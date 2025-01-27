@@ -31,12 +31,57 @@ use crate::{
     UtpSocket,
 };
 
+type SeqNr = u16;
+
+// This contains more states than Rust could model with its enums, but I'm keeping
+// the names for 1:1 TCP mapping.
 #[derive(Clone, Copy)]
 enum VirtualSocketState {
     Established,
-    FinReceived,
-    FinSent { seq_nr: u16, acked: bool },
     DeviceDead,
+
+    // We sent FIN, not yet ACKed
+    FinWait1 { our_fin: SeqNr },
+
+    // Our fin was ACKed
+    FinWait2 { our_fin: SeqNr },
+
+    // We received a FIN, but we may still send data.
+    CloseWait,
+
+    // We and remote sent FINs, but none were ACKed
+    Closing { our_fin: SeqNr },
+
+    // Both sides closed, we are waiting for final ACK.
+    // After this we just kill the socket.
+    LastAck { our_fin: SeqNr },
+}
+
+impl VirtualSocketState {
+    fn transition_to_fin_sent(&mut self, our_fin: SeqNr) -> bool {
+        match self {
+            VirtualSocketState::FinWait1 { .. }
+            | VirtualSocketState::FinWait2 { .. }
+            | VirtualSocketState::Closing { .. }
+            | VirtualSocketState::LastAck { .. }
+            | VirtualSocketState::DeviceDead => return false,
+            VirtualSocketState::Established => *self = VirtualSocketState::FinWait1 { our_fin },
+            VirtualSocketState::CloseWait => *self = VirtualSocketState::LastAck { our_fin },
+        }
+        true
+    }
+
+    fn transition_to_fin_received(&mut self, remote_ack_nr: SeqNr) -> bool {
+        match *self {
+            VirtualSocketState::Established => *self = VirtualSocketState::CloseWait,
+            VirtualSocketState::DeviceDead | VirtualSocketState::CloseWait => return false,
+            VirtualSocketState::FinWait1 { our_fin } => todo!(),
+            VirtualSocketState::FinWait2 { our_fin } => todo!(),
+            VirtualSocketState::Closing { our_fin } => todo!(),
+            VirtualSocketState::LastAck { our_fin } => todo!(),
+        }
+        true
+    }
 }
 
 enum UserRxMessage {
@@ -55,7 +100,7 @@ struct VirtualSocket {
     addr: SocketAddr,
 
     assembler: AssembledRx,
-    conn_id_send: u16,
+    conn_id_send: SeqNr,
 
     // Triggers delay-based operations
     timers: Timers,
@@ -67,17 +112,17 @@ struct VirtualSocket {
     last_remote_window: u32,
 
     // Next sequence number to use when fragmenting user input.
-    next_seq_nr: u16,
+    next_seq_nr: SeqNr,
 
     // The last seq_nr we told the other end about.
-    last_sent_seq_nr: u16,
+    last_sent_seq_nr: SeqNr,
 
     // Last remote sequence number that we fully processed.
-    last_consumed_ack_nr: u16,
+    last_consumed_ack_nr: SeqNr,
 
     // Last ACK that we sent out. This is different from "ack_nr" because we don't ACK
     // every packet. This must be <= ack_nr.
-    last_sent_ack_nr: u16,
+    last_sent_ack_nr: SeqNr,
 
     // Incoming queue. The main UDP socket writes here, and we need to consume these
     // as fast as possible.
@@ -93,7 +138,7 @@ struct VirtualSocket {
     user_rx_sender: UnboundedSender<UserRxMessage>,
 
     // Last received ACK for fast retransmit
-    local_rx_last_ack: Option<u16>,
+    local_rx_last_ack: Option<SeqNr>,
     local_rx_dup_acks: u8,
 
     // The user ppayload that we haven't yet fragmented into uTP messages.
@@ -317,7 +362,7 @@ impl VirtualSocket {
 
         let sent = !self.this_poll.udp_socket_full;
 
-        // Each packet can probably act as ACK so update related state.
+        // Each control packet can act as ACK so update related state.
         if sent {
             self.rtte.on_send(self.this_poll.now, header.seq_nr);
             self.last_sent_ack_nr = self.last_consumed_ack_nr;
@@ -396,11 +441,8 @@ impl VirtualSocket {
         if g.buffer.is_empty() {
             update_optional_waker(&mut g.buffer_has_data, cx);
 
-            if g.closed && !matches!(self.state, VirtualSocketState::FinSent { .. }) {
-                self.state = VirtualSocketState::FinSent {
-                    seq_nr: self.next_seq_nr,
-                    acked: false,
-                };
+            if g.closed {
+                self.state.transition_to_fin_sent(self.next_seq_nr);
             }
 
             return Ok(());
@@ -454,19 +496,8 @@ impl VirtualSocket {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> anyhow::Result<()> {
-        let expecting_data = match self.state {
-            VirtualSocketState::Established | VirtualSocketState::FinSent { .. } => true,
-            VirtualSocketState::FinReceived => false,
-            VirtualSocketState::DeviceDead => return Ok(()),
-        };
-
         while let Poll::Ready(msg) = self.rx.poll_recv(cx) {
             let msg = match msg {
-                Some(_) if !expecting_data => {
-                    debug!("received messages after ST_FIN. This is not allowed by spec, connection is broken");
-                    self.send_reset(cx)?;
-                    bail!("received a message after ST_FIN - this is not allowed");
-                }
                 Some(msg) => msg,
                 None => {
                     debug!("marking device dead as rx is closed");
