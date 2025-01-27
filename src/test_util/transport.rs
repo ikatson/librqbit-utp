@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     future::poll_fn,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -8,8 +7,9 @@ use std::{
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tracing::trace;
 
-use crate::Transport;
+use crate::{constants::UTP_HEADER_SIZE, raw::UtpHeader, Transport};
 
 type Msg = (SocketAddr, Vec<u8>);
 
@@ -38,15 +38,22 @@ impl MockUtpTransport {
             }),
         }
     }
+
+    #[tracing::instrument(name = "MockUtpTransport::send", skip(self, buf), fields(?target))]
+    pub fn send(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        let (header, len) = UtpHeader::deserialize(buf).unwrap();
+        trace!(?header, payload_size = buf.len() - len, "sending");
+
+        let len = buf.len();
+        self.inner.tx.send((target, buf.to_owned())).unwrap();
+        Ok(len)
+    }
 }
 
 const DEFAULT_BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
 
 impl Transport for MockUtpTransport {
-    async fn recv_from<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> std::io::Result<(usize, std::net::SocketAddr)> {
+    async fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         let f = poll_fn(|cx| self.inner.locked.lock().rx.poll_recv(cx));
         let (addr, data) = f.await.unwrap();
         assert!(data.len() <= buf.len());
@@ -54,28 +61,20 @@ impl Transport for MockUtpTransport {
         Ok((data.len(), addr))
     }
 
-    async fn send_to<'a>(
-        &'a self,
-        buf: &'a [u8],
-        target: std::net::SocketAddr,
-    ) -> std::io::Result<usize> {
-        let len = buf.len();
-        self.inner.tx.send((target, buf.to_owned())).unwrap();
-        Ok(len)
+    async fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr) -> std::io::Result<usize> {
+        self.send(buf, target)
     }
 
     fn poll_send_to(
         &self,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
         buf: &[u8],
-        target: std::net::SocketAddr,
+        target: SocketAddr,
     ) -> std::task::Poll<std::io::Result<usize>> {
-        let len = buf.len();
-        self.inner.tx.send((target, buf.to_owned())).unwrap();
-        Poll::Ready(Ok(len))
+        Poll::Ready(self.send(buf, target))
     }
 
-    fn bind_addr(&self) -> std::net::SocketAddr {
+    fn bind_addr(&self) -> SocketAddr {
         DEFAULT_BIND_ADDR
     }
 }

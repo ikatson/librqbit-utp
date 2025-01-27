@@ -1,28 +1,27 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use parking_lot::Mutex;
 
 use crate::traits::UtpEnvironment;
 
 pub struct MockRandom {
-    pub current: usize,
-    pub all: Vec<u16>,
+    pub current: u16,
 }
 
 impl Default for MockRandom {
     fn default() -> Self {
-        Self {
-            current: 0,
-            all: (0..10).collect(),
-        }
+        Self { current: 1 }
     }
 }
 
 impl MockRandom {
-    fn next(&mut self) -> Option<u16> {
+    fn next(&mut self) -> u16 {
         let current = self.current;
-        self.current += 1;
-        self.all.get(current).copied()
+        self.current = self.current.wrapping_add(100);
+        current
     }
 }
 
@@ -45,15 +44,14 @@ impl MockUtpEnvironment {
             })),
         }
     }
-
-    pub fn set_now(&self, now: Instant) {
-        self.inner.lock().now = now;
-    }
 }
 
 impl UtpEnvironment for MockUtpEnvironment {
-    fn now(&self) -> std::time::Instant {
-        self.inner.lock().now
+    fn now(&self) -> Instant {
+        let mut g = self.inner.lock();
+        let ret = g.now;
+        g.now += Duration::from_millis(1);
+        ret
     }
 
     fn copy(&self) -> Self {
@@ -61,10 +59,6 @@ impl UtpEnvironment for MockUtpEnvironment {
     }
 
     fn random_u16(&self) -> u16 {
-        self.inner
-            .lock()
-            .random
-            .next()
-            .expect("exhausted random numbers")
+        self.inner.lock().random.next()
     }
 }

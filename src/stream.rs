@@ -220,7 +220,7 @@ struct ThisPoll {
 
 impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn timestamp_microseconds(&self) -> u32 {
-        self.socket_created.elapsed().as_micros() as u32
+        (self.this_poll.now - self.socket_created).as_micros() as u32
     }
 
     /// Create a stub header for a new outgoing message.

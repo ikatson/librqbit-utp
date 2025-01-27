@@ -285,7 +285,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let seq_nr = self.env.random_u16().into();
         let mut header = UtpHeader {
             connection_id,
-            timestamp_microseconds: self.created.elapsed().as_micros() as u32,
+            timestamp_microseconds: (self.env.now() - self.created).as_micros() as u32,
             seq_nr,
             ..Default::default()
         };
@@ -382,26 +382,38 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
-    use tokio::join;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        join,
+    };
 
-    use crate::{
-        test_util::{env::MockUtpEnvironment, transport::MockUtpTransport},
-        UtpSocket,
+    use crate::test_util::{
+        env::MockUtpEnvironment, setup_test_logging, transport::MockUtpTransport, MockUtpSocket,
+        MockUtpStream,
     };
 
     #[tokio::test]
     async fn test_echo() {
+        setup_test_logging();
         let transport = MockUtpTransport::new();
         let env = MockUtpEnvironment::new();
 
         let remote: SocketAddr = (Ipv4Addr::LOCALHOST, 2).into();
 
-        let socket = UtpSocket::new_with_opts(transport, env, Default::default())
+        let socket = MockUtpSocket::new_with_opts(transport, env, Default::default())
             .await
             .unwrap();
 
-        let connect = async { socket.connect(remote).await.unwrap() };
-        let accept = async { socket.accept().await.unwrap() };
+        async fn echo(s: MockUtpStream) {
+            let (mut r, mut w) = s.split();
+            w.write_u32(42).await.unwrap();
+
+            let read = r.read_u32().await.unwrap();
+            assert_eq!(read, 42)
+        }
+
+        let connect = async { echo(socket.connect(remote).await.unwrap()).await };
+        let accept = async { echo(socket.accept().await.unwrap()).await };
 
         join!(connect, accept);
     }
