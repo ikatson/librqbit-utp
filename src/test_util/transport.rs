@@ -1,18 +1,38 @@
-use std::{
-    future::poll_fn,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-    task::Poll,
-};
+use std::{future::poll_fn, net::SocketAddr, sync::Arc, task::Poll};
 
-use anyhow::Context;
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::trace;
 
 use crate::{raw::UtpHeader, Transport};
 
+use super::{env::MockUtpEnvironment, MockUtpSocket};
+
 type Msg = (SocketAddr, Vec<u8>);
+
+#[derive(Default)]
+pub struct MockInterface {
+    sockets: dashmap::DashMap<SocketAddr, UnboundedSender<Msg>>,
+}
+
+impl MockInterface {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Default::default())
+    }
+
+    pub fn create_socket(self: &Arc<Self>, bind_addr: SocketAddr) -> Arc<MockUtpSocket> {
+        let (tx, rx) = unbounded_channel();
+        let transport = MockUtpTransport::new(bind_addr, rx, self.clone());
+        let env = MockUtpEnvironment::new();
+
+        let socket = MockUtpSocket::new_with_opts(transport, env, Default::default()).unwrap();
+
+        if self.sockets.insert(bind_addr, tx).is_some() {
+            panic!("socket with {} already existed", bind_addr)
+        }
+        socket
+    }
+}
 
 // Without this indirection rust analyzer doesn't work somehow
 struct MockUtpTransportInnerLocked {
@@ -21,7 +41,7 @@ struct MockUtpTransportInnerLocked {
 
 struct MockUtpTransportInner {
     locked: Mutex<MockUtpTransportInnerLocked>,
-    tx: UnboundedSender<Msg>,
+    interface: Arc<MockInterface>,
 }
 
 #[derive(Clone)]
@@ -31,12 +51,15 @@ pub struct MockUtpTransport {
 }
 
 impl MockUtpTransport {
-    pub fn new(bind_addr: SocketAddr) -> Self {
-        let (tx, rx) = unbounded_channel();
+    pub fn new(
+        bind_addr: SocketAddr,
+        rx: UnboundedReceiver<Msg>,
+        interface: Arc<MockInterface>,
+    ) -> Self {
         Self {
             inner: Arc::new(MockUtpTransportInner {
                 locked: Mutex::new(MockUtpTransportInnerLocked { rx }),
-                tx,
+                interface,
             }),
             bind_addr,
         }
@@ -46,9 +69,16 @@ impl MockUtpTransport {
     pub fn send(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
         let (header, len) = UtpHeader::deserialize(buf).unwrap();
         trace!(?header, payload_size = buf.len() - len, "sending");
-
         let len = buf.len();
-        self.inner.tx.send((target, buf.to_owned())).unwrap();
+
+        match self.inner.interface.sockets.get(&target) {
+            Some(tx) => match tx.send((self.bind_addr, buf.to_owned())) {
+                Ok(_) => {}
+                Err(_) => return Err(std::io::Error::other(format!("target {target} is dead"))),
+            },
+            None => return Err(std::io::Error::other(format!("no route to {target}"))),
+        };
+
         Ok(len)
     }
 }

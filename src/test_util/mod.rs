@@ -17,12 +17,3 @@ pub fn setup_test_logging() {
     }
     let _ = tracing_subscriber::fmt::try_init();
 }
-
-pub async fn create_mock_socket(bind_addr: SocketAddr) -> Arc<MockUtpSocket> {
-    let transport = MockUtpTransport::new(bind_addr);
-    let env = MockUtpEnvironment::new();
-
-    MockUtpSocket::new_with_opts(transport, env, Default::default())
-        .await
-        .unwrap()
-}

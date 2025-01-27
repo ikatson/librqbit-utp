@@ -139,16 +139,12 @@ impl UtpSocket<tokio::net::UdpSocket, DefaultUtpEnvironment> {
         let sock = tokio::net::UdpSocket::bind(bind_addr)
             .await
             .context("error binding")?;
-        Self::new_with_opts(sock, Default::default(), opts).await
+        Self::new_with_opts(sock, Default::default(), opts)
     }
 }
 
 impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
-    pub async fn new_with_opts(
-        transport: T,
-        env: Env,
-        opts: SocketOpts,
-    ) -> anyhow::Result<Arc<Self>> {
+    pub fn new_with_opts(transport: T, env: Env, opts: SocketOpts) -> anyhow::Result<Arc<Self>> {
         let opts = opts.validate().context("error validating socket options")?;
         let sock = transport;
         let local_addr = sock.bind_addr();
@@ -388,7 +384,7 @@ mod tests {
         try_join,
     };
 
-    use crate::test_util::{create_mock_socket, setup_test_logging, MockUtpStream};
+    use crate::test_util::{setup_test_logging, transport::MockInterface, MockUtpStream};
 
     #[tokio::test]
     async fn test_echo() -> anyhow::Result<()> {
@@ -396,8 +392,10 @@ mod tests {
         let client_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 1).into();
         let server_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 2).into();
 
-        let client = create_mock_socket(client_addr).await;
-        let server = create_mock_socket(server_addr).await;
+        let interface = MockInterface::new();
+
+        let client = interface.create_socket(client_addr);
+        let server = interface.create_socket(server_addr);
 
         async fn echo(s: MockUtpStream) -> anyhow::Result<()> {
             let (mut r, mut w) = s.split();
