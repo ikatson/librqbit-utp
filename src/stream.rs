@@ -8,7 +8,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rand::random;
 use smoltcp::storage::RingBuffer;
 use tokio::{
@@ -35,7 +35,7 @@ use crate::{
 enum VirtualSocketState {
     Established,
     FinReceived,
-    FinSent,
+    FinSent { seq_nr: u16, acked: bool },
     DeviceDead,
 }
 
@@ -163,40 +163,13 @@ impl VirtualSocket {
             return Ok(());
         }
 
-        let tx_first_seq_nr = self
-            .tx
-            .first_seq_nr()
-            .context("bug: expected self.tx to have a seq nr")?;
-
-        if let Some(retransmit_delta) = self.timers.kind.should_retransmit(self.this_poll.now) {
-            // If a retransmit timer expired, we should resend data starting at the last ACK.
-            trace!("retransmitting at t+{:?}", retransmit_delta);
-
-            // Rewind "last sequence number sent", as if we never
-            // had sent them. This will cause all data in the queue
-            // to be sent again.
-            self.last_sent_seq_nr = tx_first_seq_nr.saturating_sub(1);
-
-            // Clear the `should_retransmit` state. If we can't retransmit right
-            // now for whatever reason (like zero window), this avoids an
-            // infinite polling loop where `poll_at` returns `Now` but `dispatch`
-            // can't actually do anything.
-            self.timers.kind.set_for_idle();
-
-            // Inform RTTE, so that it can avoid bogus measurements.
-            self.rtte.on_retransmit();
-
-            // Inform the congestion controller that we're retransmitting.
-            self.congestion_controller.on_retransmit(self.this_poll.now);
-        }
-
         let sock = self.socket.upgrade().context("socket closed")?;
 
         let mut sent = false;
         let mut recv_wnd =
             (self.last_remote_window as usize).min(self.congestion_controller.window());
 
-        trace!(tx_first_seq_nr, recv_wnd);
+        trace!(recv_wnd);
 
         // Send only the stuff we haven't sent yet, up to sender's window.
         for item in self.tx.iter() {
@@ -222,7 +195,7 @@ impl VirtualSocket {
                     let offset = item.payload_offset();
                     let len = item.payload_size();
                     // TODO: use rwlock
-                    let g = self.user_tx.locked.read();
+                    let g = self.user_tx.locked.lock();
                     fill_buffer_from_rb(b, &g.buffer, offset, len)
                         .context("error filling output buffer from user_tx")?;
                     Ok(len)
@@ -263,15 +236,58 @@ impl VirtualSocket {
     }
 
     fn maybe_send_delayed_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
-        if self.this_poll.udp_socket_full {
-            return Ok(false);
-        }
-
         if self.delayed_ack_expired() && self.ack_to_transmit() {
             trace!("delayed ack expired, sending ACK");
             self.send_ack(cx)
         } else {
             Ok(false)
+        }
+    }
+
+    fn maybe_prepare_for_retransmission(&mut self) {
+        if let Some(retransmit_delta) = self.timers.kind.should_retransmit(self.this_poll.now) {
+            // TODO: maybe store last acked seq_nr somewhere to make this logic simpler? If it diverges
+            // from tx_first though it will be a bug.
+
+            let rewind_to = match (self.tx.first_seq_nr(), self.state) {
+                // Retransmit ST_DATA
+                (Some(tx_first), _) => tx_first.saturating_sub(1),
+
+                // Retransmit FIN
+                (
+                    None,
+                    VirtualSocketState::FinSent {
+                        seq_nr,
+                        acked: false,
+                    },
+                ) => seq_nr.saturating_sub(1),
+                _ => {
+                    debug!("retransmission timer triggered but nothing to retransmit");
+
+                    self.timers.kind.set_for_idle();
+                    return;
+                }
+            };
+
+            // If a retransmit timer expired, we should resend data starting at the last ACK.
+            trace!("retransmitting at t+{:?}", retransmit_delta);
+
+            // Rewind "last sequence number sent", as if we never
+            // had sent them. This will cause all data in the queue
+            // to be sent again.
+            self.last_sent_seq_nr = rewind_to;
+
+            // Clear the `should_retransmit` state. If we can't retransmit right
+            // now for whatever reason (like zero window), this avoids an
+            // infinite polling loop where `poll_at` returns `Now` but `dispatch`
+            // can't actually do anything.
+            self.timers.kind.set_for_idle();
+
+            // Inform RTTE, so that it can avoid bogus measurements.
+            self.rtte.on_retransmit();
+
+            // Inform the congestion controller that we're retransmitting.
+            self.congestion_controller.on_retransmit(self.this_poll.now);
         }
     }
 
@@ -299,13 +315,9 @@ impl VirtualSocket {
         self.this_poll.udp_socket_full =
             sock.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.addr)?;
 
-        Ok(!self.this_poll.udp_socket_full)
-    }
+        let sent = !self.this_poll.udp_socket_full;
 
-    fn send_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
-        let header = self.outgoing_header();
-        let sent = self.send_control_packet(cx, header)?;
-
+        // Each packet can probably act as ACK so update related state.
         if sent {
             self.rtte.on_send(self.this_poll.now, header.seq_nr);
             self.last_sent_ack_nr = self.last_consumed_ack_nr;
@@ -315,8 +327,8 @@ impl VirtualSocket {
         Ok(sent)
     }
 
-    fn send_fin(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
-        todo!()
+    fn send_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+        self.send_control_packet(cx, self.outgoing_header())
     }
 
     fn send_reset(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
@@ -340,14 +352,57 @@ impl VirtualSocket {
         }
     }
 
+    fn maybe_send_fin(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
+        if self.this_poll.udp_socket_full {
+            return Ok(());
+        }
+
+        match self.state {
+            VirtualSocketState::FinSent {
+                seq_nr,
+                acked: false,
+            } => {
+                // Only send fin after all the outstanding data was sent.
+                if seq_nr_offset(
+                    seq_nr,
+                    self.last_sent_seq_nr,
+                    self.socket_opts.wrap_torelance(),
+                ) != 1
+                {
+                    return Ok(());
+                }
+
+                let mut fin = self.outgoing_header();
+                fin.seq_nr = seq_nr;
+                if self.send_control_packet(cx, fin)? {
+                    self.timers
+                        .kind
+                        .set_for_retransmit(self.this_poll.now, self.rtte.retransmission_timeout());
+                    self.state = VirtualSocketState::FinSent {
+                        seq_nr,
+                        acked: false,
+                    };
+                    self.last_sent_seq_nr = seq_nr;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn fragment_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
-        let mut g = self.user_tx.locked.upgradable_read();
+        let mut g = self.user_tx.locked.lock();
 
         if g.buffer.is_empty() {
-            trace!("user tx queue empty, updating waker");
-            g.with_upgraded(|val| {
-                update_optional_waker(&mut val.buffer_has_data, cx);
-            });
+            update_optional_waker(&mut g.buffer_has_data, cx);
+
+            if g.closed && !matches!(self.state, VirtualSocketState::FinSent { .. }) {
+                self.state = VirtualSocketState::FinSent {
+                    seq_nr: self.next_seq_nr,
+                    acked: false,
+                };
+            }
+
             return Ok(());
         }
 
@@ -400,7 +455,7 @@ impl VirtualSocket {
         cx: &mut std::task::Context<'_>,
     ) -> anyhow::Result<()> {
         let expecting_data = match self.state {
-            VirtualSocketState::Established | VirtualSocketState::FinSent => true,
+            VirtualSocketState::Established | VirtualSocketState::FinSent { .. } => true,
             VirtualSocketState::FinReceived => false,
             VirtualSocketState::DeviceDead => return Ok(()),
         };
@@ -440,7 +495,7 @@ impl VirtualSocket {
         // Remove everything from tx_buffer that was acked by this message.
         let (removed_headers, removed_bytes) = self.tx.remove_up_to_ack(msg.header.ack_nr);
         if removed_headers > 0 {
-            let mut g = self.user_tx.locked.write();
+            let mut g = self.user_tx.locked.lock();
             let was_full = g.buffer.is_full();
             g.buffer.dequeue_allocated(removed_bytes);
             if was_full {
@@ -734,7 +789,7 @@ impl WakeableRingBuffer {
 }
 
 struct UserTx {
-    locked: RwLock<WakeableRingBuffer>,
+    locked: Mutex<WakeableRingBuffer>,
 }
 
 // When both writer and reader are dropped, this will close the stream.
@@ -756,7 +811,7 @@ impl Drop for UtpStreamDropGuard {
 
 impl Drop for VirtualSocket {
     fn drop(&mut self) {
-        self.user_tx.locked.write().mark_stream_dead();
+        self.user_tx.locked.lock().mark_stream_dead();
     }
 }
 
@@ -819,7 +874,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-        let mut g = self.user_tx.locked.write();
+        let mut g = self.user_tx.locked.lock();
 
         if g.dead {
             return Poll::Ready(Err(std::io::Error::other("socket died")));
@@ -843,7 +898,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        let mut g = self.user_tx.locked.write();
+        let mut g = self.user_tx.locked.lock();
 
         if g.dead {
             return Poll::Ready(Err(std::io::Error::other("socket died")));
@@ -866,7 +921,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
         if let Err(e) = flush_result {
             return Poll::Ready(Err(e));
         }
-        let mut g = self.get_mut().user_tx.locked.write();
+        let mut g = self.get_mut().user_tx.locked.lock();
 
         g.closed = true;
         if let Some(w) = g.buffer_has_data.take() {
@@ -1011,7 +1066,7 @@ impl UtpStream {
 
         let (user_rx_sender, user_rx_receiver) = unbounded_channel();
         let user_tx = Arc::new(UserTx {
-            locked: RwLock::new(WakeableRingBuffer {
+            locked: Mutex::new(WakeableRingBuffer {
                 buffer: RingBuffer::new(vec![0u8; socket.opts().virtual_socket_tx_bytes]),
                 buffer_no_longer_full: None,
                 buffer_has_data: None,
@@ -1265,17 +1320,21 @@ impl std::future::Future for VirtualSocket {
             bail_if_err!(this.process_all_incoming_messages(cx));
             if let VirtualSocketState::DeviceDead = this.state {
                 let _ = this.user_rx_sender.send(UserRxMessage::DeviceClosed);
-                this.user_tx.locked.write().mark_stream_dead();
+                this.user_tx.locked.lock().mark_stream_dead();
                 return Poll::Ready(Ok(()));
             }
 
             bail_if_err!(this.maybe_send_delayed_ack(cx));
+
+            this.maybe_prepare_for_retransmission();
 
             // Fragment data sent by user
             bail_if_err!(this.fragment_tx_queue(cx));
 
             // (Re)send tx queue.
             bail_if_err!(this.send_tx_queue(cx));
+
+            bail_if_err!(this.maybe_send_fin(cx));
 
             match this.poll_at() {
                 PollAt::Now => {
