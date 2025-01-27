@@ -22,7 +22,10 @@ use tracing::{debug, error_span, trace, warn};
 use crate::{
     assembled_rx::AssembledRx,
     congestion::{reno::Reno, Controller},
-    constants::{ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, UTP_HEADER_SIZE},
+    constants::{
+        ACK_DELAY, CHALLENGE_ACK_RATELIMIT, GRACEFUL_TERMINATION_TIMEOUT, IMMEDIATE_ACK_EVERY,
+        UTP_HEADER_SIZE,
+    },
     message::UtpMessage,
     raw::{Type, UtpHeader},
     rtte::RttEstimator,
@@ -864,18 +867,24 @@ struct UserTx {
 }
 
 // When both writer and reader are dropped, this will close the stream.
-struct UtpStreamDropGuard<T> {
+struct UtpStreamDropGuard<T: Transport> {
     sock: Weak<UtpSocket<T>>,
     addr: SocketAddr,
     id1: u16,
     id2: u16,
 }
 
-impl<T> Drop for UtpStreamDropGuard<T> {
+impl<T: Transport> Drop for UtpStreamDropGuard<T> {
     fn drop(&mut self) {
         if let Some(sock) = self.sock.upgrade() {
-            sock.streams.remove(&(self.addr, self.id1));
-            sock.streams.remove(&(self.addr, self.id2));
+            let addr = self.addr;
+            let id1 = self.id1;
+            let id2 = self.id2;
+            tokio::spawn(async move {
+                tokio::time::sleep(GRACEFUL_TERMINATION_TIMEOUT).await;
+                sock.streams.remove(&(addr, id1));
+                sock.streams.remove(&(addr, id2));
+            });
         }
     }
 }
@@ -886,19 +895,19 @@ impl<T> Drop for VirtualSocket<T> {
     }
 }
 
-pub struct UtpStreamReadHalf<T> {
+pub struct UtpStreamReadHalf<T: Transport> {
     _guard: Arc<UtpStreamDropGuard<T>>,
     rx: UnboundedReceiver<UserRxMessage>,
     current: Option<UtpMessage>,
     offset: usize,
 }
 
-pub struct UtpStreamWriteHalf<T> {
+pub struct UtpStreamWriteHalf<T: Transport> {
     _guard: Arc<UtpStreamDropGuard<T>>,
     user_tx: Arc<UserTx>,
 }
 
-impl<T> UtpStreamWriteHalf<T> {
+impl<T: Transport> UtpStreamWriteHalf<T> {
     fn close(&mut self) {
         let mut g = self.user_tx.locked.lock();
         g.closed = true;
@@ -908,13 +917,13 @@ impl<T> UtpStreamWriteHalf<T> {
     }
 }
 
-impl<T> Drop for UtpStreamWriteHalf<T> {
+impl<T: Transport> Drop for UtpStreamWriteHalf<T> {
     fn drop(&mut self) {
         self.close();
     }
 }
 
-impl<T> AsyncRead for UtpStreamReadHalf<T> {
+impl<T: Transport> AsyncRead for UtpStreamReadHalf<T> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -955,7 +964,7 @@ impl<T> AsyncRead for UtpStreamReadHalf<T> {
     }
 }
 
-impl<T> AsyncWrite for UtpStreamWriteHalf<T> {
+impl<T: Transport> AsyncWrite for UtpStreamWriteHalf<T> {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1015,7 +1024,7 @@ impl<T> AsyncWrite for UtpStreamWriteHalf<T> {
 
 pub type UtpStreamUdp = UtpStream<tokio::net::UdpSocket>;
 
-pub struct UtpStream<T> {
+pub struct UtpStream<T: Transport> {
     reader: UtpStreamReadHalf<T>,
     writer: UtpStreamWriteHalf<T>,
     _phantom: PhantomData<T>,
