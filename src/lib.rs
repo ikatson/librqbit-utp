@@ -1,3 +1,5 @@
+// TODO: informing readers and writers of socket death.
+//
 // TODO: congestion control
 //
 // TODO: extensions

@@ -2,13 +2,20 @@ use std::{cmp::Ordering, future::Future, task::Waker};
 
 use anyhow::bail;
 use smoltcp::storage::RingBuffer;
+use tracing::Instrument;
 
-pub fn spawn_print_error(f: impl Future<Output = anyhow::Result<()>> + Send + 'static) {
-    tokio::spawn(async move {
-        if let Err(e) = f.await {
-            tracing::debug!("error: {e:#}");
+pub fn spawn_print_error(
+    span: tracing::Span,
+    f: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+) {
+    tokio::spawn(
+        async move {
+            if let Err(e) = f.await {
+                tracing::debug!("error: {e:#}");
+            }
         }
-    });
+        .instrument(span),
+    );
 }
 
 pub fn update_optional_waker(waker: &mut Option<Waker>, cx: &std::task::Context<'_>) {

@@ -1,5 +1,4 @@
 use std::{
-    io::Write,
     net::{Ipv4Addr, SocketAddr},
     time::Duration,
 };
@@ -13,7 +12,7 @@ use tokio::{
 };
 use tracing::{error_span, info, Instrument};
 
-const TICK_INTERVAL: Duration = Duration::from_millis(1);
+const MAX_COUNTER: u64 = 10_000;
 const TIMEOUT: Duration = Duration::from_secs(1);
 
 async fn echo(stream: UtpStream) -> anyhow::Result<()> {
@@ -22,8 +21,7 @@ async fn echo(stream: UtpStream) -> anyhow::Result<()> {
     let mut reader = tokio::io::BufReader::new(reader);
 
     let reader = async move {
-        let mut expected = 0;
-        loop {
+        for expected in 0..=MAX_COUNTER {
             let current = timeout(TIMEOUT, reader.read_u64())
                 .await
                 .context("timeout reading")?
@@ -35,23 +33,18 @@ async fn echo(stream: UtpStream) -> anyhow::Result<()> {
             if current % 100 == 0 {
                 info!("current counter {current}");
             }
-            expected += 1;
         }
         #[allow(unreachable_code)]
         Ok::<_, anyhow::Error>(())
     };
 
     let writer = async move {
-        let mut counter = 0;
-        let mut interval = tokio::time::interval(TICK_INTERVAL);
         let mut writer = writer;
-        loop {
-            interval.tick().await;
+        for counter in 0..=MAX_COUNTER {
             timeout(TIMEOUT, writer.write_u64(counter))
                 .await
                 .context("timeout writing")?
                 .context("error writing")?;
-            counter += 1;
         }
         #[allow(unreachable_code)]
         Ok::<_, anyhow::Error>(())
@@ -85,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("timeout connecting")?
                 .context("error connecting")?;
-            echo(sock).await
+            echo(sock).await.context("error running client echo")
         }
         .instrument(error_span!("client")),
     );
@@ -96,13 +89,17 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .context("error creating socket")?;
             let sock = server.accept().await.context("error accepting")?;
-            echo(sock).await
+            echo(sock).await.context("error running server echo")
         }
         .instrument(error_span!("server")),
     );
 
     tokio::select! {
-        r = client => r.context("error joining client")?.context("client died"),
-        r = server => r.context("error joining server")?.context("server died"),
+        r = client => r.context("error joining client")?.context("client died")?,
+        r = server => r.context("error joining server")?.context("server died")?,
     }
+
+    info!("finished");
+
+    Ok(())
 }

@@ -16,7 +16,7 @@ use tokio::{
     sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     time::{sleep_until, Sleep},
 };
-use tracing::{debug, error_span, trace, warn, Instrument};
+use tracing::{debug, error_span, trace, warn};
 
 use crate::{
     assembled_rx::AssembledRx,
@@ -972,7 +972,7 @@ impl UtpStream {
             },
         };
 
-        spawn_print_error({
+        spawn_print_error(error_span!("utp_stream", connection_id = conn_id_recv), {
             let socket = socket.clone();
             async move {
                 // Send first "weird" ACK if this is an incoming connection.
@@ -990,9 +990,8 @@ impl UtpStream {
                         .context("error sending initial ACK")?;
                 }
 
-                state.await
+                state.await.context("error running utp stream event loop")
             }
-            .instrument(error_span!("utp_stream", connection_id = conn_id_recv))
         });
 
         Self {

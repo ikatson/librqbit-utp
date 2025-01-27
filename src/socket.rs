@@ -23,7 +23,7 @@ use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
-use tracing::{debug, error_span, trace, warn, Instrument};
+use tracing::{debug, error_span, trace, warn};
 
 type ConnectionId = u16;
 
@@ -166,9 +166,8 @@ impl UtpSocket {
             opts,
         });
         spawn_print_error(
-            sock.clone()
-                .dispatcher(accept_rx)
-                .instrument(error_span!("utp_socket", addr=?local_addr)),
+            error_span!("utp_socket", addr=?local_addr),
+            sock.clone().dispatcher(accept_rx),
         );
         Ok(sock)
     }
