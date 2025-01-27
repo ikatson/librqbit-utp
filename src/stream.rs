@@ -31,13 +31,16 @@ use crate::{
     UtpSocket,
 };
 
+#[derive(Clone, Copy)]
 enum VirtualSocketState {
     Established,
+    FinReceived,
     DeviceDead,
 }
 
 enum UserRxMessage {
     UtpMessage(UtpMessage),
+    Eof,
     DeviceClosed,
 }
 
@@ -271,15 +274,20 @@ impl VirtualSocket {
         }
     }
 
-    fn send_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+    fn send_control_packet(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        header: UtpHeader,
+    ) -> anyhow::Result<bool> {
         if self.this_poll.udp_socket_full {
             return Ok(false);
         }
-        let header = self.outgoing_header();
+
         trace!(
             seq_nr = header.seq_nr,
             ack_nr = header.ack_nr,
-            "sending ACK"
+            type = ?header.get_type(),
+            "sending"
         );
 
         let len = header
@@ -289,13 +297,31 @@ impl VirtualSocket {
 
         self.this_poll.udp_socket_full =
             sock.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.addr)?;
-        if !self.this_poll.udp_socket_full {
+
+        Ok(!self.this_poll.udp_socket_full)
+    }
+
+    fn send_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+        let header = self.outgoing_header();
+        let sent = self.send_control_packet(cx, header)?;
+
+        if sent {
             self.rtte.on_send(self.this_poll.now, header.seq_nr);
             self.last_sent_ack_nr = self.last_consumed_ack_nr;
             self.reset_delayed_ack_timer();
         }
 
-        Ok(!self.this_poll.udp_socket_full)
+        Ok(sent)
+    }
+
+    fn send_fin(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+        todo!()
+    }
+
+    fn send_reset(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+        let mut header = self.outgoing_header();
+        header.set_type(Type::ST_RESET);
+        self.send_control_packet(cx, header)
     }
 
     fn send_challenge_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
@@ -372,8 +398,19 @@ impl VirtualSocket {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> anyhow::Result<()> {
+        let expecting_data = match self.state {
+            VirtualSocketState::Established => true,
+            VirtualSocketState::FinReceived => false,
+            VirtualSocketState::DeviceDead => return Ok(()),
+        };
+
         while let Poll::Ready(msg) = self.rx.poll_recv(cx) {
             let msg = match msg {
+                Some(_) if !expecting_data => {
+                    debug!("received messages after ST_FIN. This is not allowed by spec, connection is broken");
+                    self.send_reset(cx)?;
+                    bail!("received a message after ST_FIN - this is not allowed");
+                }
                 Some(msg) => msg,
                 None => {
                     debug!("marking device dead as rx is closed");
@@ -407,6 +444,12 @@ impl VirtualSocket {
             g.buffer.dequeue_allocated(removed_bytes);
             if was_full {
                 if let Some(w) = g.buffer_no_longer_full.take() {
+                    w.wake();
+                }
+            }
+
+            if g.buffer.is_empty() {
+                if let Some(w) = g.buffer_flushed.take() {
                     w.wake();
                 }
             }
@@ -571,8 +614,14 @@ impl VirtualSocket {
                 Ok(())
             }
 
-            Type::ST_RESET => bail!("ST_RESET not implemented"),
-            Type::ST_FIN => bail!("ST_FIN not implemented"),
+            Type::ST_RESET => bail!("ST_RESET received"),
+            Type::ST_FIN => {
+                self.state = VirtualSocketState::FinReceived;
+                self.last_consumed_ack_nr = self.last_consumed_ack_nr.wrapping_add(1);
+                self.send_ack(cx)?;
+                let _ = self.user_rx_sender.send(UserRxMessage::Eof);
+                Ok(())
+            }
             Type::ST_SYN => {
                 warn!("ignoring unexpected ST_SYN packet: {:?}", msg.header);
                 Ok(())
@@ -666,6 +715,9 @@ struct WakeableRingBuffer {
     // This is woken up by dispatcher when the buffer has space if it didn't have it previously.
     buffer_no_longer_full: Option<Waker>,
 
+    // This is woken up by dispatcher when all packets where ACKed.
+    buffer_flushed: Option<Waker>,
+
     // This is woken by by writer when it has space.
     buffer_has_data: Option<Waker>,
 }
@@ -746,6 +798,7 @@ impl AsyncRead for UtpStreamReadHalf {
 
             let msg = match this.rx.poll_recv(cx) {
                 Poll::Ready(Some(UserRxMessage::UtpMessage(msg))) => msg,
+                Poll::Ready(Some(UserRxMessage::Eof)) => return Poll::Ready(Ok(())),
                 Poll::Ready(Some(UserRxMessage::DeviceClosed)) => {
                     return Poll::Ready(Err(std::io::Error::other("device closed")))
                 }
@@ -786,9 +839,21 @@ impl AsyncWrite for UtpStreamWriteHalf {
 
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        todo!()
+        let mut g = self.user_tx.locked.write();
+
+        if g.dead {
+            return Poll::Ready(Err(std::io::Error::other("socket died")));
+        }
+
+        if g.buffer.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+
+        update_optional_waker(&mut g.buffer_flushed, cx);
+
+        Poll::Pending
     }
 
     fn poll_shutdown(
