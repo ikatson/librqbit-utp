@@ -334,8 +334,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 
         let (tx, rx) = unbounded_channel();
 
-        let stream_args =
-            StreamArgs::new_outgoing(connection_id, &ack_header, syn_sent_ts, ack_received_ts);
+        let stream_args = StreamArgs::new_outgoing(&ack_header, syn_sent_ts, ack_received_ts);
         let stream = UtpStream::new(self, remote, rx, stream_args);
 
         self.streams.insert((remote, connection_id), tx.clone());

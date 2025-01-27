@@ -10,20 +10,23 @@ use super::{env::MockUtpEnvironment, MockUtpSocket};
 
 type Msg = (SocketAddr, Vec<u8>);
 
-#[derive(Default)]
 pub struct MockInterface {
     sockets: dashmap::DashMap<SocketAddr, UnboundedSender<Msg>>,
+    pub env: MockUtpEnvironment,
 }
 
 impl MockInterface {
     pub fn new() -> Arc<Self> {
-        Arc::new(Default::default())
+        Arc::new(Self {
+            sockets: Default::default(),
+            env: MockUtpEnvironment::new(),
+        })
     }
 
     pub fn create_socket(self: &Arc<Self>, bind_addr: SocketAddr) -> Arc<MockUtpSocket> {
         let (tx, rx) = unbounded_channel();
         let transport = MockUtpTransport::new(bind_addr, rx, self.clone());
-        let env = MockUtpEnvironment::new();
+        let env = self.env.clone();
 
         let socket = MockUtpSocket::new_with_opts(transport, env, Default::default()).unwrap();
 

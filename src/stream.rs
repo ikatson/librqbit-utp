@@ -150,7 +150,7 @@ struct VirtualSocket<T, Env> {
     socket_created: Instant,
     socket_opts: ValidatedSocketOpts,
 
-    addr: SocketAddr,
+    remote: SocketAddr,
 
     assembler: AssembledRx,
     conn_id_send: u16,
@@ -303,7 +303,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .context("bug: wasn't able to serialize the buffer")?;
 
             self.this_poll.transport_pending |=
-                socket.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.addr)?;
+                socket.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.remote)?;
 
             trace!(
                 %header.seq_nr,
@@ -411,7 +411,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .context("bug")?;
 
         self.this_poll.transport_pending =
-            socket.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.addr)?;
+            socket.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.remote)?;
 
         let sent = !self.this_poll.transport_pending;
 
@@ -859,7 +859,7 @@ struct UserTx {
 // When both writer and reader are dropped, this will close the stream.
 struct UtpStreamDropGuard<T: Transport, Env: UtpEnvironment> {
     sock: Weak<UtpSocket<T, Env>>,
-    addr: SocketAddr,
+    remote: SocketAddr,
     id1: u16,
     id2: u16,
 }
@@ -867,7 +867,7 @@ struct UtpStreamDropGuard<T: Transport, Env: UtpEnvironment> {
 impl<T: Transport, Env: UtpEnvironment> Drop for UtpStreamDropGuard<T, Env> {
     fn drop(&mut self) {
         if let Some(sock) = self.sock.upgrade() {
-            let addr = self.addr;
+            let addr = self.remote;
             let id1 = self.id1;
             let id2 = self.id2;
             tokio::spawn(async move {
@@ -1075,11 +1075,11 @@ pub struct StreamArgs {
 
 impl StreamArgs {
     pub fn new_outgoing(
-        conn_id: u16,
         remote_ack: &UtpHeader,
         syn_sent_ts: Instant,
         ack_received_ts: Instant,
     ) -> Self {
+        let conn_id = remote_ack.connection_id;
         Self {
             conn_id_recv: conn_id,
             conn_id_send: conn_id.wrapping_add(1),
@@ -1128,10 +1128,44 @@ impl StreamArgs {
 impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
     pub(crate) fn new(
         socket: &Arc<UtpSocket<T, Env>>,
-        addr: SocketAddr,
+        remote: SocketAddr,
         rx: UnboundedReceiver<UtpMessage>,
         args: StreamArgs,
     ) -> Self {
+        let (stream, vsock, first_packet) = Self::new_internal(socket, remote, rx, args);
+
+        spawn_print_error(
+            error_span!("utp_stream", conn_id_send = vsock.conn_id_send),
+            {
+                let socket = socket.clone();
+                async move {
+                    // Send first "weird" ACK if this is an incoming connection.
+                    if let Some(first_packet) = first_packet {
+                        let mut buf = [0u8; UTP_HEADER_SIZE];
+                        first_packet
+                            .serialize(&mut buf)
+                            .context("bug: can't serialize header")?;
+                        socket
+                            .udp_socket
+                            .send_to(&buf, vsock.remote)
+                            .await
+                            .context("error sending initial ACK")?;
+                    }
+
+                    vsock.await.context("error running utp stream event loop")
+                }
+            },
+        );
+        stream
+    }
+
+    // Exposed for tests.
+    fn new_internal(
+        socket: &Arc<UtpSocket<T, Env>>,
+        remote: SocketAddr,
+        rx: UnboundedReceiver<UtpMessage>,
+        args: StreamArgs,
+    ) -> (Self, VirtualSocket<T, Env>, Option<UtpHeader>) {
         let StreamArgs {
             conn_id_recv,
             conn_id_send,
@@ -1160,7 +1194,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
 
         let guard = Arc::new(UtpStreamDropGuard {
             sock: Arc::downgrade(socket),
-            addr,
+            remote,
             id1: conn_id_recv,
             id2: conn_id_send,
         });
@@ -1182,13 +1216,13 @@ impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
 
         let socket_opts = socket.opts();
 
-        let state = VirtualSocket {
+        let vsock = VirtualSocket {
             state: VirtualSocketState::Established,
             env,
             socket: Arc::downgrade(socket),
             socket_created: socket.created,
             socket_opts: *socket_opts,
-            addr,
+            remote,
             assembler: AssembledRx::new(
                 socket_opts.virtual_socket_tx_packets,
                 socket_opts.max_payload_size,
@@ -1233,33 +1267,21 @@ impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
             },
         };
 
-        spawn_print_error(error_span!("utp_stream", connection_id = conn_id_recv), {
-            let socket = socket.clone();
-            async move {
-                // Send first "weird" ACK if this is an incoming connection.
-                if !is_outgoing {
-                    let mut hdr = state.outgoing_header();
-                    // The initial "ACK" should be of the NEXT sequence, not the previous one.
-                    hdr.seq_nr += 1;
-                    let mut buf = [0u8; UTP_HEADER_SIZE];
-                    hdr.serialize(&mut buf)
-                        .context("bug: can't serialize header")?;
-                    socket
-                        .udp_socket
-                        .send_to(&buf, state.addr)
-                        .await
-                        .context("error sending initial ACK")?;
-                }
+        let first_packet = if !is_outgoing {
+            let mut hdr = vsock.outgoing_header();
+            // The initial "ACK" should be of the NEXT sequence, not the previous one.
+            hdr.seq_nr += 1;
+            Some(hdr)
+        } else {
+            None
+        };
 
-                state.await.context("error running utp stream event loop")
-            }
-        });
-
-        Self {
+        let stream = Self {
             reader: read_half,
             writer: write_half,
             _phantom: PhantomData,
-        }
+        };
+        (stream, vsock, first_packet)
     }
 
     // This is faster than tokio::io::split as it doesn't use a mutex
@@ -1472,4 +1494,96 @@ pub(crate) enum PollAt {
     Time(Instant),
     /// The socket does not need to be polled unless there are external changes.
     Ingress,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use crate::{
+        raw::{Type, UtpHeader},
+        test_util::{
+            env::MockUtpEnvironment,
+            transport::{MockInterface, MockUtpTransport},
+            MockUtpStream, ADDR_1, ADDR_2,
+        },
+        traits::UtpEnvironment,
+    };
+
+    use super::{StreamArgs, UtpStream, VirtualSocket};
+
+    struct TestStream {
+        stream: MockUtpStream,
+        vsock: VirtualSocket<MockUtpTransport, MockUtpEnvironment>,
+        ack_to_send: Option<UtpHeader>,
+    }
+
+    struct TestStreams {
+        interface: Arc<MockInterface>,
+        s1: TestStream,
+        s2: TestStream,
+    }
+
+    fn create_2_internal_vsockets() -> TestStreams {
+        let interface = MockInterface::new();
+        let sock1 = interface.create_socket(ADDR_1);
+        let sock2 = interface.create_socket(ADDR_2);
+
+        let env = interface.env.clone();
+
+        let (tx1, rx1) = unbounded_channel();
+        let (tx2, rx2) = unbounded_channel();
+
+        let connection_id = 0;
+
+        let syn = UtpHeader {
+            htype: Type::ST_SYN,
+            connection_id,
+            timestamp_microseconds: 0,
+            timestamp_difference_microseconds: 0,
+            wnd_size: 0,
+            seq_nr: 0.into(),
+            ack_nr: 0.into(),
+        };
+
+        let stream_args = StreamArgs::new_incoming(0.into(), &syn);
+        let (stream1, vsock1, ack) = UtpStream::new_internal(&sock1, ADDR_2, rx1, stream_args);
+        let ack = ack.unwrap();
+
+        let (stream2, vsock2, None) = UtpStream::new_internal(
+            &sock2,
+            ADDR_2,
+            rx2,
+            StreamArgs::new_outgoing(&ack, env.now(), env.now()),
+        ) else {
+            panic!("did not expect first packet");
+        };
+
+        sock1.streams.insert((ADDR_2, connection_id), tx1.clone());
+        sock1.streams.insert((ADDR_2, connection_id + 1), tx1);
+
+        sock2.streams.insert((ADDR_2, connection_id), tx2.clone());
+        sock2.streams.insert((ADDR_2, connection_id + 1), tx2);
+
+        TestStreams {
+            interface,
+            s1: TestStream {
+                stream: stream1,
+                vsock: vsock1,
+                ack_to_send: Some(ack),
+            },
+            s2: TestStream {
+                stream: stream2,
+                vsock: vsock2,
+                ack_to_send: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_2_vsocks() {
+        create_2_internal_vsockets();
+    }
 }
