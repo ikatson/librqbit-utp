@@ -110,12 +110,6 @@ pub(crate) struct ValidatedSocketOpts {
     pub nagle: bool,
 }
 
-impl ValidatedSocketOpts {
-    pub fn wrap_torelance(&self) -> u16 {
-        self.virtual_socket_tx_packets as u16
-    }
-}
-
 pub struct UtpSocket<Transport> {
     // Todo private/public
     pub(crate) udp_socket: Transport,

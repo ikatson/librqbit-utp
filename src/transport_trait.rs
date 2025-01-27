@@ -1,6 +1,6 @@
 use std::{
     future::Future,
-    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     task::{Context, Poll},
 };
 

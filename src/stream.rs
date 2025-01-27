@@ -429,16 +429,6 @@ impl<T: Transport> VirtualSocket<T> {
         self.send_control_packet(cx, socket, self.outgoing_header())
     }
 
-    fn send_reset(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T>,
-    ) -> anyhow::Result<bool> {
-        let mut header = self.outgoing_header();
-        header.set_type(Type::ST_RESET);
-        self.send_control_packet(cx, socket, header)
-    }
-
     fn send_challenge_ack(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -496,7 +486,7 @@ impl<T: Transport> VirtualSocket<T> {
             update_optional_waker(&mut g.buffer_has_data, cx);
 
             if g.closed && self.state.transition_to_fin_sent(self.next_seq_nr) {
-                trace!(?self.state, "new state");
+                trace!(?self.state, "writer closed, transitioned state");
             }
 
             return Ok(());
@@ -1211,7 +1201,7 @@ impl<T: Transport> UtpStream<T> {
             last_consumed_ack_nr,
             last_sent_ack_nr,
             rx,
-            tx: Tx::new(socket.opts().wrap_torelance()),
+            tx: Tx::new(),
             user_rx_sender,
             local_rx_last_ack: None,
             local_rx_dup_acks: 0,

@@ -1,6 +1,6 @@
 use smoltcp::storage::RingBuffer;
 
-use crate::{raw::UtpHeader, seq_nr::SeqNr, utils::seq_nr_offset};
+use crate::{raw::UtpHeader, seq_nr::SeqNr};
 
 type RingBufferHeader = RingBuffer<'static, (UtpHeader, usize)>;
 
@@ -8,8 +8,6 @@ type RingBufferHeader = RingBuffer<'static, (UtpHeader, usize)>;
 // The payloads are stored in the user TX behind a shared lock. Users write there with poll_write().
 pub struct Tx {
     headers: RingBufferHeader,
-
-    wrap_tolerance: u16,
 }
 
 pub struct TxIterItem<'a> {
@@ -31,11 +29,9 @@ impl TxIterItem<'_> {
 }
 
 impl Tx {
-    // TODO: we can avoid copying by re-using user-sides TX queue. We can  just store fragments.
-    pub fn new(wrap_tolerance: u16) -> Self {
+    pub fn new() -> Self {
         Tx {
             headers: RingBufferHeader::new(vec![Default::default(); 64]),
-            wrap_tolerance,
         }
     }
 
