@@ -9,6 +9,10 @@
 // - poll_close and/or poll_shutdown impl
 //
 // TODO: tests (e.g. nagle etc)
+//
+// TODO: built-in connection timeouts?
+//
+// TODO: detect MTU at least through this crate https://github.com/mozilla/mtu/
 
 mod constants;
 mod message;
