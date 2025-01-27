@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Weak},
-    task::{Poll, Waker},
+    task::{ready, Poll, Waker},
     time::{Duration, Instant},
 };
 
@@ -35,6 +35,7 @@ use crate::{
 enum VirtualSocketState {
     Established,
     FinReceived,
+    FinSent,
     DeviceDead,
 }
 
@@ -399,7 +400,7 @@ impl VirtualSocket {
         cx: &mut std::task::Context<'_>,
     ) -> anyhow::Result<()> {
         let expecting_data = match self.state {
-            VirtualSocketState::Established => true,
+            VirtualSocketState::Established | VirtualSocketState::FinSent => true,
             VirtualSocketState::FinReceived => false,
             VirtualSocketState::DeviceDead => return Ok(()),
         };
@@ -710,15 +711,16 @@ impl VirtualSocket {
 struct WakeableRingBuffer {
     // Set when stream dies abruptly for writer to know about it.
     dead: bool,
+    // When the writer shuts down, or both reader and writer die, the stream is closed.
+    closed: bool,
 
     buffer: RingBuffer<'static, u8>,
+
     // This is woken up by dispatcher when the buffer has space if it didn't have it previously.
     buffer_no_longer_full: Option<Waker>,
-
-    // This is woken up by dispatcher when all packets where ACKed.
+    // This is woken up by dispatcher when all outstanding packets where ACKed.
     buffer_flushed: Option<Waker>,
-
-    // This is woken by by writer when it has space.
+    // This is woken by by writer when it has put smth into the buffer.
     buffer_has_data: Option<Waker>,
 }
 
@@ -857,10 +859,20 @@ impl AsyncWrite for UtpStreamWriteHalf {
     }
 
     fn poll_shutdown(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        todo!()
+        let flush_result = ready!(self.as_mut().poll_flush(cx));
+        if let Err(e) = flush_result {
+            return Poll::Ready(Err(e));
+        }
+        let mut g = self.get_mut().user_tx.locked.write();
+
+        g.closed = true;
+        if let Some(w) = g.buffer_has_data.take() {
+            w.wake();
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -1003,7 +1015,9 @@ impl UtpStream {
                 buffer: RingBuffer::new(vec![0u8; socket.opts().virtual_socket_tx_bytes]),
                 buffer_no_longer_full: None,
                 buffer_has_data: None,
+                buffer_flushed: None,
                 dead: false,
+                closed: false,
             }),
         });
 
