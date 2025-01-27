@@ -77,6 +77,10 @@ async fn main() -> anyhow::Result<()> {
     let client = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 8001);
     let server = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 8002);
 
+    let listener = UtpSocket::new_udp(server)
+        .await
+        .context("error creating socket")?;
+
     let client = tokio::spawn(
         async move {
             let client = UtpSocket::new_udp(client)
@@ -95,10 +99,7 @@ async fn main() -> anyhow::Result<()> {
 
     let server = tokio::spawn(
         async move {
-            let server = UtpSocket::new_udp(server)
-                .await
-                .context("error creating socket")?;
-            let sock = server.accept().await.context("error accepting")?;
+            let sock = listener.accept().await.context("error accepting")?;
             echo(sock).await.context("error running server echo")
         }
         .instrument(error_span!("server"))
@@ -107,6 +108,9 @@ async fn main() -> anyhow::Result<()> {
 
     try_join!(flatten(client), flatten(server))?;
     info!("finished");
+
+    // TODO: proper waiting for listener to finish
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     Ok(())
 }

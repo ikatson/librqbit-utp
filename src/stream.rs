@@ -9,7 +9,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use rand::random;
 use smoltcp::storage::RingBuffer;
 use tokio::{
@@ -41,6 +41,8 @@ enum VirtualSocketState {
     Established,
 
     // The UTP socket disconnected (either panicked or it was dropped).
+    // TODO: this is not true. It just means we got removed from socket.streams!
+    // Device is dead only when socket is dropped.
     DeviceDead,
 
     // We are fully done - both sides sent and acked FINs.

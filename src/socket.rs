@@ -278,9 +278,8 @@ impl<T: Transport> UtpSocket<T> {
         let stream_args = StreamArgs::new_incoming(&header);
         let stream = UtpStream::new(self, addr, rx, stream_args);
 
-        // TODO: validate already existing connections like this.
         self.streams.insert((addr, conn_id_recv), tx.clone());
-        self.streams.insert((addr, conn_id_send), tx.clone());
+        self.streams.insert((addr, conn_id_send), tx);
         Ok(stream)
     }
 
