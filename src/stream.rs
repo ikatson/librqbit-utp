@@ -34,12 +34,14 @@ use crate::{
 
 // This contains more states than Rust could model with its enums, but I'm keeping
 // the names for 1:1 TCP mapping.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum VirtualSocketState {
     Established,
 
-    //
+    // The UTP socket disconnected (either panicked or it was dropped).
     DeviceDead,
+
+    // We are fully done - both sides sent and acked FINs.
     Finished,
 
     // We sent FIN, not yet ACKed
@@ -514,6 +516,15 @@ impl VirtualSocket {
         Ok(())
     }
 
+    fn transition_to_device_dead(&mut self) {
+        if !matches!(self.state, VirtualSocketState::DeviceDead) {
+            debug!("marking device dead as rx is closed");
+            self.state = VirtualSocketState::DeviceDead;
+            let _ = self.user_rx_sender.send(UserRxMessage::DeviceClosed);
+            self.user_tx.locked.lock().mark_stream_dead();
+        }
+    }
+
     fn process_all_incoming_messages(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -522,8 +533,7 @@ impl VirtualSocket {
             let msg = match msg {
                 Some(msg) => msg,
                 None => {
-                    debug!("marking device dead as rx is closed");
-                    self.state = VirtualSocketState::DeviceDead;
+                    self.transition_to_device_dead();
                     return Ok(());
                 }
             };
@@ -717,7 +727,6 @@ impl VirtualSocket {
             Type::ST_STATE => Ok(()),
             Type::ST_RESET => bail!("ST_RESET received"),
             Type::ST_FIN => {
-                todo!();
                 self.send_ack(cx)?;
                 let _ = self.user_rx_sender.send(UserRxMessage::Eof);
                 Ok(())
@@ -771,24 +780,6 @@ impl VirtualSocket {
     }
 
     fn poll_at(&self) -> PollAt {
-        // The logic here mirrors the beginning of dispatch() closely.
-        // if self.tuple.is_none() {
-        //     // No one to talk to, nothing to transmit.
-        //     PollAt::Ingress
-        // } else if self.remote_last_ts.is_none() {
-        //     // Socket stopped being quiet recently, we need to acquire a timestamp.
-        //     PollAt::Now
-        // } else if self.state == State::Closed {
-        //     // Socket was aborted, we have an RST packet to transmit.
-        //     PollAt::Now
-        // } else if self.seq_to_transmit(cx) {
-        //     // We have a data or flag packet to transmit.
-        //     PollAt::Now
-        // } else if self.window_to_update() {
-        //     // The receive window has been raised significantly.
-        //     PollAt::Now
-        // } else {
-
         let want_ack = self.ack_to_transmit();
 
         let delayed_ack_poll_at = match (want_ack, self.timers.ack_delay_timer) {
@@ -865,6 +856,22 @@ pub struct UtpStreamReadHalf {
 pub struct UtpStreamWriteHalf {
     _guard: Arc<UtpStreamDropGuard>,
     user_tx: Arc<UserTx>,
+}
+
+impl UtpStreamWriteHalf {
+    fn close(&mut self) {
+        let mut g = self.user_tx.locked.lock();
+        g.closed = true;
+        if let Some(w) = g.buffer_has_data.take() {
+            w.wake();
+        }
+    }
+}
+
+impl Drop for UtpStreamWriteHalf {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 impl AsyncRead for UtpStreamReadHalf {
@@ -961,12 +968,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
         if let Err(e) = flush_result {
             return Poll::Ready(Err(e));
         }
-        let mut g = self.get_mut().user_tx.locked.lock();
-
-        g.closed = true;
-        if let Some(w) = g.buffer_has_data.take() {
-            w.wake();
-        }
+        self.get_mut().close();
         Poll::Ready(Ok(()))
     }
 }
@@ -1345,7 +1347,13 @@ impl std::future::Future for VirtualSocket {
         macro_rules! bail_if_err {
             ($e:expr) => {
                 match $e {
-                    Ok(val) => val,
+                    Ok(val) => {
+                        if this.state.is_done() {
+                            debug!(?this.state, "closing event loop");
+                            return Poll::Ready(Ok(()));
+                        }
+                        val
+                    }
                     Err(e) => return Poll::Ready(Err(e)),
                 }
             };
@@ -1358,11 +1366,6 @@ impl std::future::Future for VirtualSocket {
 
             // Read incoming stream.
             bail_if_err!(this.process_all_incoming_messages(cx));
-            if let VirtualSocketState::DeviceDead = this.state {
-                let _ = this.user_rx_sender.send(UserRxMessage::DeviceClosed);
-                this.user_tx.locked.lock().mark_stream_dead();
-                return Poll::Ready(Ok(()));
-            }
 
             bail_if_err!(this.maybe_send_delayed_ack(cx));
 
