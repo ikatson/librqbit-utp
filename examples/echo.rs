@@ -7,7 +7,7 @@ use std::{
 use anyhow::{bail, Context};
 use futures::FutureExt;
 pub use librqbit_utp::UtpSocket;
-use librqbit_utp::UtpStream;
+use librqbit_utp::UtpStreamUdp;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     time::timeout,
@@ -28,7 +28,7 @@ async fn flatten<JoinError>(
     }
 }
 
-async fn echo(stream: UtpStream) -> anyhow::Result<()> {
+async fn echo(stream: UtpStreamUdp) -> anyhow::Result<()> {
     let (reader, writer) = stream.split();
 
     let mut reader = tokio::io::BufReader::new(reader);
@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
 
     let client = tokio::spawn(
         async move {
-            let client = UtpSocket::new(client)
+            let client = UtpSocket::new_udp(client)
                 .await
                 .context("error creating socket")?;
             let sock = timeout(TIMEOUT, client.connect(server))
@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
 
     let server = tokio::spawn(
         async move {
-            let server = UtpSocket::new(server)
+            let server = UtpSocket::new_udp(server)
                 .await
                 .context("error creating socket")?;
             let sock = server.accept().await.context("error accepting")?;

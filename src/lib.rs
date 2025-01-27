@@ -28,7 +28,9 @@ mod rtte;
 mod seq_nr;
 mod stream;
 mod stream_tx;
+mod transport_trait;
 mod utils;
 
 pub use socket::UtpSocket;
-pub use stream::UtpStream;
+pub use stream::{UtpStream, UtpStreamUdp};
+pub use transport_trait::Transport;

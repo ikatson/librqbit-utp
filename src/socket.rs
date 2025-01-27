@@ -14,6 +14,7 @@ use crate::{
     packet_pool::PacketPool,
     raw::{Type, UtpHeader},
     stream::StreamArgs,
+    transport_trait::Transport,
     utils::spawn_print_error,
     UtpStream,
 };
@@ -115,9 +116,9 @@ impl ValidatedSocketOpts {
     }
 }
 
-pub struct UtpSocket {
+pub struct UtpSocket<Transport> {
     // Todo private/public
-    pub(crate) udp_socket: tokio::net::UdpSocket,
+    pub(crate) udp_socket: Transport,
     pub(crate) created: Instant,
     pub(crate) streams: dashmap::DashMap<Key, UnboundedSender<UtpMessage>>,
 
@@ -129,7 +130,7 @@ pub struct UtpSocket {
     opts: ValidatedSocketOpts,
 }
 
-impl std::fmt::Debug for UtpSocket {
+impl<T> std::fmt::Debug for UtpSocket<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UtpSocket")
             .field("addr", &self.local_addr)
@@ -137,21 +138,29 @@ impl std::fmt::Debug for UtpSocket {
     }
 }
 
-impl UtpSocket {
-    pub async fn new(bind_addr: SocketAddr) -> anyhow::Result<Arc<Self>> {
+impl UtpSocket<tokio::net::UdpSocket> {
+    pub async fn new_udp(bind_addr: SocketAddr) -> anyhow::Result<Arc<Self>> {
         let opts = SocketOpts::default();
-        Self::new_with_opts(bind_addr, opts).await
-    }
-
-    pub async fn new_with_opts(
-        bind_addr: SocketAddr,
-        opts: SocketOpts,
-    ) -> anyhow::Result<Arc<Self>> {
-        let opts = opts.validate().context("error validating socket options")?;
         let sock = tokio::net::UdpSocket::bind(bind_addr)
             .await
             .context("error binding")?;
-        let local_addr = sock.local_addr().context("cannot determine local addr")?;
+        Self::new_with_opts(sock, opts).await
+    }
+}
+
+impl<T: Transport> UtpSocket<T> {
+    pub async fn new(transport: T) -> anyhow::Result<Arc<Self>> {
+        let opts = SocketOpts::default();
+        Self::new_with_opts(transport, opts).await
+    }
+
+    pub async fn new_with_opts(transport: T, opts: SocketOpts) -> anyhow::Result<Arc<Self>> {
+        let opts = opts.validate().context("error validating socket options")?;
+        // let sock = tokio::net::UdpSocket::bind(bind_addr)
+        //     .await
+        //     .context("error binding")?;
+        let sock = transport;
+        let local_addr = sock.bind_addr();
 
         let (accept_tx, accept_rx) = unbounded_channel();
 
@@ -176,9 +185,9 @@ impl UtpSocket {
         &self.opts
     }
 
-    pub fn addr(&self) -> SocketAddr {
-        self.local_addr
-    }
+    // pub fn addr(&self) -> SocketAddr {
+    //     self.local_addr
+    // }
 
     async fn dispatcher(
         self: Arc<Self>,
@@ -253,7 +262,7 @@ impl UtpSocket {
     }
 
     #[tracing::instrument(name="utp_socket:accept", skip(self), fields(local=?self.local_addr))]
-    pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream> {
+    pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream<T>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.accept_tx.send(tx).context("error accepting")?;
 
@@ -276,7 +285,7 @@ impl UtpSocket {
     }
 
     #[tracing::instrument(name="utp_socket:connect", skip(self), fields(local=?self.local_addr))]
-    pub async fn connect(self: &Arc<Self>, remote: SocketAddr) -> anyhow::Result<UtpStream> {
+    pub async fn connect(self: &Arc<Self>, remote: SocketAddr) -> anyhow::Result<UtpStream<T>> {
         // create a "connecting" future. On received message, resolve the oneshot.
 
         // One for send one for recv.

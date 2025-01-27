@@ -76,12 +76,6 @@ impl std::cmp::PartialOrd for SeqNr {
 impl std::cmp::Ord for SeqNr {
     fn cmp(&self, other: &Self) -> Ordering {
         let offset = *self - *other;
-        if offset == 0 {
-            Ordering::Equal
-        } else if offset > 0 {
-            Ordering::Greater
-        } else {
-            Ordering::Less
-        }
+        offset.cmp(&0)
     }
 }

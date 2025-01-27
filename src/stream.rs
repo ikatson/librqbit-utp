@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    marker::PhantomData,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Weak},
@@ -28,6 +29,7 @@ use crate::{
     seq_nr::SeqNr,
     socket::ValidatedSocketOpts,
     stream_tx::Tx,
+    transport_trait::Transport,
     utils::{fill_buffer_from_rb, spawn_print_error, update_optional_waker},
     UtpSocket,
 };
@@ -145,9 +147,9 @@ enum UserRxMessage {
 }
 
 // An equivalent of a TCP socket for uTP.
-struct VirtualSocket {
+struct VirtualSocket<T> {
     state: VirtualSocketState,
-    socket: Weak<UtpSocket>,
+    socket: Weak<UtpSocket<T>>,
     socket_created: Instant,
     socket_opts: ValidatedSocketOpts,
 
@@ -215,7 +217,7 @@ struct ThisPoll {
     udp_socket_full: bool,
 }
 
-impl VirtualSocket {
+impl<T: Transport> VirtualSocket<T> {
     fn timestamp_microseconds(&self) -> u32 {
         self.socket_created.elapsed().as_micros() as u32
     }
@@ -824,14 +826,14 @@ struct UserTx {
 }
 
 // When both writer and reader are dropped, this will close the stream.
-struct UtpStreamDropGuard {
-    sock: Weak<UtpSocket>,
+struct UtpStreamDropGuard<T> {
+    sock: Weak<UtpSocket<T>>,
     addr: SocketAddr,
     id1: u16,
     id2: u16,
 }
 
-impl Drop for UtpStreamDropGuard {
+impl<T> Drop for UtpStreamDropGuard<T> {
     fn drop(&mut self) {
         if let Some(sock) = self.sock.upgrade() {
             sock.streams.remove(&(self.addr, self.id1));
@@ -840,25 +842,25 @@ impl Drop for UtpStreamDropGuard {
     }
 }
 
-impl Drop for VirtualSocket {
+impl<T> Drop for VirtualSocket<T> {
     fn drop(&mut self) {
         self.user_tx.locked.lock().mark_stream_dead();
     }
 }
 
-pub struct UtpStreamReadHalf {
-    _guard: Arc<UtpStreamDropGuard>,
+pub struct UtpStreamReadHalf<T> {
+    _guard: Arc<UtpStreamDropGuard<T>>,
     rx: UnboundedReceiver<UserRxMessage>,
     current: Option<UtpMessage>,
     offset: usize,
 }
 
-pub struct UtpStreamWriteHalf {
-    _guard: Arc<UtpStreamDropGuard>,
+pub struct UtpStreamWriteHalf<T> {
+    _guard: Arc<UtpStreamDropGuard<T>>,
     user_tx: Arc<UserTx>,
 }
 
-impl UtpStreamWriteHalf {
+impl<T> UtpStreamWriteHalf<T> {
     fn close(&mut self) {
         let mut g = self.user_tx.locked.lock();
         g.closed = true;
@@ -868,13 +870,13 @@ impl UtpStreamWriteHalf {
     }
 }
 
-impl Drop for UtpStreamWriteHalf {
+impl<T> Drop for UtpStreamWriteHalf<T> {
     fn drop(&mut self) {
         self.close();
     }
 }
 
-impl AsyncRead for UtpStreamReadHalf {
+impl<T> AsyncRead for UtpStreamReadHalf<T> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -915,7 +917,7 @@ impl AsyncRead for UtpStreamReadHalf {
     }
 }
 
-impl AsyncWrite for UtpStreamWriteHalf {
+impl<T> AsyncWrite for UtpStreamWriteHalf<T> {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -973,12 +975,15 @@ impl AsyncWrite for UtpStreamWriteHalf {
     }
 }
 
-pub struct UtpStream {
-    reader: UtpStreamReadHalf,
-    writer: UtpStreamWriteHalf,
+pub type UtpStreamUdp = UtpStream<tokio::net::UdpSocket>;
+
+pub struct UtpStream<T> {
+    reader: UtpStreamReadHalf<T>,
+    writer: UtpStreamWriteHalf<T>,
+    _phantom: PhantomData<T>,
 }
 
-impl AsyncRead for UtpStream {
+impl<T: Transport> AsyncRead for UtpStream<T> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -988,7 +993,7 @@ impl AsyncRead for UtpStream {
     }
 }
 
-impl AsyncWrite for UtpStream {
+impl<T: Transport> AsyncWrite for UtpStream<T> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1085,9 +1090,9 @@ impl StreamArgs {
     }
 }
 
-impl UtpStream {
+impl<T: Transport> UtpStream<T> {
     pub(crate) fn new(
-        socket: &Arc<UtpSocket>,
+        socket: &Arc<UtpSocket<T>>,
         addr: SocketAddr,
         rx: UnboundedReceiver<UtpMessage>,
         args: StreamArgs,
@@ -1216,6 +1221,7 @@ impl UtpStream {
         Self {
             reader: read_half,
             writer: write_half,
+            _phantom: PhantomData,
         }
     }
 
@@ -1338,7 +1344,7 @@ impl Timers {
 }
 
 // The main dispatch loop for the virtual socket is here.
-impl std::future::Future for VirtualSocket {
+impl<T: Transport> std::future::Future for VirtualSocket<T> {
     type Output = anyhow::Result<()>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
