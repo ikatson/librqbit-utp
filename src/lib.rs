@@ -16,18 +16,18 @@
 //
 // TODO: detect MTU at least through this crate https://github.com/mozilla/mtu/
 
+mod assembled_rx;
+mod congestion;
 mod constants;
 mod message;
 mod packet_pool;
 pub mod raw;
-mod socket;
-// mod stream;
-mod assembled_rx;
-mod congestion;
 mod rtte;
 mod seq_nr;
+mod socket;
 mod stream;
 mod stream_tx;
+
 #[cfg(test)]
 mod test_util;
 mod traits;

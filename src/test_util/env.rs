@@ -5,8 +5,17 @@ use parking_lot::Mutex;
 use crate::traits::UtpEnvironment;
 
 pub struct MockRandom {
-    current: usize,
-    all: Vec<u16>,
+    pub current: usize,
+    pub all: Vec<u16>,
+}
+
+impl Default for MockRandom {
+    fn default() -> Self {
+        Self {
+            current: 0,
+            all: (0..10).collect(),
+        }
+    }
 }
 
 impl MockRandom {
@@ -28,9 +37,12 @@ pub struct MockUtpEnvironment {
 }
 
 impl MockUtpEnvironment {
-    pub fn new(now: Instant, random: MockRandom) -> Self {
+    pub fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(MockUtpEnvironmentInner { now, random })),
+            inner: Arc::new(Mutex::new(MockUtpEnvironmentInner {
+                now: Instant::now(),
+                random: Default::default(),
+            })),
         }
     }
 

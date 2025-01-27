@@ -377,3 +377,32 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         Ok(false)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+
+    use tokio::join;
+
+    use crate::{
+        test_util::{env::MockUtpEnvironment, transport::MockUtpTransport},
+        UtpSocket,
+    };
+
+    #[tokio::test]
+    async fn test_echo() {
+        let transport = MockUtpTransport::new();
+        let env = MockUtpEnvironment::new();
+
+        let remote: SocketAddr = (Ipv4Addr::LOCALHOST, 2).into();
+
+        let socket = UtpSocket::new_with_opts(transport, env, Default::default())
+            .await
+            .unwrap();
+
+        let connect = async { socket.connect(remote).await.unwrap() };
+        let accept = async { socket.accept().await.unwrap() };
+
+        join!(connect, accept);
+    }
+}

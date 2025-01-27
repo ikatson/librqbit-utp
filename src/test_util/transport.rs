@@ -1,16 +1,38 @@
 use std::{
+    collections::VecDeque,
+    future::poll_fn,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
+    task::Poll,
 };
 
 use parking_lot::Mutex;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::Transport;
 
-struct MockUtpTransportInner {}
+type Msg = (SocketAddr, Vec<u8>);
 
+struct MockUtpTransportInner {
+    rx: Mutex<UnboundedReceiver<Msg>>,
+    tx: UnboundedSender<Msg>,
+}
+
+#[derive(Clone)]
 pub struct MockUtpTransport {
-    inner: Arc<Mutex<MockUtpTransportInner>>,
+    inner: Arc<MockUtpTransportInner>,
+}
+
+impl MockUtpTransport {
+    pub fn new() -> Self {
+        let (tx, rx) = unbounded_channel();
+        Self {
+            inner: Arc::new(MockUtpTransportInner {
+                rx: Mutex::new(rx),
+                tx,
+            }),
+        }
+    }
 }
 
 const DEFAULT_BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
@@ -20,7 +42,11 @@ impl Transport for MockUtpTransport {
         &'a self,
         buf: &'a mut [u8],
     ) -> std::io::Result<(usize, std::net::SocketAddr)> {
-        Ok((0, "0.0.0.0:0".parse().unwrap()))
+        let f = poll_fn(|cx| self.inner.rx.lock().poll_recv(cx));
+        let (addr, data): Msg = f.await.unwrap();
+        assert!(data.len() <= buf.len());
+        buf[..data.len()].copy_from_slice(&data);
+        Ok((data.len(), addr))
     }
 
     async fn send_to<'a>(
@@ -28,7 +54,9 @@ impl Transport for MockUtpTransport {
         buf: &'a [u8],
         target: std::net::SocketAddr,
     ) -> std::io::Result<usize> {
-        Ok(0)
+        let len = buf.len();
+        self.inner.tx.send((target, buf.to_owned())).unwrap();
+        Ok(len)
     }
 
     fn poll_send_to(
@@ -37,7 +65,9 @@ impl Transport for MockUtpTransport {
         buf: &[u8],
         target: std::net::SocketAddr,
     ) -> std::task::Poll<std::io::Result<usize>> {
-        todo!()
+        let len = buf.len();
+        self.inner.tx.send((target, buf.to_owned())).unwrap();
+        Poll::Ready(Ok(len))
     }
 
     fn bind_addr(&self) -> std::net::SocketAddr {

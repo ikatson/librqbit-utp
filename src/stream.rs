@@ -1474,9 +1474,3 @@ pub(crate) enum PollAt {
     /// The socket does not need to be polled unless there are external changes.
     Ingress,
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_create_mocked() {}
-}
