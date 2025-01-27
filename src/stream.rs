@@ -43,7 +43,7 @@ enum VirtualSocketState {
     // The UTP socket disconnected (either panicked or it was dropped).
     // TODO: this is not true. It just means we got removed from socket.streams!
     // Device is dead only when socket is dropped.
-    DeviceDead,
+    // DeviceDead,
 
     // We are fully done - both sides sent and acked FINs.
     Finished,
@@ -67,10 +67,7 @@ enum VirtualSocketState {
 
 impl VirtualSocketState {
     fn is_done(&self) -> bool {
-        matches!(
-            self,
-            VirtualSocketState::DeviceDead | VirtualSocketState::Finished
-        )
+        matches!(self, VirtualSocketState::Finished)
     }
 
     fn transition_to_fin_sent(&mut self, our_fin: SeqNr) {
@@ -126,7 +123,7 @@ impl VirtualSocketState {
             VirtualSocketState::Established => {
                 *self = VirtualSocketState::CloseWait;
             }
-            VirtualSocketState::DeviceDead | VirtualSocketState::Finished => {}
+            VirtualSocketState::Finished => {}
             VirtualSocketState::FinWait1 { our_fin } => {
                 *self = VirtualSocketState::Closing { our_fin };
             }
@@ -210,13 +207,15 @@ struct VirtualSocket<T> {
 
 // Updated on every poll
 struct ThisPoll {
+    // Set here once per poll for consistent reproducible calculations.
     now: Instant,
 
     // Temp buffer used for writing messages to socket, so that we dno't alloc and zero
     // it every time.
     tmp_buf: Vec<u8>,
-    // Temp variable used during poll() and conveniently stored here not to pass it around
-    udp_socket_full: bool,
+
+    // Set if the transport can't send anything this poll.
+    transport_pending: bool,
 }
 
 impl<T: Transport> VirtualSocket<T> {
@@ -256,17 +255,19 @@ impl<T: Transport> VirtualSocket<T> {
     }
 
     // Returns true if UDP socket is full
-    fn send_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
+    fn send_tx_queue(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        socket: &UtpSocket<T>,
+    ) -> anyhow::Result<()> {
         if self.tx.is_empty() {
             return Ok(());
         }
 
         // No reason to send anything, we'll get polled next time.
-        if self.this_poll.udp_socket_full {
+        if self.this_poll.transport_pending {
             return Ok(());
         }
-
-        let sock = self.socket.upgrade().context("socket closed")?;
 
         let mut sent = false;
         let mut recv_wnd =
@@ -301,18 +302,18 @@ impl<T: Transport> VirtualSocket<T> {
                 })
                 .context("bug: wasn't able to serialize the buffer")?;
 
-            self.this_poll.udp_socket_full |=
-                sock.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.addr)?;
+            self.this_poll.transport_pending |=
+                socket.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.addr)?;
 
             trace!(
                 %header.seq_nr,
                 %header.ack_nr,
                 payload_size = len,
-                socket_was_full = self.this_poll.udp_socket_full,
+                socket_was_full = self.this_poll.transport_pending,
                 "attempted to send ST_DATA"
             );
 
-            if self.this_poll.udp_socket_full {
+            if self.this_poll.transport_pending {
                 break;
             }
 
@@ -333,10 +334,14 @@ impl<T: Transport> VirtualSocket<T> {
         Ok(())
     }
 
-    fn maybe_send_delayed_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+    fn maybe_send_delayed_ack(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        socket: &UtpSocket<T>,
+    ) -> anyhow::Result<bool> {
         if self.delayed_ack_expired() && self.ack_to_transmit() {
             trace!("delayed ack expired, sending ACK");
-            self.send_ack(cx)
+            self.send_ack(cx, socket)
         } else {
             Ok(false)
         }
@@ -379,9 +384,10 @@ impl<T: Transport> VirtualSocket<T> {
     fn send_control_packet(
         &mut self,
         cx: &mut std::task::Context<'_>,
+        socket: &UtpSocket<T>,
         header: UtpHeader,
     ) -> anyhow::Result<bool> {
-        if self.this_poll.udp_socket_full {
+        if self.this_poll.transport_pending {
             return Ok(false);
         }
 
@@ -395,12 +401,11 @@ impl<T: Transport> VirtualSocket<T> {
         let len = header
             .serialize(&mut self.this_poll.tmp_buf)
             .context("bug")?;
-        let sock = self.socket.upgrade().context("no socket")?;
 
-        self.this_poll.udp_socket_full =
-            sock.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.addr)?;
+        self.this_poll.transport_pending =
+            socket.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.addr)?;
 
-        let sent = !self.this_poll.udp_socket_full;
+        let sent = !self.this_poll.transport_pending;
 
         // Each control packet can act as ACK so update related state.
         if sent {
@@ -412,23 +417,35 @@ impl<T: Transport> VirtualSocket<T> {
         Ok(sent)
     }
 
-    fn send_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
-        self.send_control_packet(cx, self.outgoing_header())
+    fn send_ack(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        socket: &UtpSocket<T>,
+    ) -> anyhow::Result<bool> {
+        self.send_control_packet(cx, socket, self.outgoing_header())
     }
 
-    fn send_reset(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+    fn send_reset(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        socket: &UtpSocket<T>,
+    ) -> anyhow::Result<bool> {
         let mut header = self.outgoing_header();
         header.set_type(Type::ST_RESET);
-        self.send_control_packet(cx, header)
+        self.send_control_packet(cx, socket, header)
     }
 
-    fn send_challenge_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+    fn send_challenge_ack(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        socket: &UtpSocket<T>,
+    ) -> anyhow::Result<bool> {
         if self.this_poll.now < self.timers.challenge_ack_timer {
             return Ok(false);
         }
 
         // Rate-limit to 1 per second max.
-        if self.send_ack(cx)? {
+        if self.send_ack(cx, socket)? {
             trace!("sending challenge ACK");
             self.timers.challenge_ack_timer = self.this_poll.now + CHALLENGE_ACK_RATELIMIT;
             Ok(true)
@@ -437,8 +454,12 @@ impl<T: Transport> VirtualSocket<T> {
         }
     }
 
-    fn maybe_send_fin(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
-        if self.this_poll.udp_socket_full {
+    fn maybe_send_fin(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        socket: &UtpSocket<T>,
+    ) -> anyhow::Result<()> {
+        if self.this_poll.transport_pending {
             return Ok(());
         }
 
@@ -454,7 +475,7 @@ impl<T: Transport> VirtualSocket<T> {
 
         let mut fin = self.outgoing_header();
         fin.seq_nr = seq_nr;
-        if self.send_control_packet(cx, fin)? {
+        if self.send_control_packet(cx, socket, fin)? {
             self.timers
                 .kind
                 .set_for_retransmit(self.this_poll.now, self.rtte.retransmission_timeout());
@@ -520,28 +541,41 @@ impl<T: Transport> VirtualSocket<T> {
         Ok(())
     }
 
-    fn transition_to_device_dead(&mut self) {
-        if !matches!(self.state, VirtualSocketState::DeviceDead) {
-            debug!("marking device dead as rx is closed");
-            self.state = VirtualSocketState::DeviceDead;
-            let _ = self.user_rx_sender.send(UserRxMessage::DeviceClosed);
-            self.user_tx.locked.lock().mark_stream_dead();
-        }
-    }
+    // fn transition_to_device_dead(&mut self) {
+    //     if !matches!(self.state, VirtualSocketState::DeviceDead) {
+    //         debug!("marking device dead as rx is closed");
+    //         self.state = VirtualSocketState::DeviceDead;
+    //         let _ = self.user_rx_sender.send(UserRxMessage::DeviceClosed);
+    //         self.user_tx.locked.lock().mark_stream_dead();
+    //     }
+    // }
 
     fn process_all_incoming_messages(
         &mut self,
         cx: &mut std::task::Context<'_>,
+        socket: &UtpSocket<T>,
     ) -> anyhow::Result<()> {
         while let Poll::Ready(msg) = self.rx.poll_recv(cx) {
             let msg = match msg {
                 Some(msg) => msg,
                 None => {
-                    self.transition_to_device_dead();
+                    // This could happen in the following scenarios:
+                    // 1. The socket is dead. In this case any attempt to send() will result in poll() erroring out,
+                    //    as the Weak<socket>.upgrade() will fail.
+                    //    It's useless running dispatcher in this state, we can just quit.
+                    //
+                    // 2. We were removed from socket.streams().
+                    //    The only case this could happen is both reader and writer are dropped.
+                    //
+                    //    We need to send FIN in this case, but we can't wait for its ACK to arrive back, cause we can't
+                    //    receive any messages!
+
+                    todo!();
+                    // self.transition_to_device_dead();
                     return Ok(());
                 }
             };
-            self.process_incoming_message(cx, msg)?;
+            self.process_incoming_message(cx, socket, msg)?;
         }
         Ok(())
     }
@@ -555,6 +589,7 @@ impl<T: Transport> VirtualSocket<T> {
     fn process_incoming_message(
         &mut self,
         cx: &mut std::task::Context<'_>,
+        socket: &UtpSocket<T>,
         msg: UtpMessage,
     ) -> anyhow::Result<()> {
         trace!("on_message");
@@ -660,7 +695,7 @@ impl<T: Transport> VirtualSocket<T> {
                         %self.last_consumed_ack_nr,
                         "dropping message, we already ACKed it"
                     );
-                    self.send_challenge_ack(cx)?;
+                    self.send_challenge_ack(cx, socket)?;
                     return Ok(());
                 }
 
@@ -724,14 +759,14 @@ impl<T: Transport> VirtualSocket<T> {
                         immediate_ack_to_transmit = self.immediate_ack_to_transmit(),
                         "sending immediate ACK"
                     );
-                    self.send_ack(cx)?;
+                    self.send_ack(cx, socket)?;
                 }
                 Ok(())
             }
             Type::ST_STATE => Ok(()),
             Type::ST_RESET => bail!("ST_RESET received"),
             Type::ST_FIN => {
-                self.send_ack(cx)?;
+                self.send_ack(cx, socket)?;
                 let _ = self.user_rx_sender.send(UserRxMessage::Eof);
                 Ok(())
             }
@@ -1189,7 +1224,7 @@ impl<T: Transport> UtpStream<T> {
             this_poll: ThisPoll {
                 now,
                 tmp_buf: vec![0u8; socket.opts().max_packet_size],
-                udp_socket_full: false,
+                transport_pending: false,
             },
             congestion_controller: {
                 let mut controller = Reno::default();
@@ -1362,20 +1397,27 @@ impl<T: Transport> std::future::Future for VirtualSocket<T> {
                         }
                         val
                     }
-                    Err(e) => return Poll::Ready(Err(e)),
+                    Err(e) => {
+                        // TODO: can do cleanup here.
+                        return Poll::Ready(Err(e));
+                    },
                 }
             };
         }
 
+        // Doing this once here not to upgrade too often below.
+        let socket = bail_if_err!(this.socket.upgrade().context("device dead"));
+        let socket = &*socket;
+
+        // Track if UDP socket is full this poll, and don't send to it if so.
+        this.this_poll.transport_pending = false;
+        this.this_poll.now = Instant::now();
+
         loop {
-            // Track if UDP socket is full this poll, and don't send to it if so.
-            this.this_poll.udp_socket_full = false;
-            this.this_poll.now = Instant::now();
-
             // Read incoming stream.
-            bail_if_err!(this.process_all_incoming_messages(cx));
+            bail_if_err!(this.process_all_incoming_messages(cx, socket));
 
-            bail_if_err!(this.maybe_send_delayed_ack(cx));
+            bail_if_err!(this.maybe_send_delayed_ack(cx, socket));
 
             this.maybe_prepare_for_retransmission();
 
@@ -1383,12 +1425,15 @@ impl<T: Transport> std::future::Future for VirtualSocket<T> {
             bail_if_err!(this.fragment_tx_queue(cx));
 
             // (Re)send tx queue.
-            bail_if_err!(this.send_tx_queue(cx));
+            bail_if_err!(this.send_tx_queue(cx, socket));
 
-            bail_if_err!(this.maybe_send_fin(cx));
+            bail_if_err!(this.maybe_send_fin(cx, socket));
 
             match this.poll_at() {
                 PollAt::Now => {
+                    if this.this_poll.transport_pending {
+                        return Poll::Pending;
+                    }
                     trace!("need to repoll");
                     continue;
                 }
