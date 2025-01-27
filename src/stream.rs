@@ -70,6 +70,19 @@ impl VirtualSocketState {
         true
     }
 
+    fn our_fin_if_unacked(&self) -> Option<SeqNr> {
+        match *self {
+            VirtualSocketState::Established
+            | VirtualSocketState::DeviceDead
+            | VirtualSocketState::CloseWait
+            | VirtualSocketState::FinWait2 { .. } => None,
+
+            VirtualSocketState::FinWait1 { our_fin }
+            | VirtualSocketState::Closing { our_fin }
+            | VirtualSocketState::LastAck { our_fin } => Some(our_fin),
+        }
+    }
+
     fn transition_to_fin_received(&mut self, remote_ack_nr: SeqNr) -> bool {
         match *self {
             VirtualSocketState::Established => *self = VirtualSocketState::CloseWait,
@@ -286,27 +299,14 @@ impl VirtualSocket {
 
     fn maybe_prepare_for_retransmission(&mut self) {
         if let Some(retransmit_delta) = self.timers.kind.should_retransmit(self.this_poll.now) {
-            // TODO: maybe store last acked seq_nr somewhere to make this logic simpler? If it diverges
-            // from tx_first though it will be a bug.
-
-            let rewind_to = match (self.tx.first_seq_nr(), self.state) {
-                // Retransmit ST_DATA
-                (Some(tx_first), _) => tx_first.saturating_sub(1),
-
-                // Retransmit FIN
-                (
-                    None,
-                    VirtualSocketState::FinSent {
-                        seq_nr,
-                        acked: false,
-                    },
-                ) => seq_nr.saturating_sub(1),
-                _ => {
-                    debug!("retransmission timer triggered but nothing to retransmit");
-
-                    self.timers.kind.set_for_idle();
-                    return;
-                }
+            let rewind_to = self
+                .tx
+                .first_seq_nr()
+                .or_else(|| self.state.our_fin_if_unacked())
+                .map(|rw| rw - 1);
+            let rewind_to = match rewind_to {
+                Some(v) => v,
+                None => return,
             };
 
             // If a retransmit timer expired, we should resend data starting at the last ACK.
@@ -397,32 +397,25 @@ impl VirtualSocket {
             return Ok(());
         }
 
-        match self.state {
-            VirtualSocketState::FinSent {
-                seq_nr,
-                acked: false,
-            } => {
-                // Only send fin after all the outstanding data was sent.
-                if seq_nr - self.last_sent_seq_nr != 1 {
-                    return Ok(());
-                }
+        let seq_nr = match self.state.our_fin_if_unacked() {
+            Some(seq_nr) => seq_nr,
+            None => return Ok(()),
+        };
 
-                let mut fin = self.outgoing_header();
-                fin.seq_nr = seq_nr;
-                if self.send_control_packet(cx, fin)? {
-                    self.timers
-                        .kind
-                        .set_for_retransmit(self.this_poll.now, self.rtte.retransmission_timeout());
-                    self.state = VirtualSocketState::FinSent {
-                        seq_nr,
-                        acked: false,
-                    };
-                    self.last_sent_seq_nr = seq_nr;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
+        // Only send fin after all the outstanding data was sent.
+        if seq_nr - self.last_sent_seq_nr != 1 {
+            return Ok(());
         }
+
+        let mut fin = self.outgoing_header();
+        fin.seq_nr = seq_nr;
+        if self.send_control_packet(cx, fin)? {
+            self.timers
+                .kind
+                .set_for_retransmit(self.this_poll.now, self.rtte.retransmission_timeout());
+            self.last_sent_seq_nr = seq_nr;
+        }
+        Ok(())
     }
 
     fn fragment_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
@@ -687,8 +680,7 @@ impl VirtualSocket {
 
             Type::ST_RESET => bail!("ST_RESET received"),
             Type::ST_FIN => {
-                self.state = VirtualSocketState::FinReceived;
-                self.last_consumed_ack_nr += 1;
+                todo!();
                 self.send_ack(cx)?;
                 let _ = self.user_rx_sender.send(UserRxMessage::Eof);
                 Ok(())
