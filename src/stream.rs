@@ -31,8 +31,19 @@ use crate::{
     UtpSocket,
 };
 
+enum VirtualSocketState {
+    Established,
+    DeviceDead,
+}
+
+enum UserRxMessage {
+    UtpMessage(UtpMessage),
+    DeviceClosed,
+}
+
 // An equivalent of a TCP socket for uTP.
 struct VirtualSocket {
+    state: VirtualSocketState,
     socket: Weak<UtpSocket>,
     socket_created: Instant,
     socket_opts: ValidatedSocketOpts,
@@ -75,9 +86,7 @@ struct VirtualSocket {
 
     // The user sides's queue with packets fully processed and ready to consume.
     // This is what "UtpStream::poll_read" reads from.
-    //
-    // TODO: make bounded if the user doesn't read, we need to stop.
-    user_rx_sender: UnboundedSender<UtpMessage>,
+    user_rx_sender: UnboundedSender<UserRxMessage>,
 
     // Last received ACK for fast retransmit
     local_rx_last_ack: Option<u16>,
@@ -364,7 +373,14 @@ impl VirtualSocket {
         cx: &mut std::task::Context<'_>,
     ) -> anyhow::Result<()> {
         while let Poll::Ready(msg) = self.rx.poll_recv(cx) {
-            let msg = msg.context("rx channel closed")?;
+            let msg = match msg {
+                Some(msg) => msg,
+                None => {
+                    debug!("marking device dead as rx is closed");
+                    self.state = VirtualSocketState::DeviceDead;
+                    return Ok(());
+                }
+            };
             self.process_incoming_message(cx, msg)?;
         }
         Ok(())
@@ -437,7 +453,7 @@ impl VirtualSocket {
                 let ack_nr = msg.header.ack_nr;
 
                 match self.assembler.add_remove(msg, offset as usize, |msg| {
-                    let _ = self.user_rx_sender.send(msg);
+                    let _ = self.user_rx_sender.send(UserRxMessage::UtpMessage(msg));
                 }) {
                     Ok(count) => {
                         self.rtte.on_ack(self.this_poll.now, ack_nr);
@@ -692,7 +708,7 @@ impl Drop for VirtualSocket {
 
 pub struct UtpStreamReadHalf {
     _guard: Arc<UtpStreamDropGuard>,
-    rx: UnboundedReceiver<UtpMessage>,
+    rx: UnboundedReceiver<UserRxMessage>,
     current: Option<UtpMessage>,
     offset: usize,
 }
@@ -729,7 +745,10 @@ impl AsyncRead for UtpStreamReadHalf {
             }
 
             let msg = match this.rx.poll_recv(cx) {
-                Poll::Ready(Some(msg)) => msg,
+                Poll::Ready(Some(UserRxMessage::UtpMessage(msg))) => msg,
+                Poll::Ready(Some(UserRxMessage::DeviceClosed)) => {
+                    return Poll::Ready(Err(std::io::Error::other("device closed")))
+                }
                 Poll::Ready(None) => return Poll::Ready(Err(std::io::Error::other("socket died"))),
                 Poll::Pending => return Poll::Pending,
             };
@@ -947,6 +966,7 @@ impl UtpStream {
         let socket_opts = socket.opts();
 
         let state = VirtualSocket {
+            state: VirtualSocketState::Established,
             socket: Arc::downgrade(socket),
             socket_created: socket.created,
             socket_opts: *socket_opts,
@@ -1164,6 +1184,11 @@ impl std::future::Future for VirtualSocket {
 
             // Read incoming stream.
             bail_if_err!(this.process_all_incoming_messages(cx));
+            if let VirtualSocketState::DeviceDead = this.state {
+                let _ = this.user_rx_sender.send(UserRxMessage::DeviceClosed);
+                this.user_tx.locked.write().mark_stream_dead();
+                return Poll::Ready(Ok(()));
+            }
 
             bail_if_err!(this.maybe_send_delayed_ack(cx));
 

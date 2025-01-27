@@ -1,4 +1,4 @@
-// TODO: informing writer of socket death.
+// "error: error running utp stream event loop: rx channel closed" - detect if it's ok
 //
 // TODO: congestion control
 //
