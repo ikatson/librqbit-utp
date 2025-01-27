@@ -538,7 +538,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn just_before_death(&mut self, error: Option<&anyhow::Error>) {
-        // This will close the reader with a useful message.
+        if let Some(err) = error {
+            trace!("just_before_death: {err:#}");
+        } else {
+            trace!("just_before_death: no error");
+        }
+
         let _ = self.user_rx_sender.send(
             error
                 .map(|e| UserRxMessage::Error(format!("{e:#}")))
@@ -939,6 +944,7 @@ impl<T: Transport, Env: UtpEnvironment> AsyncRead for UtpStreamReadHalf<T, Env> 
                     return Poll::Ready(Err(std::io::Error::other(msg)))
                 }
                 Poll::Ready(Some(UserRxMessage::Eof)) => return Poll::Ready(Ok(())),
+
                 Poll::Ready(None) => return Poll::Ready(Err(std::io::Error::other("socket died"))),
                 Poll::Pending => return Poll::Pending,
             };

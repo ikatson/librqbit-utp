@@ -382,9 +382,10 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
+    use anyhow::{bail, Context};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        join,
+        join, try_join,
     };
 
     use crate::test_util::{
@@ -393,7 +394,7 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn test_echo() {
+    async fn test_echo() -> anyhow::Result<()> {
         setup_test_logging();
         let transport = MockUtpTransport::new();
         let env = MockUtpEnvironment::new();
@@ -404,17 +405,29 @@ mod tests {
             .await
             .unwrap();
 
-        async fn echo(s: MockUtpStream) {
+        async fn echo(s: MockUtpStream) -> anyhow::Result<()> {
             let (mut r, mut w) = s.split();
-            w.write_u32(42).await.unwrap();
+            w.write_u32(42).await.context("error writing 42")?;
 
-            let read = r.read_u32().await.unwrap();
-            assert_eq!(read, 42)
+            let read = r.read_u32().await.context("error reading u32")?;
+            if read != 42 {
+                bail!("expected 42, got {}", read);
+            }
+            Ok(())
         }
 
-        let connect = async { echo(socket.connect(remote).await.unwrap()).await };
-        let accept = async { echo(socket.accept().await.unwrap()).await };
+        let connect = async {
+            echo(socket.connect(remote).await.context("error connecting")?)
+                .await
+                .context("error running echo connect")
+        };
+        let accept = async {
+            echo(socket.accept().await.context("error accepting")?)
+                .await
+                .context("error running echo accept")
+        };
 
-        join!(connect, accept);
+        try_join!(connect, accept)?;
+        Ok(())
     }
 }
