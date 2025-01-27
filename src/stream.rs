@@ -478,6 +478,7 @@ impl<T: Transport> VirtualSocket<T> {
         }
 
         let mut fin = self.outgoing_header();
+        fin.set_type(Type::ST_FIN);
         fin.seq_nr = seq_nr;
         if self.send_control_packet(cx, socket, fin)? {
             self.timers
@@ -494,8 +495,8 @@ impl<T: Transport> VirtualSocket<T> {
         if g.buffer.is_empty() {
             update_optional_waker(&mut g.buffer_has_data, cx);
 
-            if g.closed {
-                self.state.transition_to_fin_sent(self.next_seq_nr);
+            if g.closed && self.state.transition_to_fin_sent(self.next_seq_nr) {
+                trace!(?self.state, "new state");
             }
 
             return Ok(());
