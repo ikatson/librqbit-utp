@@ -1,3 +1,5 @@
+use std::{net::SocketAddr, sync::Arc};
+
 use env::MockUtpEnvironment;
 use transport::MockUtpTransport;
 
@@ -14,4 +16,13 @@ pub fn setup_test_logging() {
         std::env::set_var("RUST_LOG", "trace");
     }
     let _ = tracing_subscriber::fmt::try_init();
+}
+
+pub async fn create_mock_socket(bind_addr: SocketAddr) -> Arc<MockUtpSocket> {
+    let transport = MockUtpTransport::new(bind_addr);
+    let env = MockUtpEnvironment::new();
+
+    MockUtpSocket::new_with_opts(transport, env, Default::default())
+        .await
+        .unwrap()
 }

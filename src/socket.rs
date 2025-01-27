@@ -385,25 +385,19 @@ mod tests {
     use anyhow::{bail, Context};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
-        join, try_join,
+        try_join,
     };
 
-    use crate::test_util::{
-        env::MockUtpEnvironment, setup_test_logging, transport::MockUtpTransport, MockUtpSocket,
-        MockUtpStream,
-    };
+    use crate::test_util::{create_mock_socket, setup_test_logging, MockUtpStream};
 
     #[tokio::test]
     async fn test_echo() -> anyhow::Result<()> {
         setup_test_logging();
-        let transport = MockUtpTransport::new();
-        let env = MockUtpEnvironment::new();
+        let client_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 1).into();
+        let server_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 2).into();
 
-        let remote: SocketAddr = (Ipv4Addr::LOCALHOST, 2).into();
-
-        let socket = MockUtpSocket::new_with_opts(transport, env, Default::default())
-            .await
-            .unwrap();
+        let client = create_mock_socket(client_addr).await;
+        let server = create_mock_socket(server_addr).await;
 
         async fn echo(s: MockUtpStream) -> anyhow::Result<()> {
             let (mut r, mut w) = s.split();
@@ -417,12 +411,17 @@ mod tests {
         }
 
         let connect = async {
-            echo(socket.connect(remote).await.context("error connecting")?)
-                .await
-                .context("error running echo connect")
+            echo(
+                client
+                    .connect(server_addr)
+                    .await
+                    .context("error connecting")?,
+            )
+            .await
+            .context("error running echo connect")
         };
         let accept = async {
-            echo(socket.accept().await.context("error accepting")?)
+            echo(server.accept().await.context("error accepting")?)
                 .await
                 .context("error running echo accept")
         };

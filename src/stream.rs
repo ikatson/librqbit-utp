@@ -574,6 +574,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     //    We need to send FIN in this case, but we can't wait for its ACK to arrive back, cause we can't
                     //    receive any messages!
 
+                    trace!("no more data. transitioning to FINISHED");
                     self.state.transition_to_fin_sent(self.next_seq_nr);
                     self.maybe_send_fin(cx, socket)?;
                     self.state = VirtualSocketState::Finished;

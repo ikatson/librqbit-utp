@@ -5,11 +5,12 @@ use std::{
     task::Poll,
 };
 
+use anyhow::Context;
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::trace;
 
-use crate::{constants::UTP_HEADER_SIZE, raw::UtpHeader, Transport};
+use crate::{raw::UtpHeader, Transport};
 
 type Msg = (SocketAddr, Vec<u8>);
 
@@ -26,16 +27,18 @@ struct MockUtpTransportInner {
 #[derive(Clone)]
 pub struct MockUtpTransport {
     inner: Arc<MockUtpTransportInner>,
+    bind_addr: SocketAddr,
 }
 
 impl MockUtpTransport {
-    pub fn new() -> Self {
+    pub fn new(bind_addr: SocketAddr) -> Self {
         let (tx, rx) = unbounded_channel();
         Self {
             inner: Arc::new(MockUtpTransportInner {
                 locked: Mutex::new(MockUtpTransportInnerLocked { rx }),
                 tx,
             }),
+            bind_addr,
         }
     }
 
@@ -49,8 +52,6 @@ impl MockUtpTransport {
         Ok(len)
     }
 }
-
-const DEFAULT_BIND_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5000);
 
 impl Transport for MockUtpTransport {
     async fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
@@ -75,6 +76,6 @@ impl Transport for MockUtpTransport {
     }
 
     fn bind_addr(&self) -> SocketAddr {
-        DEFAULT_BIND_ADDR
+        self.bind_addr
     }
 }
