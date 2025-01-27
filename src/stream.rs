@@ -268,7 +268,7 @@ impl<T: Transport> VirtualSocket<T> {
             return Ok(());
         }
 
-        let mut sent = false;
+        let mut last_sent = None;
         let mut recv_wnd =
             (self.last_remote_window as usize).min(self.congestion_controller.window());
 
@@ -318,16 +318,11 @@ impl<T: Transport> VirtualSocket<T> {
 
             recv_wnd = recv_wnd.saturating_sub(item.payload_size());
 
-            // Each DATA packet can act as ACK so update related state.
-            self.last_sent_seq_nr = header.seq_nr;
-            self.last_sent_ack_nr = header.ack_nr;
-            self.timers.reset_delayed_ack_timer();
-
-            self.rtte.on_send(self.this_poll.now, header.seq_nr);
-            sent = true;
+            last_sent = Some(header);
         }
 
-        if sent {
+        if let Some(header) = last_sent {
+            self.on_packet_sent(&header);
             self.timers
                 .kind
                 .set_for_retransmit(self.this_poll.now, self.rtte.retransmission_timeout());
@@ -385,6 +380,14 @@ impl<T: Transport> VirtualSocket<T> {
         }
     }
 
+    fn on_packet_sent(&mut self, header: &UtpHeader) {
+        // Each packet sent can act as ACK so update related state.
+        self.last_sent_seq_nr = header.seq_nr;
+        self.last_sent_ack_nr = header.ack_nr;
+        self.timers.reset_delayed_ack_timer();
+        self.rtte.on_send(self.this_poll.now, header.seq_nr);
+    }
+
     fn send_control_packet(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -411,11 +414,8 @@ impl<T: Transport> VirtualSocket<T> {
 
         let sent = !self.this_poll.transport_pending;
 
-        // Each control packet can act as ACK so update related state.
         if sent {
-            self.rtte.on_send(self.this_poll.now, header.seq_nr);
-            self.last_sent_ack_nr = self.last_consumed_ack_nr;
-            self.timers.reset_delayed_ack_timer();
+            self.on_packet_sent(&header);
         }
 
         Ok(sent)
