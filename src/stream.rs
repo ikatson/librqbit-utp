@@ -1514,12 +1514,14 @@ mod tests {
 
     use super::{StreamArgs, UtpStream, VirtualSocket};
 
+    #[allow(unused)]
     struct TestStream {
         stream: MockUtpStream,
         vsock: VirtualSocket<MockUtpTransport, MockUtpEnvironment>,
         ack_to_send: Option<UtpHeader>,
     }
 
+    #[allow(unused)]
     struct TestStreams {
         interface: Arc<MockInterface>,
         s1: TestStream,
