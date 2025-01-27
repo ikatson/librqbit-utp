@@ -28,6 +28,8 @@ mod rtte;
 mod seq_nr;
 mod stream;
 mod stream_tx;
+#[cfg(test)]
+mod test_util;
 mod traits;
 mod utils;
 
