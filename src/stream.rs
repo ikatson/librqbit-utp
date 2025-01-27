@@ -25,13 +25,12 @@ use crate::{
     message::UtpMessage,
     raw::{Type, UtpHeader},
     rtte::RttEstimator,
+    seq_nr::SeqNr,
     socket::ValidatedSocketOpts,
     stream_tx::Tx,
     utils::{fill_buffer_from_rb, seq_nr_offset, spawn_print_error, update_optional_waker},
     UtpSocket,
 };
-
-type SeqNr = u16;
 
 // This contains more states than Rust could model with its enums, but I'm keeping
 // the names for 1:1 TCP mapping.
@@ -100,7 +99,7 @@ struct VirtualSocket {
     addr: SocketAddr,
 
     assembler: AssembledRx,
-    conn_id_send: SeqNr,
+    conn_id_send: u16,
 
     // Triggers delay-based operations
     timers: Timers,
@@ -218,11 +217,7 @@ impl VirtualSocket {
 
         // Send only the stuff we haven't sent yet, up to sender's window.
         for item in self.tx.iter() {
-            let already_sent = seq_nr_offset(
-                item.header().seq_nr,
-                self.last_sent_seq_nr,
-                self.socket_opts.wrap_torelance(),
-            ) <= 0;
+            let already_sent = item.header().seq_nr - self.last_sent_seq_nr <= 0;
             if already_sent {
                 recv_wnd = recv_wnd.saturating_sub(item.payload_size());
                 continue;
@@ -252,8 +247,8 @@ impl VirtualSocket {
                 sock.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.addr)?;
 
             trace!(
-                header.seq_nr,
-                header.ack_nr,
+                %header.seq_nr,
+                %header.ack_nr,
                 payload_size = len,
                 socket_was_full = self.this_poll.udp_socket_full,
                 "attempted to send ST_DATA"
@@ -346,8 +341,8 @@ impl VirtualSocket {
         }
 
         trace!(
-            seq_nr = header.seq_nr,
-            ack_nr = header.ack_nr,
+            seq_nr = %header.seq_nr,
+            ack_nr = %header.ack_nr,
             type = ?header.get_type(),
             "sending"
         );
@@ -408,12 +403,7 @@ impl VirtualSocket {
                 acked: false,
             } => {
                 // Only send fin after all the outstanding data was sent.
-                if seq_nr_offset(
-                    seq_nr,
-                    self.last_sent_seq_nr,
-                    self.socket_opts.wrap_torelance(),
-                ) != 1
-                {
+                if seq_nr - self.last_sent_seq_nr != 1 {
                     return Ok(());
                 }
 
@@ -486,7 +476,7 @@ impl VirtualSocket {
             self.tx.enqueue(header, payload_size);
             remaining -= payload_size;
             trace!(bytes = payload_size, "enqueued");
-            self.next_seq_nr = self.next_seq_nr.wrapping_add(1);
+            self.next_seq_nr += 1;
         }
 
         Ok(())
@@ -511,8 +501,8 @@ impl VirtualSocket {
     }
 
     #[tracing::instrument(name="msg", skip_all, fields(
-        seq_nr=msg.header.seq_nr,
-        ack_nr=msg.header.ack_nr,
+        seq_nr=%msg.header.seq_nr,
+        ack_nr=%msg.header.ack_nr,
         len=msg.payload().len(),
         type=?msg.header.get_type()
     ))]
@@ -558,14 +548,10 @@ impl VirtualSocket {
 
                 let msg_seq_nr = msg.header.seq_nr;
 
-                let offset = seq_nr_offset(
-                    msg_seq_nr,
-                    self.last_consumed_ack_nr.wrapping_add(1),
-                    self.socket_opts.wrap_torelance(),
-                );
+                let offset = msg_seq_nr - (self.last_consumed_ack_nr + 1);
                 if offset < 0 {
                     trace!(
-                        self.last_consumed_ack_nr,
+                        %self.last_consumed_ack_nr,
                         "dropping message, we already ACKed it"
                     );
                     self.send_challenge_ack(cx)?;
@@ -574,7 +560,7 @@ impl VirtualSocket {
 
                 trace!(
                     offset,
-                    self.last_consumed_ack_nr,
+                    %self.last_consumed_ack_nr,
                     "adding ST_DATA message to assember"
                 );
 
@@ -598,8 +584,7 @@ impl VirtualSocket {
                             trace!(asm = %self.assembler.debug_string(), "out of order");
                         }
 
-                        self.last_consumed_ack_nr =
-                            self.last_consumed_ack_nr.wrapping_add(count as u16);
+                        self.last_consumed_ack_nr += count as u16;
                     }
                     Err(_) => {
                         trace!("cannot reassemble message, dropping");
@@ -653,8 +638,7 @@ impl VirtualSocket {
                     // the third duplicate ACK
                     Some(last_rx_ack)
                         if last_rx_ack == msg.header.ack_nr
-                            && seq_nr_offset(self.last_sent_seq_nr, msg.header.ack_nr, 1024)
-                                > 0
+                            && self.last_sent_seq_nr > msg.header.ack_nr
                             && !is_window_update =>
                     {
                         // Increment duplicate ACK count
@@ -704,7 +688,7 @@ impl VirtualSocket {
             Type::ST_RESET => bail!("ST_RESET received"),
             Type::ST_FIN => {
                 self.state = VirtualSocketState::FinReceived;
-                self.last_consumed_ack_nr = self.last_consumed_ack_nr.wrapping_add(1);
+                self.last_consumed_ack_nr += 1;
                 self.send_ack(cx)?;
                 let _ = self.user_rx_sender.send(UserRxMessage::Eof);
                 Ok(())
@@ -729,15 +713,11 @@ impl VirtualSocket {
     /// byte of new data. For details, see
     /// <https://elixir.bootlin.com/linux/v6.11.4/source/net/ipv4/tcp_input.c#L5747>.
     fn immediate_ack_to_transmit(&self) -> bool {
-        self.last_consumed_ack_nr
-            .wrapping_sub(self.last_sent_ack_nr)
-            >= IMMEDIATE_ACK_EVERY
+        self.last_consumed_ack_nr - self.last_sent_ack_nr >= IMMEDIATE_ACK_EVERY
     }
 
     fn ack_to_transmit(&self) -> bool {
-        self.last_consumed_ack_nr
-            .wrapping_sub(self.last_sent_ack_nr)
-            > 0
+        self.last_consumed_ack_nr > self.last_sent_ack_nr
     }
 
     fn delayed_ack_expired(&self) -> bool {
@@ -1007,10 +987,10 @@ pub struct StreamArgs {
     conn_id_send: u16,
     last_remote_timestamp: u32,
 
-    next_seq_nr: u16,
-    last_sent_seq_nr: u16,
-    last_consumed_ack_nr: u16,
-    last_sent_ack_nr: u16,
+    next_seq_nr: SeqNr,
+    last_sent_seq_nr: SeqNr,
+    last_consumed_ack_nr: SeqNr,
+    last_sent_ack_nr: SeqNr,
 
     syn_sent_ts: Option<Instant>,
     ack_received_ts: Option<Instant>,
@@ -1033,13 +1013,13 @@ impl StreamArgs {
             remote_window: remote_ack.wnd_size,
 
             // The next ST_DATA must be +1 from initial SYN.
-            next_seq_nr: remote_ack.ack_nr.wrapping_add(1),
+            next_seq_nr: remote_ack.ack_nr + 1,
             last_sent_seq_nr: remote_ack.ack_nr,
 
             // On connect, the client sends a number that represents the next ST_DATA number.
             // Pretend that we saw the non-existing previous one.
-            last_sent_ack_nr: remote_ack.seq_nr.wrapping_sub(1),
-            last_consumed_ack_nr: remote_ack.seq_nr.wrapping_sub(1),
+            last_sent_ack_nr: remote_ack.seq_nr - 1,
+            last_consumed_ack_nr: remote_ack.seq_nr - 1,
 
             // For RTTE
             syn_sent_ts: Some(syn_sent_ts),
@@ -1051,7 +1031,7 @@ impl StreamArgs {
 
     // TODO: this doesn't work with echo, not sure about real world
     pub fn new_incoming(remote_syn: &UtpHeader) -> Self {
-        let next_seq_nr = random();
+        let next_seq_nr = random::<u16>().into();
 
         Self {
             conn_id_recv: remote_syn.connection_id.wrapping_add(1),
@@ -1062,7 +1042,7 @@ impl StreamArgs {
             next_seq_nr,
             // The connecting client will send the next ST_DATA packet with seq_nr + 1.
             last_consumed_ack_nr: remote_syn.seq_nr,
-            last_sent_seq_nr: next_seq_nr.wrapping_sub(1),
+            last_sent_seq_nr: next_seq_nr - 1,
             last_sent_ack_nr: remote_syn.seq_nr,
 
             // For RTTE
@@ -1187,7 +1167,7 @@ impl UtpStream {
                 if !is_outgoing {
                     let mut hdr = state.outgoing_header();
                     // The initial "ACK" should be of the NEXT sequence, not the previous one.
-                    hdr.seq_nr = hdr.seq_nr.wrapping_add(1);
+                    hdr.seq_nr += 1;
                     let mut buf = [0u8; UTP_HEADER_SIZE];
                     hdr.serialize(&mut buf)
                         .context("bug: can't serialize header")?;

@@ -283,7 +283,7 @@ impl UtpSocket {
         let connection_id = self.connection_id.fetch_add(2, Ordering::Relaxed);
 
         let mut buf = [0u8; UTP_HEADER_SIZE];
-        let seq_nr = random();
+        let seq_nr = random::<u16>().into();
         let mut header = UtpHeader {
             connection_id,
             timestamp_microseconds: self.created.elapsed().as_micros() as u32,

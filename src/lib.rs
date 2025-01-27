@@ -25,6 +25,7 @@ mod socket;
 mod assembled_rx;
 mod congestion;
 mod rtte;
+mod seq_nr;
 mod stream;
 mod stream_tx;
 mod utils;

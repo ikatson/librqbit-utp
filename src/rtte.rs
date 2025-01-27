@@ -2,6 +2,8 @@ use std::time::{Duration, Instant};
 
 use tracing::trace;
 
+use crate::seq_nr::SeqNr;
+
 // Conservative initial RTT estimate.
 const RTTE_INITIAL_RTT: u32 = 300;
 const RTTE_INITIAL_DEV: u32 = 100;
@@ -13,15 +15,13 @@ const RTTE_MIN_MARGIN: u32 = 5;
 const RTTE_MIN_RTO: u32 = 10;
 const RTTE_MAX_RTO: u32 = 10000;
 
-type UtpSeqNumber = u16;
-
 #[derive(Debug, Clone, Copy)]
 pub struct RttEstimator {
     // Using u32 instead of Duration to save space (Duration is i64)
     rtt: u32,
     deviation: u32,
-    timestamp: Option<(Instant, UtpSeqNumber)>,
-    max_seq_sent: Option<UtpSeqNumber>,
+    timestamp: Option<(Instant, SeqNr)>,
+    max_seq_sent: Option<SeqNr>,
     rto_count: u8,
 }
 
@@ -62,7 +62,7 @@ impl RttEstimator {
         );
     }
 
-    pub fn on_send(&mut self, timestamp: Instant, seq: UtpSeqNumber) {
+    pub fn on_send(&mut self, timestamp: Instant, seq: SeqNr) {
         if self
             .max_seq_sent
             .map(|max_seq_sent| seq > max_seq_sent)
@@ -76,7 +76,7 @@ impl RttEstimator {
         }
     }
 
-    pub fn on_ack(&mut self, timestamp: Instant, seq: UtpSeqNumber) {
+    pub fn on_ack(&mut self, timestamp: Instant, seq: SeqNr) {
         if let Some((sent_timestamp, sent_seq)) = self.timestamp {
             if seq >= sent_seq {
                 self.sample((timestamp - sent_timestamp).as_millis() as u32);

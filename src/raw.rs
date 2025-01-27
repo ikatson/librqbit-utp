@@ -1,7 +1,7 @@
 use anyhow::{bail, Context};
 use tracing::{debug, trace};
 
-use crate::constants::UTP_HEADER_SIZE;
+use crate::{constants::UTP_HEADER_SIZE, seq_nr::SeqNr};
 
 #[derive(Clone, Copy, Debug, Default)]
 #[allow(non_camel_case_types)]
@@ -44,8 +44,8 @@ pub struct UtpHeader {
     pub timestamp_microseconds: u32,            // Timestamp in microseconds
     pub timestamp_difference_microseconds: u32, // Timestamp difference in microseconds
     pub wnd_size: u32,                          // Window size
-    pub seq_nr: u16,                            // Sequence number
-    pub ack_nr: u16,                            // Acknowledgment number
+    pub seq_nr: SeqNr,                          // Sequence number
+    pub ack_nr: SeqNr,                          // Acknowledgment number
 }
 
 impl UtpHeader {
@@ -108,8 +108,8 @@ impl UtpHeader {
         header.timestamp_difference_microseconds =
             u32::from_be_bytes(buffer[8..12].try_into().unwrap());
         header.wnd_size = u32::from_be_bytes(buffer[12..16].try_into().unwrap());
-        header.seq_nr = u16::from_be_bytes(buffer[16..18].try_into().unwrap());
-        header.ack_nr = u16::from_be_bytes(buffer[18..20].try_into().unwrap());
+        header.seq_nr = u16::from_be_bytes(buffer[16..18].try_into().unwrap()).into();
+        header.ack_nr = u16::from_be_bytes(buffer[18..20].try_into().unwrap()).into();
 
         buffer = &buffer[UTP_HEADER_SIZE..];
 

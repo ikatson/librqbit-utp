@@ -1,6 +1,6 @@
 use smoltcp::storage::RingBuffer;
 
-use crate::{raw::UtpHeader, utils::seq_nr_offset};
+use crate::{raw::UtpHeader, seq_nr::SeqNr, utils::seq_nr_offset};
 
 type RingBufferHeader = RingBuffer<'static, (UtpHeader, usize)>;
 
@@ -39,7 +39,7 @@ impl Tx {
         }
     }
 
-    pub fn first_seq_nr(&self) -> Option<u16> {
+    pub fn first_seq_nr(&self) -> Option<SeqNr> {
         if self.headers.is_empty() {
             return None;
         }
@@ -70,12 +70,11 @@ impl Tx {
     }
 
     // Returns number of removed headers, and their comibined payload size.
-    pub fn remove_up_to_ack(&mut self, ack_nr: u16) -> (usize, usize) {
-        let is_acked = |seq_nr: u16| seq_nr_offset(ack_nr, seq_nr, self.wrap_tolerance) >= 0;
+    pub fn remove_up_to_ack(&mut self, ack_nr: SeqNr) -> (usize, usize) {
         let mut removed = 0;
         let mut payload_size = 0;
         while let Ok(Ok(ps)) = self.headers.dequeue_one_with(|(header, payload_size)| {
-            if is_acked(header.seq_nr) {
+            if ack_nr >= header.seq_nr {
                 return Ok(*payload_size);
             }
             Err(())
