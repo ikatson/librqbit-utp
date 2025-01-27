@@ -1,0 +1,29 @@
+[package]
+name = "librqbit-utp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# A minimal set of features for smoltcp to compile.
+smoltcp = { version = "0.12.0", path = "../smoltcp", default-features = false, features = [
+    "std",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-raw",
+] }
+tokio = { version = "1", features = ["net", "sync", "time", "io-util", "rt"] }
+anyhow = "1.0.95"
+dashmap = "6.1.0"
+rand = "0.8.5"
+tracing = "0.1.41"
+parking_lot = "0.12.3"
+crossbeam-queue = "0.3.12"
+network-interface = "2.0.0"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = "*"
+futures = "*"
+
+[profile.release]
+panic = "abort"

@@ -1,0 +1,1183 @@
+use std::{
+    future::Future,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{Arc, Weak},
+    task::{Poll, Waker},
+    time::{Duration, Instant},
+};
+
+use anyhow::{bail, Context};
+use parking_lot::RwLock;
+use rand::random;
+use smoltcp::storage::RingBuffer;
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    time::{sleep_until, Sleep},
+};
+use tracing::{debug, error_span, trace, warn, Instrument};
+
+use crate::{
+    assembled_rx::AssembledRx,
+    congestion::{reno::Reno, Controller},
+    constants::{ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, UTP_HEADER_SIZE},
+    message::UtpMessage,
+    raw::{Type, UtpHeader},
+    rtte::RttEstimator,
+    socket::ValidatedSocketOpts,
+    stream_tx::Tx,
+    utils::{fill_buffer_from_rb, seq_nr_offset, spawn_print_error, update_optional_waker},
+    UtpSocket,
+};
+
+// An equivalent of a TCP socket for uTP.
+struct VirtualSocket {
+    socket: Weak<UtpSocket>,
+    socket_created: Instant,
+    socket_opts: ValidatedSocketOpts,
+
+    addr: SocketAddr,
+
+    assembler: AssembledRx,
+    conn_id_send: u16,
+
+    // Triggers delay-based operations
+    timers: Timers,
+
+    // The last seen value of uTP's "last_remote_timestamp"
+    last_remote_timestamp: u32,
+    /// The timestamp of the last packet received.
+    last_remote_timestamp_instant: Instant,
+    last_remote_window: u32,
+
+    // Next sequence number to use when fragmenting user input.
+    next_seq_nr: u16,
+
+    // The last seq_nr we told the other end about.
+    last_sent_seq_nr: u16,
+
+    // Last remote sequence number that we fully processed.
+    last_consumed_ack_nr: u16,
+
+    // Last ACK that we sent out. This is different from "ack_nr" because we don't ACK
+    // every packet. This must be <= ack_nr.
+    last_sent_ack_nr: u16,
+
+    // Incoming queue. The main UDP socket writes here, and we need to consume these
+    // as fast as possible.
+    //
+    // TODO: make bounded
+    rx: UnboundedReceiver<UtpMessage>,
+
+    // Unacked fragments. Ready to send or retransmit.
+    tx: Tx,
+
+    // The user sides's queue with packets fully processed and ready to consume.
+    // This is what "UtpStream::poll_read" reads from.
+    //
+    // TODO: make bounded if the user doesn't read, we need to stop.
+    user_rx_sender: UnboundedSender<UtpMessage>,
+
+    // Last received ACK for fast retransmit
+    local_rx_last_ack: Option<u16>,
+    local_rx_dup_acks: u8,
+
+    // The user ppayload that we haven't yet fragmented into uTP messages.
+    // This is what "UtpStream::poll_write" writes to.
+    user_tx: Arc<UserTx>,
+    rtte: RttEstimator,
+    congestion_controller: Reno,
+
+    this_poll: ThisPoll,
+}
+
+// Updated on every poll
+struct ThisPoll {
+    now: Instant,
+
+    // Temp buffer used for writing messages to socket, so that we dno't alloc and zero
+    // it every time.
+    tmp_buf: Vec<u8>,
+    // Temp variable used during poll() and conveniently stored here not to pass it around
+    udp_socket_full: bool,
+}
+
+impl VirtualSocket {
+    fn timestamp_microseconds(&self) -> u32 {
+        self.socket_created.elapsed().as_micros() as u32
+    }
+
+    /// Create a stub header for a new outgoing message.
+    pub(crate) fn outgoing_header(&self) -> UtpHeader {
+        let mut header = UtpHeader::default();
+        header.connection_id = self.conn_id_send;
+        header.timestamp_microseconds = self.timestamp_microseconds();
+        header.timestamp_difference_microseconds = header
+            .timestamp_microseconds
+            .wrapping_sub(self.last_remote_timestamp);
+        header.seq_nr = self.last_sent_seq_nr;
+        header.ack_nr = self.last_consumed_ack_nr;
+        header.wnd_size = self.rx_window();
+        header
+    }
+
+    /// Prepare a previously created header for resend.
+    fn update_header(&self, header: &UtpHeader) -> UtpHeader {
+        let mut header = *header;
+
+        header.timestamp_microseconds = self.timestamp_microseconds();
+        header.timestamp_difference_microseconds = header
+            .timestamp_microseconds
+            .wrapping_sub(self.last_remote_timestamp);
+        header.ack_nr = self.last_consumed_ack_nr;
+        header.wnd_size = self.rx_window();
+        header
+    }
+
+    fn rx_window(&self) -> u32 {
+        self.assembler.window() as u32
+    }
+
+    // Returns true if UDP socket is full
+    fn send_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
+        if self.tx.is_empty() {
+            return Ok(());
+        }
+
+        // No reason to send anything, we'll get polled next time.
+        if self.this_poll.udp_socket_full {
+            return Ok(());
+        }
+
+        let tx_first_seq_nr = self
+            .tx
+            .first_seq_nr()
+            .context("bug: expected self.tx to have a seq nr")?;
+
+        if let Some(retransmit_delta) = self.timers.kind.should_retransmit(self.this_poll.now) {
+            // If a retransmit timer expired, we should resend data starting at the last ACK.
+            trace!("retransmitting at t+{:?}", retransmit_delta);
+
+            // Rewind "last sequence number sent", as if we never
+            // had sent them. This will cause all data in the queue
+            // to be sent again.
+            self.last_sent_seq_nr = tx_first_seq_nr.saturating_sub(1);
+
+            // Clear the `should_retransmit` state. If we can't retransmit right
+            // now for whatever reason (like zero window), this avoids an
+            // infinite polling loop where `poll_at` returns `Now` but `dispatch`
+            // can't actually do anything.
+            self.timers.kind.set_for_idle();
+
+            // Inform RTTE, so that it can avoid bogus measurements.
+            self.rtte.on_retransmit();
+
+            // Inform the congestion controller that we're retransmitting.
+            self.congestion_controller.on_retransmit(self.this_poll.now);
+        }
+
+        let sock = self.socket.upgrade().context("socket closed")?;
+
+        let mut sent = false;
+        let mut recv_wnd =
+            (self.last_remote_window as usize).min(self.congestion_controller.window());
+
+        trace!(tx_first_seq_nr, recv_wnd);
+
+        // Send only the stuff we haven't sent yet, up to sender's window.
+        for item in self.tx.iter() {
+            let already_sent = seq_nr_offset(
+                item.header().seq_nr,
+                self.last_sent_seq_nr,
+                self.socket_opts.wrap_torelance(),
+            ) <= 0;
+            if already_sent {
+                recv_wnd = recv_wnd.saturating_sub(item.payload_size());
+                continue;
+            }
+
+            if recv_wnd < item.payload_size() {
+                debug!("remote recv window exhausted, not sending anything");
+                break;
+            }
+
+            let header = self.update_header(item.header());
+
+            let len = header
+                .serialize_with_payload(&mut self.this_poll.tmp_buf, |b| {
+                    let offset = item.payload_offset();
+                    let len = item.payload_size();
+                    // TODO: use rwlock
+                    let g = self.user_tx.locked.read();
+                    fill_buffer_from_rb(b, &g.buffer, offset, len)
+                        .context("error filling output buffer from user_tx")?;
+                    Ok(len)
+                })
+                .context("bug: wasn't able to serialize the buffer")?;
+
+            self.rtte.on_send(self.this_poll.now, header.seq_nr);
+            self.this_poll.udp_socket_full |=
+                sock.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.addr)?;
+
+            trace!(
+                header.seq_nr,
+                header.ack_nr,
+                payload_size = len,
+                socket_was_full = self.this_poll.udp_socket_full,
+                "attempted to send ST_DATA"
+            );
+
+            if self.this_poll.udp_socket_full {
+                break;
+            }
+
+            recv_wnd = recv_wnd.saturating_sub(item.payload_size());
+            self.last_sent_seq_nr = header.seq_nr;
+            self.rtte.on_send(self.this_poll.now, header.seq_nr);
+            sent = true;
+        }
+
+        if sent {
+            self.timers
+                .kind
+                .set_for_retransmit(self.this_poll.now, self.rtte.retransmission_timeout());
+        } else {
+            trace!(recv_wnd, "did not send anything");
+        }
+
+        Ok(())
+    }
+
+    fn maybe_send_delayed_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+        if self.this_poll.udp_socket_full {
+            return Ok(false);
+        }
+
+        if self.delayed_ack_expired() && self.ack_to_transmit() {
+            trace!("delayed ack expired, sending ACK");
+            self.send_ack(cx)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn send_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+        if self.this_poll.udp_socket_full {
+            return Ok(false);
+        }
+        let header = self.outgoing_header();
+        trace!(
+            seq_nr = header.seq_nr,
+            ack_nr = header.ack_nr,
+            "sending ACK"
+        );
+
+        let len = header
+            .serialize(&mut self.this_poll.tmp_buf)
+            .context("bug")?;
+        let sock = self.socket.upgrade().context("no socket")?;
+
+        self.this_poll.udp_socket_full =
+            sock.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.addr)?;
+        if !self.this_poll.udp_socket_full {
+            self.rtte.on_send(self.this_poll.now, header.seq_nr);
+            self.last_sent_ack_nr = self.last_consumed_ack_nr;
+            self.reset_delayed_ack_timer();
+        }
+
+        Ok(!self.this_poll.udp_socket_full)
+    }
+
+    fn send_challenge_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+        if self.this_poll.now < self.timers.challenge_ack_timer {
+            return Ok(false);
+        }
+
+        // Rate-limit to 1 per second max.
+        if self.send_ack(cx)? {
+            trace!("sending challenge ACK");
+            self.timers.challenge_ack_timer = self.this_poll.now + CHALLENGE_ACK_RATELIMIT;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn fragment_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
+        let mut g = self.user_tx.locked.upgradable_read();
+
+        if g.buffer.is_empty() {
+            trace!("user tx queue empty, updating waker");
+            g.with_upgraded(|val| {
+                update_optional_waker(&mut val.buffer_has_data, cx);
+            });
+            return Ok(());
+        }
+
+        let tx_offset = self
+            .tx
+            .iter()
+            .last()
+            .map(|item| item.payload_offset() + item.payload_size())
+            .unwrap_or(0);
+
+        if g.buffer.len() < tx_offset {
+            bail!(
+                "bug in buffer computations: user_tx_buflen={} tx_offset={}",
+                g.buffer.len(),
+                tx_offset
+            );
+        }
+
+        let mut remaining = g.buffer.len() - tx_offset;
+
+        while !self.tx.is_full() && remaining > 0 {
+            let payload_size = self.socket_opts.max_payload_size.min(remaining);
+
+            // Run Nagle algorithm to prevent sending too many small segments.
+            {
+                let can_send_full_payload = payload_size == self.socket_opts.max_payload_size;
+                let data_in_flight = !self.tx.is_empty();
+
+                if self.socket_opts.nagle && !can_send_full_payload && data_in_flight {
+                    trace!("nagle: buffering more data");
+                    break;
+                }
+            }
+
+            let mut header = self.outgoing_header();
+            header.set_type(Type::ST_DATA);
+            header.seq_nr = self.next_seq_nr;
+
+            self.tx.enqueue(header, payload_size);
+            remaining -= payload_size;
+            trace!(bytes = payload_size, "enqueued");
+            self.next_seq_nr = self.next_seq_nr.wrapping_add(1);
+        }
+
+        Ok(())
+    }
+
+    fn process_all_incoming_messages(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> anyhow::Result<()> {
+        while let Poll::Ready(msg) = self.rx.poll_recv(cx) {
+            let msg = msg.context("rx channel closed")?;
+            self.process_incoming_message(cx, msg)?;
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(name="msg", skip_all, fields(
+        seq_nr=msg.header.seq_nr,
+        ack_nr=msg.header.ack_nr,
+        len=msg.payload().len(),
+        type=?msg.header.get_type()
+    ))]
+    fn process_incoming_message(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        msg: UtpMessage,
+    ) -> anyhow::Result<()> {
+        trace!("on_message");
+
+        // Remove everything from tx_buffer that was acked by this message.
+        let (removed_headers, removed_bytes) = self.tx.remove_up_to_ack(msg.header.ack_nr);
+        if removed_headers > 0 {
+            let mut g = self.user_tx.locked.write();
+            let was_full = g.buffer.is_full();
+            g.buffer.dequeue_allocated(removed_bytes);
+            if was_full {
+                if let Some(w) = g.buffer_no_longer_full.take() {
+                    w.wake();
+                }
+            }
+
+            trace!(removed_headers, removed_bytes, "removed ACKed tx messages");
+        }
+
+        self.last_remote_timestamp = msg.header.timestamp_microseconds;
+        self.last_remote_timestamp_instant = self.this_poll.now;
+
+        let is_window_update = self.last_remote_window != msg.header.wnd_size;
+        self.last_remote_window = msg.header.wnd_size;
+        self.congestion_controller
+            .set_remote_window(msg.header.wnd_size as usize);
+
+        match msg.header.get_type() {
+            Type::ST_DATA => {
+                trace!(payload_size = msg.payload().len(), "received ST_DATA");
+
+                let msg_seq_nr = msg.header.seq_nr;
+
+                let offset = seq_nr_offset(
+                    msg_seq_nr,
+                    self.last_consumed_ack_nr.wrapping_add(1),
+                    self.socket_opts.wrap_torelance(),
+                );
+                if offset < 0 {
+                    trace!(
+                        self.last_consumed_ack_nr,
+                        "dropping message, we already ACKed it"
+                    );
+                    self.send_challenge_ack(cx)?;
+                    return Ok(());
+                }
+
+                trace!(
+                    offset,
+                    self.last_consumed_ack_nr,
+                    "adding ST_DATA message to assember"
+                );
+
+                let assembler_was_empty = self.assembler.is_empty();
+
+                let ack_nr = msg.header.ack_nr;
+
+                match self.assembler.add_remove(msg, offset as usize, |msg| {
+                    let _ = self.user_rx_sender.send(msg);
+                }) {
+                    Ok(count) => {
+                        self.rtte.on_ack(self.this_poll.now, ack_nr);
+                        self.congestion_controller.on_ack(
+                            self.this_poll.now,
+                            removed_bytes,
+                            &self.rtte,
+                        );
+                        if count > 0 {
+                            trace!(count, "dequeued messages to user rx");
+                        } else {
+                            trace!(asm = %self.assembler.debug_string(), "out of order");
+                        }
+
+                        self.last_consumed_ack_nr =
+                            self.last_consumed_ack_nr.wrapping_add(count as u16);
+                    }
+                    Err(_) => {
+                        trace!("cannot reassemble message, dropping");
+                    }
+                }
+
+                // Handle delayed acks
+                if self.ack_to_transmit() {
+                    self.timers.ack_delay_timer = match self.timers.ack_delay_timer {
+                        AckDelayTimer::Idle => {
+                            trace!("starting delayed ack timer");
+                            AckDelayTimer::Waiting(self.this_poll.now + ACK_DELAY)
+                        }
+                        AckDelayTimer::Waiting(_) if self.immediate_ack_to_transmit() => {
+                            trace!("delayed ack timer already started, forcing expiry");
+                            AckDelayTimer::Immediate
+                        }
+                        timer @ AckDelayTimer::Waiting(_) => {
+                            trace!("waiting until delayed ack timer expires");
+                            timer
+                        }
+                        AckDelayTimer::Immediate => {
+                            trace!("delayed ack timer already force-expired");
+                            AckDelayTimer::Immediate
+                        }
+                    };
+                }
+
+                // Per RFC 5681, we should send an immediate ACK when either:
+                //  1) an out-of-order segment is received, or
+                //  2) a segment arrives that fills in all or part of a gap in sequence space.
+                if !self.assembler.is_empty()
+                    || !assembler_was_empty
+                    || self.immediate_ack_to_transmit()
+                {
+                    trace!(
+                        assembler_not_empty = !self.assembler.is_empty(),
+                        assembler_was_empty,
+                        immediate_ack_to_transmit = self.immediate_ack_to_transmit(),
+                        "sending immediate ACK"
+                    );
+                    self.send_ack(cx)?;
+                }
+                Ok(())
+            }
+            Type::ST_STATE => {
+                // Fast retransmit in case of duplicate ACKs
+                match self.local_rx_last_ack {
+                    // Duplicate ACK if payload empty and ACK doesn't move send window ->
+                    // Increment duplicate ACK count and set for retransmit if we just received
+                    // the third duplicate ACK
+                    Some(last_rx_ack)
+                        if last_rx_ack == msg.header.ack_nr
+                            && seq_nr_offset(self.last_sent_seq_nr, msg.header.ack_nr, 1024)
+                                > 0
+                            && !is_window_update =>
+                    {
+                        // Increment duplicate ACK count
+                        self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
+
+                        // Inform congestion controller of duplicate ACK
+                        self.congestion_controller
+                            .on_duplicate_ack(self.this_poll.now);
+
+                        debug!(
+                            "received duplicate ACK for seq {} (duplicate nr {}{})",
+                            msg.header.ack_nr,
+                            self.local_rx_dup_acks,
+                            if self.local_rx_dup_acks == u8::MAX {
+                                "+"
+                            } else {
+                                ""
+                            }
+                        );
+
+                        if self.local_rx_dup_acks == 3 {
+                            self.timers.kind.set_for_fast_retransmit();
+                            debug!("started fast retransmit");
+                        }
+                    }
+                    // No duplicate ACK -> Reset state and update last received ACK
+                    _ => {
+                        if self.local_rx_dup_acks > 0 {
+                            self.local_rx_dup_acks = 0;
+                            trace!("reset duplicate ACK count");
+                        }
+                        self.local_rx_last_ack = Some(msg.header.ack_nr);
+                    }
+                };
+
+                let ack_all = msg.header.ack_nr == self.last_sent_ack_nr;
+                if !self.timers.kind.is_retransmit() || ack_all {
+                    self.timers.kind.set_for_idle();
+                }
+                self.rtte.on_ack(self.this_poll.now, msg.header.ack_nr);
+                self.congestion_controller
+                    .on_ack(self.this_poll.now, removed_bytes, &self.rtte);
+
+                Ok(())
+            }
+
+            Type::ST_RESET => bail!("ST_RESET not implemented"),
+            Type::ST_FIN => bail!("ST_FIN not implemented"),
+            Type::ST_SYN => {
+                warn!("ignoring unexpected ST_SYN packet: {:?}", msg.header);
+                Ok(())
+            }
+        }
+    }
+
+    /// TODO: implement this better
+    ///
+    /// Return whether to send ACK immediately due to the amount of unacknowledged data.
+    ///
+    /// RFC 9293 states "An ACK SHOULD be generated for at least every second full-sized segment or
+    /// 2*RMSS bytes of new data (where RMSS is the MSS specified by the TCP endpoint receiving the
+    /// segments to be acknowledged, or the default value if not specified) (SHLD-19)."
+    ///
+    /// Note that the RFC above only says "at least 2*RMSS bytes", which is not a hard requirement.
+    /// In practice, we follow the Linux kernel's empirical value of sending an ACK for every RMSS
+    /// byte of new data. For details, see
+    /// <https://elixir.bootlin.com/linux/v6.11.4/source/net/ipv4/tcp_input.c#L5747>.
+    fn immediate_ack_to_transmit(&self) -> bool {
+        self.last_consumed_ack_nr
+            .wrapping_sub(self.last_sent_ack_nr)
+            >= IMMEDIATE_ACK_EVERY
+    }
+
+    fn ack_to_transmit(&self) -> bool {
+        self.last_consumed_ack_nr
+            .wrapping_sub(self.last_sent_ack_nr)
+            > 0
+    }
+
+    fn delayed_ack_expired(&self) -> bool {
+        match self.timers.ack_delay_timer {
+            AckDelayTimer::Idle => true,
+            AckDelayTimer::Waiting(t) => t <= self.this_poll.now,
+            AckDelayTimer::Immediate => true,
+        }
+    }
+
+    fn reset_delayed_ack_timer(&mut self) {
+        match self.timers.ack_delay_timer {
+            AckDelayTimer::Idle => {}
+            AckDelayTimer::Waiting(_) => {
+                trace!("stop delayed ack timer")
+            }
+            AckDelayTimer::Immediate => {
+                trace!("stop delayed ack timer (was force-expired)")
+            }
+        }
+        self.timers.ack_delay_timer = AckDelayTimer::Idle;
+    }
+
+    fn poll_at(&self) -> PollAt {
+        // The logic here mirrors the beginning of dispatch() closely.
+        // if self.tuple.is_none() {
+        //     // No one to talk to, nothing to transmit.
+        //     PollAt::Ingress
+        // } else if self.remote_last_ts.is_none() {
+        //     // Socket stopped being quiet recently, we need to acquire a timestamp.
+        //     PollAt::Now
+        // } else if self.state == State::Closed {
+        //     // Socket was aborted, we have an RST packet to transmit.
+        //     PollAt::Now
+        // } else if self.seq_to_transmit(cx) {
+        //     // We have a data or flag packet to transmit.
+        //     PollAt::Now
+        // } else if self.window_to_update() {
+        //     // The receive window has been raised significantly.
+        //     PollAt::Now
+        // } else {
+
+        let want_ack = self.ack_to_transmit();
+
+        let delayed_ack_poll_at = match (want_ack, self.timers.ack_delay_timer) {
+            (false, _) => PollAt::Ingress,
+            (true, AckDelayTimer::Idle) => PollAt::Now,
+            (true, AckDelayTimer::Waiting(t)) => PollAt::Time(t),
+            (true, AckDelayTimer::Immediate) => PollAt::Now,
+        };
+
+        // We wait for the earliest of our timers to fire.
+        self.timers.kind.poll_at().min(delayed_ack_poll_at)
+    }
+}
+
+struct WakeableRingBuffer {
+    buffer: RingBuffer<'static, u8>,
+    // This is woken up by dispatcher when the buffer has space if it didn't have it previously.
+    buffer_no_longer_full: Option<Waker>,
+
+    // This is woken by by writer when it has space.
+    buffer_has_data: Option<Waker>,
+}
+
+struct UserTx {
+    locked: RwLock<WakeableRingBuffer>,
+}
+
+struct UtpStreamDropGuard {
+    sock: Weak<UtpSocket>,
+    addr: SocketAddr,
+    id1: u16,
+    id2: u16,
+}
+
+impl Drop for UtpStreamDropGuard {
+    fn drop(&mut self) {
+        if let Some(sock) = self.sock.upgrade() {
+            sock.streams.remove(&(self.addr, self.id1));
+            sock.streams.remove(&(self.addr, self.id2));
+        }
+    }
+}
+
+pub struct UtpStreamReadHalf {
+    _guard: Arc<UtpStreamDropGuard>,
+    rx: UnboundedReceiver<UtpMessage>,
+    current: Option<UtpMessage>,
+    offset: usize,
+}
+
+pub struct UtpStreamWriteHalf {
+    _guard: Arc<UtpStreamDropGuard>,
+    user_tx: Arc<UserTx>,
+}
+
+impl AsyncRead for UtpStreamReadHalf {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if buf.remaining() == 0 {
+            return Poll::Ready(Err(std::io::Error::other("empty buffer")));
+        }
+
+        loop {
+            // If there was a previous message we haven't read till the end, do it.
+            if let Some(current) = this.current.as_ref() {
+                let payload = &current.payload()[this.offset..];
+                let len = buf.remaining().min(payload.len());
+                assert!(len > 0);
+                buf.put_slice(&payload[..len]);
+                this.offset += len;
+                if this.offset == current.payload().len() {
+                    this.offset = 0;
+                    this.current = None;
+                }
+                return Poll::Ready(Ok(()));
+            }
+
+            let msg = match this.rx.poll_recv(cx) {
+                Poll::Ready(Some(msg)) => msg,
+                Poll::Ready(None) => {
+                    return Poll::Ready(Err(std::io::Error::other("bug: socket closed")))
+                }
+                Poll::Pending => return Poll::Pending,
+            };
+
+            this.current = Some(msg);
+        }
+    }
+}
+
+impl AsyncWrite for UtpStreamWriteHalf {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        let mut g = self.user_tx.locked.write();
+        let count = g.buffer.enqueue_slice(buf);
+        if count == 0 {
+            assert!(g.buffer.is_full());
+            update_optional_waker(&mut g.buffer_no_longer_full, cx);
+            return Poll::Pending;
+        }
+
+        if let Some(w) = g.buffer_has_data.take() {
+            w.wake()
+        }
+
+        Poll::Ready(Ok(count))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        todo!()
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), std::io::Error>> {
+        todo!()
+    }
+}
+
+pub struct UtpStream {
+    reader: UtpStreamReadHalf,
+    writer: UtpStreamWriteHalf,
+}
+
+impl AsyncRead for UtpStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().reader).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for UtpStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.get_mut().writer).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.get_mut().writer).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.get_mut().writer).poll_shutdown(cx)
+    }
+}
+
+// See field descriptions / meanings in struct VirtualSocket
+pub struct StreamArgs {
+    conn_id_recv: u16,
+    conn_id_send: u16,
+    last_remote_timestamp: u32,
+
+    next_seq_nr: u16,
+    last_sent_seq_nr: u16,
+    last_consumed_ack_nr: u16,
+    last_sent_ack_nr: u16,
+
+    syn_sent_ts: Option<Instant>,
+    ack_received_ts: Option<Instant>,
+    remote_window: u32,
+
+    is_outgoing: bool,
+}
+
+impl StreamArgs {
+    pub fn new_outgoing(
+        conn_id: u16,
+        remote_ack: &UtpHeader,
+        syn_sent_ts: Instant,
+        ack_received_ts: Instant,
+    ) -> Self {
+        Self {
+            conn_id_recv: conn_id,
+            conn_id_send: conn_id.wrapping_add(1),
+            last_remote_timestamp: remote_ack.timestamp_microseconds,
+            remote_window: remote_ack.wnd_size,
+
+            // The next ST_DATA must be +1 from initial SYN.
+            next_seq_nr: remote_ack.ack_nr.wrapping_add(1),
+            last_sent_seq_nr: remote_ack.ack_nr,
+
+            // On connect, the client sends a number that represents the next ST_DATA number.
+            // Pretend that we saw the non-existing previous one.
+            last_sent_ack_nr: remote_ack.seq_nr.wrapping_sub(1),
+            last_consumed_ack_nr: remote_ack.seq_nr.wrapping_sub(1),
+
+            // For RTTE
+            syn_sent_ts: Some(syn_sent_ts),
+            ack_received_ts: Some(ack_received_ts),
+
+            is_outgoing: true,
+        }
+    }
+
+    // TODO: this doesn't work with echo, not sure about real world
+    pub fn new_incoming(remote_syn: &UtpHeader) -> Self {
+        let next_seq_nr = random();
+
+        Self {
+            conn_id_recv: remote_syn.connection_id.wrapping_add(1),
+            conn_id_send: remote_syn.connection_id,
+            last_remote_timestamp: remote_syn.timestamp_microseconds,
+            remote_window: 0, // remote_syn.wnd_size should be 0 anyway. We can't send anything first.
+
+            next_seq_nr,
+            // The connecting client will send the next ST_DATA packet with seq_nr + 1.
+            last_consumed_ack_nr: remote_syn.seq_nr,
+            last_sent_seq_nr: next_seq_nr.wrapping_sub(1),
+            last_sent_ack_nr: remote_syn.seq_nr,
+
+            // For RTTE
+            syn_sent_ts: None,
+            ack_received_ts: None,
+
+            is_outgoing: false,
+        }
+    }
+}
+
+impl UtpStream {
+    pub(crate) fn new(
+        socket: &Arc<UtpSocket>,
+        addr: SocketAddr,
+        rx: UnboundedReceiver<UtpMessage>,
+        args: StreamArgs,
+    ) -> Self {
+        let StreamArgs {
+            conn_id_recv,
+            conn_id_send,
+            last_remote_timestamp,
+            next_seq_nr,
+            last_sent_seq_nr,
+            last_consumed_ack_nr,
+            last_sent_ack_nr,
+            syn_sent_ts,
+            ack_received_ts,
+            remote_window,
+            is_outgoing,
+        } = args;
+
+        let (user_rx_sender, user_rx_receiver) = unbounded_channel();
+        let user_tx = Arc::new(UserTx {
+            locked: RwLock::new(WakeableRingBuffer {
+                buffer: RingBuffer::new(vec![0u8; socket.opts().virtual_socket_tx_bytes]),
+                buffer_no_longer_full: None,
+                buffer_has_data: None,
+            }),
+        });
+
+        let guard = Arc::new(UtpStreamDropGuard {
+            sock: Arc::downgrade(socket),
+            addr,
+            id1: conn_id_recv,
+            id2: conn_id_send,
+        });
+
+        let read_half = UtpStreamReadHalf {
+            _guard: guard.clone(),
+            rx: user_rx_receiver,
+            current: None,
+            offset: 0,
+        };
+
+        let write_half = UtpStreamWriteHalf {
+            _guard: guard,
+            user_tx: user_tx.clone(),
+        };
+
+        let now = Instant::now();
+
+        let socket_opts = socket.opts();
+
+        let state = VirtualSocket {
+            socket: Arc::downgrade(socket),
+            socket_created: socket.created,
+            socket_opts: *socket_opts,
+            addr,
+            assembler: AssembledRx::new(
+                socket_opts.virtual_socket_tx_packets,
+                socket_opts.max_payload_size,
+            ),
+            conn_id_send,
+            timers: Timers {
+                kind: TimerKind::new(),
+                sleep: None,
+                challenge_ack_timer: now - CHALLENGE_ACK_RATELIMIT,
+                ack_delay_timer: AckDelayTimer::Idle,
+            },
+            last_remote_timestamp,
+            last_remote_timestamp_instant: now,
+            last_remote_window: remote_window,
+            next_seq_nr,
+            last_sent_seq_nr,
+            last_consumed_ack_nr,
+            last_sent_ack_nr,
+            rx,
+            tx: Tx::new(socket.opts().wrap_torelance()),
+            user_rx_sender,
+            local_rx_last_ack: None,
+            local_rx_dup_acks: 0,
+            user_tx,
+            rtte: {
+                let mut rtt = RttEstimator::default();
+                if let (Some(sent), Some(recv)) = (syn_sent_ts, ack_received_ts) {
+                    rtt.on_send(sent, next_seq_nr);
+                    rtt.on_ack(recv, next_seq_nr);
+                }
+                rtt
+            },
+            this_poll: ThisPoll {
+                now,
+                tmp_buf: vec![0u8; socket.opts().max_packet_size],
+                udp_socket_full: false,
+            },
+            congestion_controller: {
+                let mut controller = Reno::default();
+                controller.set_mss(socket_opts.max_payload_size);
+                controller
+            },
+        };
+
+        spawn_print_error({
+            let socket = socket.clone();
+            async move {
+                // Send first "weird" ACK if this is an incoming connection.
+                if !is_outgoing {
+                    let mut hdr = state.outgoing_header();
+                    // The initial "ACK" should be of the NEXT sequence, not the previous one.
+                    hdr.seq_nr = hdr.seq_nr.wrapping_add(1);
+                    let mut buf = [0u8; UTP_HEADER_SIZE];
+                    hdr.serialize(&mut buf)
+                        .context("bug: can't serialize header")?;
+                    socket
+                        .udp_socket
+                        .send_to(&buf, state.addr)
+                        .await
+                        .context("error sending initial ACK")?;
+                }
+
+                state.await
+            }
+            .instrument(error_span!("utp_stream", connection_id = conn_id_recv))
+        });
+
+        Self {
+            reader: read_half,
+            writer: write_half,
+        }
+    }
+
+    // This is faster than tokio::io::split as it doesn't use a mutex
+    // unlike the general one.
+    pub fn split(
+        self,
+    ) -> (
+        impl AsyncRead + Send + Sync + 'static,
+        impl AsyncWrite + Send + Sync + 'static,
+    ) {
+        (self.reader, self.writer)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AckDelayTimer {
+    Idle,
+    Waiting(Instant),
+    Immediate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum TimerKind {
+    Idle,
+    Retransmit {
+        expires_at: Instant,
+        delay: Duration,
+    },
+    FastRetransmit,
+}
+
+struct Timers {
+    sleep: Option<Pin<Box<Sleep>>>,
+
+    kind: TimerKind,
+
+    ack_delay_timer: AckDelayTimer,
+
+    /// Used for rate-limiting: No more challenge ACKs will be sent until this instant.
+    challenge_ack_timer: Instant,
+}
+
+impl TimerKind {
+    fn new() -> TimerKind {
+        TimerKind::Idle
+    }
+
+    fn should_retransmit(&self, timestamp: Instant) -> Option<Duration> {
+        match *self {
+            TimerKind::Retransmit { expires_at, delay } if timestamp >= expires_at => {
+                Some(timestamp - expires_at + delay)
+            }
+            TimerKind::FastRetransmit => Some(Duration::from_millis(0)),
+            _ => None,
+        }
+    }
+
+    fn poll_at(&self) -> PollAt {
+        match *self {
+            TimerKind::Idle => PollAt::Ingress,
+            TimerKind::Retransmit { expires_at, .. } => PollAt::Time(expires_at),
+            TimerKind::FastRetransmit => PollAt::Now,
+        }
+    }
+
+    fn set_for_idle(&mut self) {
+        *self = TimerKind::Idle
+    }
+
+    fn set_for_retransmit(&mut self, timestamp: Instant, delay: Duration) {
+        match *self {
+            TimerKind::Idle { .. } | TimerKind::FastRetransmit { .. } => {
+                *self = TimerKind::Retransmit {
+                    expires_at: timestamp + delay,
+                    delay,
+                }
+            }
+            TimerKind::Retransmit { expires_at, delay } if timestamp >= expires_at => {
+                *self = TimerKind::Retransmit {
+                    expires_at: timestamp + delay,
+                    delay: delay * 2,
+                }
+            }
+            TimerKind::Retransmit { .. } => (),
+        }
+    }
+
+    fn set_for_fast_retransmit(&mut self) {
+        *self = TimerKind::FastRetransmit
+    }
+
+    fn is_retransmit(&self) -> bool {
+        matches!(
+            *self,
+            TimerKind::Retransmit { .. } | TimerKind::FastRetransmit
+        )
+    }
+}
+
+impl Timers {
+    /// Schedule the timer to re-poll the dispatcher at provided deadline.
+    ///
+    /// Returns true if the waker was registered (i.e. it's ok to return Poll::Pending).
+    fn arm(&mut self, cx: &mut std::task::Context<'_>, deadline: Instant) -> bool {
+        let deadline = tokio::time::Instant::from_std(deadline);
+        match self.sleep.as_mut() {
+            Some(sl) => {
+                sl.as_mut().reset(deadline);
+                sl.as_mut().poll(cx) == Poll::Pending
+            }
+            None => {
+                let mut sleep = Box::pin(sleep_until(deadline));
+                let pending = sleep.as_mut().poll(cx) == Poll::Pending;
+                self.sleep = Some(sleep);
+                pending
+            }
+        }
+    }
+}
+
+// The main dispatch loop for the virtual socket is here.
+impl std::future::Future for VirtualSocket {
+    type Output = anyhow::Result<()>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        macro_rules! bail_if_err {
+            ($e:expr) => {
+                match $e {
+                    Ok(val) => val,
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+            };
+        }
+
+        loop {
+            // Track if UDP socket is full this poll, and don't send to it if so.
+            this.this_poll.udp_socket_full = false;
+            this.this_poll.now = Instant::now();
+
+            // Read incoming stream.
+            bail_if_err!(this.process_all_incoming_messages(cx));
+
+            bail_if_err!(this.maybe_send_delayed_ack(cx));
+
+            // Fragment data sent by user
+            bail_if_err!(this.fragment_tx_queue(cx));
+
+            // (Re)send tx queue.
+            bail_if_err!(this.send_tx_queue(cx));
+
+            match this.poll_at() {
+                PollAt::Now => {
+                    trace!("need to repoll");
+                    continue;
+                }
+                PollAt::Time(instant) => {
+                    trace!(deadline = ?instant - this.this_poll.now, "arming timer");
+                    if this.timers.arm(cx, instant) {
+                        return Poll::Pending;
+                    } else {
+                        trace!(deadline = ?instant - this.this_poll.now, "failed arming timer, continuing loop");
+                        continue;
+                    }
+                }
+                PollAt::Ingress => return Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Gives an indication on the next time the socket should be polled.
+#[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum PollAt {
+    /// The socket needs to be polled immediately.
+    Now,
+    /// The socket needs to be polled at given [Instant][struct.Instant].
+    Time(Instant),
+    /// The socket does not need to be polled unless there are external changes.
+    Ingress,
+}
