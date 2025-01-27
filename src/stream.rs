@@ -10,7 +10,6 @@ use std::{
 
 use anyhow::{bail, Context};
 use parking_lot::Mutex;
-use rand::random;
 use smoltcp::storage::RingBuffer;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -32,7 +31,7 @@ use crate::{
     seq_nr::SeqNr,
     socket::ValidatedSocketOpts,
     stream_tx::Tx,
-    transport_trait::Transport,
+    traits::{DefaultUtpEnvironment, Transport, UtpEnvironment},
     utils::{fill_buffer_from_rb, spawn_print_error, update_optional_waker},
     UtpSocket,
 };
@@ -145,9 +144,9 @@ enum UserRxMessage {
 }
 
 // An equivalent of a TCP socket for uTP.
-struct VirtualSocket<T> {
+struct VirtualSocket<T, Env> {
     state: VirtualSocketState,
-    socket: Weak<UtpSocket<T>>,
+    socket: Weak<UtpSocket<T, Env>>,
     socket_created: Instant,
     socket_opts: ValidatedSocketOpts,
 
@@ -202,6 +201,8 @@ struct VirtualSocket<T> {
     congestion_controller: Reno,
 
     this_poll: ThisPoll,
+
+    env: Env,
 }
 
 // Updated on every poll
@@ -217,7 +218,7 @@ struct ThisPoll {
     transport_pending: bool,
 }
 
-impl<T: Transport> VirtualSocket<T> {
+impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn timestamp_microseconds(&self) -> u32 {
         self.socket_created.elapsed().as_micros() as u32
     }
@@ -257,7 +258,7 @@ impl<T: Transport> VirtualSocket<T> {
     fn send_tx_queue(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T>,
+        socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<()> {
         if self.tx.is_empty() {
             return Ok(());
@@ -336,7 +337,7 @@ impl<T: Transport> VirtualSocket<T> {
     fn maybe_send_delayed_ack(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T>,
+        socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<bool> {
         if self.delayed_ack_expired() && self.ack_to_transmit() {
             trace!("delayed ack expired, sending ACK");
@@ -391,7 +392,7 @@ impl<T: Transport> VirtualSocket<T> {
     fn send_control_packet(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T>,
+        socket: &UtpSocket<T, Env>,
         header: UtpHeader,
     ) -> anyhow::Result<bool> {
         if self.this_poll.transport_pending {
@@ -424,7 +425,7 @@ impl<T: Transport> VirtualSocket<T> {
     fn send_ack(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T>,
+        socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<bool> {
         self.send_control_packet(cx, socket, self.outgoing_header())
     }
@@ -432,7 +433,7 @@ impl<T: Transport> VirtualSocket<T> {
     fn send_challenge_ack(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T>,
+        socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<bool> {
         if self.this_poll.now < self.timers.challenge_ack_timer {
             return Ok(false);
@@ -451,7 +452,7 @@ impl<T: Transport> VirtualSocket<T> {
     fn maybe_send_fin(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T>,
+        socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<()> {
         if self.this_poll.transport_pending {
             return Ok(());
@@ -551,7 +552,7 @@ impl<T: Transport> VirtualSocket<T> {
     fn process_all_incoming_messages(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T>,
+        socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<()> {
         while let Poll::Ready(msg) = self.rx.poll_recv(cx) {
             let msg = match msg {
@@ -588,7 +589,7 @@ impl<T: Transport> VirtualSocket<T> {
     fn process_incoming_message(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T>,
+        socket: &UtpSocket<T, Env>,
         msg: UtpMessage,
     ) -> anyhow::Result<()> {
         trace!("on_message");
@@ -850,14 +851,14 @@ struct UserTx {
 }
 
 // When both writer and reader are dropped, this will close the stream.
-struct UtpStreamDropGuard<T: Transport> {
-    sock: Weak<UtpSocket<T>>,
+struct UtpStreamDropGuard<T: Transport, Env: UtpEnvironment> {
+    sock: Weak<UtpSocket<T, Env>>,
     addr: SocketAddr,
     id1: u16,
     id2: u16,
 }
 
-impl<T: Transport> Drop for UtpStreamDropGuard<T> {
+impl<T: Transport, Env: UtpEnvironment> Drop for UtpStreamDropGuard<T, Env> {
     fn drop(&mut self) {
         if let Some(sock) = self.sock.upgrade() {
             let addr = self.addr;
@@ -872,25 +873,25 @@ impl<T: Transport> Drop for UtpStreamDropGuard<T> {
     }
 }
 
-impl<T> Drop for VirtualSocket<T> {
+impl<T, E> Drop for VirtualSocket<T, E> {
     fn drop(&mut self) {
         self.user_tx.locked.lock().mark_stream_dead();
     }
 }
 
-pub struct UtpStreamReadHalf<T: Transport> {
-    _guard: Arc<UtpStreamDropGuard<T>>,
+pub struct UtpStreamReadHalf<T: Transport, Env: UtpEnvironment> {
+    _guard: Arc<UtpStreamDropGuard<T, Env>>,
     rx: UnboundedReceiver<UserRxMessage>,
     current: Option<UtpMessage>,
     offset: usize,
 }
 
-pub struct UtpStreamWriteHalf<T: Transport> {
-    _guard: Arc<UtpStreamDropGuard<T>>,
+pub struct UtpStreamWriteHalf<T: Transport, Env: UtpEnvironment> {
+    _guard: Arc<UtpStreamDropGuard<T, Env>>,
     user_tx: Arc<UserTx>,
 }
 
-impl<T: Transport> UtpStreamWriteHalf<T> {
+impl<T: Transport, Env: UtpEnvironment> UtpStreamWriteHalf<T, Env> {
     fn close(&mut self) {
         let mut g = self.user_tx.locked.lock();
         g.closed = true;
@@ -900,13 +901,13 @@ impl<T: Transport> UtpStreamWriteHalf<T> {
     }
 }
 
-impl<T: Transport> Drop for UtpStreamWriteHalf<T> {
+impl<T: Transport, Env: UtpEnvironment> Drop for UtpStreamWriteHalf<T, Env> {
     fn drop(&mut self) {
         self.close();
     }
 }
 
-impl<T: Transport> AsyncRead for UtpStreamReadHalf<T> {
+impl<T: Transport, Env: UtpEnvironment> AsyncRead for UtpStreamReadHalf<T, Env> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -947,7 +948,7 @@ impl<T: Transport> AsyncRead for UtpStreamReadHalf<T> {
     }
 }
 
-impl<T: Transport> AsyncWrite for UtpStreamWriteHalf<T> {
+impl<T: Transport, Env: UtpEnvironment> AsyncWrite for UtpStreamWriteHalf<T, Env> {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1005,15 +1006,15 @@ impl<T: Transport> AsyncWrite for UtpStreamWriteHalf<T> {
     }
 }
 
-pub type UtpStreamUdp = UtpStream<tokio::net::UdpSocket>;
+pub type UtpStreamUdp = UtpStream<tokio::net::UdpSocket, DefaultUtpEnvironment>;
 
-pub struct UtpStream<T: Transport> {
-    reader: UtpStreamReadHalf<T>,
-    writer: UtpStreamWriteHalf<T>,
+pub struct UtpStream<T: Transport, Env: UtpEnvironment> {
+    reader: UtpStreamReadHalf<T, Env>,
+    writer: UtpStreamWriteHalf<T, Env>,
     _phantom: PhantomData<T>,
 }
 
-impl<T: Transport> AsyncRead for UtpStream<T> {
+impl<T: Transport, Env: UtpEnvironment> AsyncRead for UtpStream<T, Env> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1023,7 +1024,7 @@ impl<T: Transport> AsyncRead for UtpStream<T> {
     }
 }
 
-impl<T: Transport> AsyncWrite for UtpStream<T> {
+impl<T: Transport, Env: UtpEnvironment> AsyncWrite for UtpStream<T, Env> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1095,10 +1096,7 @@ impl StreamArgs {
         }
     }
 
-    // TODO: this doesn't work with echo, not sure about real world
-    pub fn new_incoming(remote_syn: &UtpHeader) -> Self {
-        let next_seq_nr = random::<u16>().into();
-
+    pub fn new_incoming(next_seq_nr: SeqNr, remote_syn: &UtpHeader) -> Self {
         Self {
             conn_id_recv: remote_syn.connection_id.wrapping_add(1),
             conn_id_send: remote_syn.connection_id,
@@ -1120,9 +1118,9 @@ impl StreamArgs {
     }
 }
 
-impl<T: Transport> UtpStream<T> {
+impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
     pub(crate) fn new(
-        socket: &Arc<UtpSocket<T>>,
+        socket: &Arc<UtpSocket<T, Env>>,
         addr: SocketAddr,
         rx: UnboundedReceiver<UtpMessage>,
         args: StreamArgs,
@@ -1172,12 +1170,14 @@ impl<T: Transport> UtpStream<T> {
             user_tx: user_tx.clone(),
         };
 
-        let now = Instant::now();
+        let env = socket.env.copy();
+        let now = env.now();
 
         let socket_opts = socket.opts();
 
         let state = VirtualSocket {
             state: VirtualSocketState::Established,
+            env,
             socket: Arc::downgrade(socket),
             socket_created: socket.created,
             socket_opts: *socket_opts,
@@ -1387,7 +1387,7 @@ impl Timers {
 }
 
 // The main dispatch loop for the virtual socket is here.
-impl<T: Transport> std::future::Future for VirtualSocket<T> {
+impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T, Env> {
     type Output = anyhow::Result<()>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
@@ -1421,7 +1421,7 @@ impl<T: Transport> std::future::Future for VirtualSocket<T> {
 
         // Track if UDP socket is full this poll, and don't send to it if so.
         this.this_poll.transport_pending = false;
-        this.this_poll.now = Instant::now();
+        this.this_poll.now = this.env.now();
 
         loop {
             // Read incoming stream.

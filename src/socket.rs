@@ -14,12 +14,11 @@ use crate::{
     packet_pool::PacketPool,
     raw::{Type, UtpHeader},
     stream::StreamArgs,
-    transport_trait::Transport,
+    traits::{DefaultUtpEnvironment, Transport, UtpEnvironment},
     utils::spawn_print_error,
     UtpStream,
 };
 use anyhow::{bail, Context};
-use rand::random;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
@@ -110,7 +109,7 @@ pub(crate) struct ValidatedSocketOpts {
     pub nagle: bool,
 }
 
-pub struct UtpSocket<Transport> {
+pub struct UtpSocket<Transport, Env> {
     // Todo private/public
     pub(crate) udp_socket: Transport,
     pub(crate) created: Instant,
@@ -122,9 +121,11 @@ pub struct UtpSocket<Transport> {
     connecting: dashmap::DashMap<Key, Connecting>,
     local_addr: SocketAddr,
     opts: ValidatedSocketOpts,
+
+    pub(crate) env: Env,
 }
 
-impl<T> std::fmt::Debug for UtpSocket<T> {
+impl<Transport, Env> std::fmt::Debug for UtpSocket<Transport, Env> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UtpSocket")
             .field("addr", &self.local_addr)
@@ -132,27 +133,23 @@ impl<T> std::fmt::Debug for UtpSocket<T> {
     }
 }
 
-impl UtpSocket<tokio::net::UdpSocket> {
+impl UtpSocket<tokio::net::UdpSocket, DefaultUtpEnvironment> {
     pub async fn new_udp(bind_addr: SocketAddr) -> anyhow::Result<Arc<Self>> {
         let opts = SocketOpts::default();
         let sock = tokio::net::UdpSocket::bind(bind_addr)
             .await
             .context("error binding")?;
-        Self::new_with_opts(sock, opts).await
+        Self::new_with_opts(sock, Default::default(), opts).await
     }
 }
 
-impl<T: Transport> UtpSocket<T> {
-    pub async fn new(transport: T) -> anyhow::Result<Arc<Self>> {
-        let opts = SocketOpts::default();
-        Self::new_with_opts(transport, opts).await
-    }
-
-    pub async fn new_with_opts(transport: T, opts: SocketOpts) -> anyhow::Result<Arc<Self>> {
+impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
+    pub async fn new_with_opts(
+        transport: T,
+        env: Env,
+        opts: SocketOpts,
+    ) -> anyhow::Result<Arc<Self>> {
         let opts = opts.validate().context("error validating socket options")?;
-        // let sock = tokio::net::UdpSocket::bind(bind_addr)
-        //     .await
-        //     .context("error binding")?;
         let sock = transport;
         let local_addr = sock.bind_addr();
 
@@ -160,13 +157,14 @@ impl<T: Transport> UtpSocket<T> {
 
         let sock = Arc::new(Self {
             udp_socket: sock,
-            created: Instant::now(),
-            connection_id: AtomicU16::new(random()),
+            created: env.now(),
+            connection_id: AtomicU16::new(env.random_u16()),
             accept_tx,
             streams: Default::default(),
             connecting: Default::default(),
             local_addr,
             opts,
+            env,
         });
         spawn_print_error(
             error_span!("utp_socket", addr=?local_addr),
@@ -178,10 +176,6 @@ impl<T: Transport> UtpSocket<T> {
     pub(crate) fn opts(&self) -> &ValidatedSocketOpts {
         &self.opts
     }
-
-    // pub fn addr(&self) -> SocketAddr {
-    //     self.local_addr
-    // }
 
     async fn dispatcher(
         self: Arc<Self>,
@@ -256,7 +250,7 @@ impl<T: Transport> UtpSocket<T> {
     }
 
     #[tracing::instrument(name="utp_socket:accept", skip(self), fields(local=?self.local_addr))]
-    pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream<T>> {
+    pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream<T, Env>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.accept_tx.send(tx).context("error accepting")?;
 
@@ -269,7 +263,7 @@ impl<T: Transport> UtpSocket<T> {
         let conn_id_recv = header.connection_id.wrapping_add(1);
         let conn_id_send = header.connection_id;
 
-        let stream_args = StreamArgs::new_incoming(&header);
+        let stream_args = StreamArgs::new_incoming(self.env.random_u16().into(), &header);
         let stream = UtpStream::new(self, addr, rx, stream_args);
 
         self.streams.insert((addr, conn_id_recv), tx.clone());
@@ -278,14 +272,17 @@ impl<T: Transport> UtpSocket<T> {
     }
 
     #[tracing::instrument(name="utp_socket:connect", skip(self), fields(local=?self.local_addr))]
-    pub async fn connect(self: &Arc<Self>, remote: SocketAddr) -> anyhow::Result<UtpStream<T>> {
+    pub async fn connect(
+        self: &Arc<Self>,
+        remote: SocketAddr,
+    ) -> anyhow::Result<UtpStream<T, Env>> {
         // create a "connecting" future. On received message, resolve the oneshot.
 
         // One for send one for recv.
         let connection_id = self.connection_id.fetch_add(2, Ordering::Relaxed);
 
         let mut buf = [0u8; UTP_HEADER_SIZE];
-        let seq_nr = random::<u16>().into();
+        let seq_nr = self.env.random_u16().into();
         let mut header = UtpHeader {
             connection_id,
             timestamp_microseconds: self.created.elapsed().as_micros() as u32,

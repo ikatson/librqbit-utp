@@ -2,6 +2,7 @@ use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     task::{Context, Poll},
+    time::Instant,
 };
 
 use tokio::net::UdpSocket;
@@ -56,5 +57,29 @@ impl Transport for UdpSocket {
 
     fn bind_addr(&self) -> SocketAddr {
         UdpSocket::local_addr(self).unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+    }
+}
+
+// A trait for mocking stuff in tests.
+pub trait UtpEnvironment: Send + Sync + Unpin + 'static {
+    fn now(&self) -> Instant;
+    fn copy(&self) -> Self;
+    fn random_u16(&self) -> u16;
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct DefaultUtpEnvironment {}
+
+impl UtpEnvironment for DefaultUtpEnvironment {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn copy(&self) -> Self {
+        *self
+    }
+
+    fn random_u16(&self) -> u16 {
+        rand::random()
     }
 }
