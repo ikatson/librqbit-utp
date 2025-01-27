@@ -14,7 +14,7 @@ use smoltcp::storage::RingBuffer;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    time::{sleep_until, Sleep},
+    time::Sleep,
 };
 use tracing::{debug, error_span, trace, warn};
 
@@ -1196,7 +1196,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
             conn_id_send,
             timers: Timers {
                 kind: TimerKind::new(),
-                sleep: None,
+                sleep: Box::pin(tokio::time::sleep(Duration::from_secs(0))),
                 challenge_ack_timer: now - CHALLENGE_ACK_RATELIMIT,
                 ack_delay_timer: AckDelayTimer::Idle,
             },
@@ -1292,7 +1292,7 @@ enum TimerKind {
 }
 
 struct Timers {
-    sleep: Option<Pin<Box<Sleep>>>,
+    sleep: Pin<Box<Sleep>>,
 
     kind: TimerKind,
 
@@ -1363,20 +1363,11 @@ impl Timers {
     /// Schedule the timer to re-poll the dispatcher at provided deadline.
     ///
     /// Returns true if the waker was registered (i.e. it's ok to return Poll::Pending).
-    fn arm(&mut self, cx: &mut std::task::Context<'_>, deadline: Instant) -> bool {
-        let deadline = tokio::time::Instant::from_std(deadline);
-        match self.sleep.as_mut() {
-            Some(sl) => {
-                sl.as_mut().reset(deadline);
-                sl.as_mut().poll(cx) == Poll::Pending
-            }
-            None => {
-                let mut sleep = Box::pin(sleep_until(deadline));
-                let pending = sleep.as_mut().poll(cx) == Poll::Pending;
-                self.sleep = Some(sleep);
-                pending
-            }
-        }
+    fn arm_in(&mut self, cx: &mut std::task::Context<'_>, duration: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + duration;
+        let mut sl = self.sleep.as_mut();
+        sl.as_mut().reset(deadline);
+        sl.as_mut().poll(cx) == Poll::Pending
     }
 
     fn reset_delayed_ack_timer(&mut self) {
@@ -1457,8 +1448,9 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
                     continue;
                 }
                 PollAt::Time(instant) => {
-                    trace!(deadline = ?instant - this.this_poll.now, "arming timer");
-                    if this.timers.arm(cx, instant) {
+                    let duration = instant - this.this_poll.now;
+                    trace!(sleep = ?duration, "arming timer");
+                    if this.timers.arm_in(cx, duration) {
                         return Poll::Pending;
                     } else {
                         trace!(deadline = ?instant - this.this_poll.now, "failed arming timer, continuing loop");

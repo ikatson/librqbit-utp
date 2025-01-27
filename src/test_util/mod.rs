@@ -1,5 +1,3 @@
-use std::{net::SocketAddr, sync::Arc};
-
 use env::MockUtpEnvironment;
 use transport::MockUtpTransport;
 
