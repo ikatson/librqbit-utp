@@ -643,6 +643,9 @@ impl VirtualSocket {
 }
 
 struct WakeableRingBuffer {
+    // Set when stream dies abruptly for writer to know about it.
+    dead: bool,
+
     buffer: RingBuffer<'static, u8>,
     // This is woken up by dispatcher when the buffer has space if it didn't have it previously.
     buffer_no_longer_full: Option<Waker>,
@@ -651,10 +654,20 @@ struct WakeableRingBuffer {
     buffer_has_data: Option<Waker>,
 }
 
+impl WakeableRingBuffer {
+    fn mark_stream_dead(&mut self) {
+        self.dead = true;
+        if let Some(waker) = self.buffer_no_longer_full.take() {
+            waker.wake();
+        }
+    }
+}
+
 struct UserTx {
     locked: RwLock<WakeableRingBuffer>,
 }
 
+// When both writer and reader are dropped, this will close the stream.
 struct UtpStreamDropGuard {
     sock: Weak<UtpSocket>,
     addr: SocketAddr,
@@ -668,6 +681,12 @@ impl Drop for UtpStreamDropGuard {
             sock.streams.remove(&(self.addr, self.id1));
             sock.streams.remove(&(self.addr, self.id2));
         }
+    }
+}
+
+impl Drop for VirtualSocket {
+    fn drop(&mut self) {
+        self.user_tx.locked.write().mark_stream_dead();
     }
 }
 
@@ -711,9 +730,7 @@ impl AsyncRead for UtpStreamReadHalf {
 
             let msg = match this.rx.poll_recv(cx) {
                 Poll::Ready(Some(msg)) => msg,
-                Poll::Ready(None) => {
-                    return Poll::Ready(Err(std::io::Error::other("bug: socket closed")))
-                }
+                Poll::Ready(None) => return Poll::Ready(Err(std::io::Error::other("socket died"))),
                 Poll::Pending => return Poll::Pending,
             };
 
@@ -727,8 +744,13 @@ impl AsyncWrite for UtpStreamWriteHalf {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
-    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+    ) -> Poll<Result<usize, std::io::Error>> {
         let mut g = self.user_tx.locked.write();
+
+        if g.dead {
+            return Poll::Ready(Err(std::io::Error::other("socket died")));
+        }
+
         let count = g.buffer.enqueue_slice(buf);
         if count == 0 {
             assert!(g.buffer.is_full());
@@ -746,14 +768,14 @@ impl AsyncWrite for UtpStreamWriteHalf {
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
+    ) -> Poll<Result<(), std::io::Error>> {
         todo!()
     }
 
     fn poll_shutdown(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), std::io::Error>> {
+    ) -> Poll<Result<(), std::io::Error>> {
         todo!()
     }
 }
@@ -897,6 +919,7 @@ impl UtpStream {
                 buffer: RingBuffer::new(vec![0u8; socket.opts().virtual_socket_tx_bytes]),
                 buffer_no_longer_full: None,
                 buffer_has_data: None,
+                dead: false,
             }),
         });
 

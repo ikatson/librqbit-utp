@@ -1,4 +1,4 @@
-// TODO: informing readers and writers of socket death.
+// TODO: informing writer of socket death.
 //
 // TODO: congestion control
 //

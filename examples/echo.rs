@@ -1,19 +1,32 @@
 use std::{
+    future::Future,
     net::{Ipv4Addr, SocketAddr},
     time::Duration,
 };
 
 use anyhow::{bail, Context};
+use futures::FutureExt;
 pub use librqbit_utp::UtpSocket;
 use librqbit_utp::UtpStream;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     time::timeout,
+    try_join,
 };
 use tracing::{error_span, info, Instrument};
 
 const MAX_COUNTER: u64 = 10_000;
 const TIMEOUT: Duration = Duration::from_secs(1);
+
+async fn flatten<JoinError>(
+    handle: impl Future<Output = Result<anyhow::Result<()>, JoinError>>,
+) -> anyhow::Result<()> {
+    match handle.await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(err)) => Err(err),
+        Err(_) => bail!("joining failed"),
+    }
+}
 
 async fn echo(stream: UtpStream) -> anyhow::Result<()> {
     let (reader, writer) = stream.split();
@@ -50,13 +63,8 @@ async fn echo(stream: UtpStream) -> anyhow::Result<()> {
         Ok::<_, anyhow::Error>(())
     };
 
-    tokio::pin!(reader);
-    tokio::pin!(writer);
-
-    tokio::select! {
-        r = &mut reader => r,
-        r = &mut writer => r
-    }
+    try_join!(reader, writer)?;
+    Ok(())
 }
 
 #[tokio::main]
@@ -80,8 +88,10 @@ async fn main() -> anyhow::Result<()> {
                 .context("error connecting")?;
             echo(sock).await.context("error running client echo")
         }
-        .instrument(error_span!("client")),
-    );
+        .instrument(error_span!("client"))
+        .map(|v| v.context("client died")),
+    )
+    .map(|v| v.context("error joining"));
 
     let server = tokio::spawn(
         async move {
@@ -91,14 +101,11 @@ async fn main() -> anyhow::Result<()> {
             let sock = server.accept().await.context("error accepting")?;
             echo(sock).await.context("error running server echo")
         }
-        .instrument(error_span!("server")),
+        .instrument(error_span!("server"))
+        .map(|v| v.context("server died")),
     );
 
-    tokio::select! {
-        r = client => r.context("error joining client")?.context("client died")?,
-        r = server => r.context("error joining server")?.context("server died")?,
-    }
-
+    try_join!(flatten(client), flatten(server))?;
     info!("finished");
 
     Ok(())
