@@ -317,7 +317,12 @@ impl<T: Transport> VirtualSocket<T> {
             }
 
             recv_wnd = recv_wnd.saturating_sub(item.payload_size());
+
+            // Each DATA packet can act as ACK so update related state.
             self.last_sent_seq_nr = header.seq_nr;
+            self.last_sent_ack_nr = header.ack_nr;
+            self.timers.reset_delayed_ack_timer();
+
             self.rtte.on_send(self.this_poll.now, header.seq_nr);
             sent = true;
         }
@@ -410,7 +415,7 @@ impl<T: Transport> VirtualSocket<T> {
         if sent {
             self.rtte.on_send(self.this_poll.now, header.seq_nr);
             self.last_sent_ack_nr = self.last_consumed_ack_nr;
-            self.reset_delayed_ack_timer();
+            self.timers.reset_delayed_ack_timer();
         }
 
         Ok(sent)
@@ -806,19 +811,6 @@ impl<T: Transport> VirtualSocket<T> {
             AckDelayTimer::Waiting(t) => t <= self.this_poll.now,
             AckDelayTimer::Immediate => true,
         }
-    }
-
-    fn reset_delayed_ack_timer(&mut self) {
-        match self.timers.ack_delay_timer {
-            AckDelayTimer::Idle => {}
-            AckDelayTimer::Waiting(_) => {
-                trace!("stop delayed ack timer")
-            }
-            AckDelayTimer::Immediate => {
-                trace!("stop delayed ack timer (was force-expired)")
-            }
-        }
-        self.timers.ack_delay_timer = AckDelayTimer::Idle;
     }
 
     // When do we need to send smth timer-based next time.
@@ -1387,6 +1379,19 @@ impl Timers {
                 pending
             }
         }
+    }
+
+    fn reset_delayed_ack_timer(&mut self) {
+        match self.ack_delay_timer {
+            AckDelayTimer::Idle => {}
+            AckDelayTimer::Waiting(_) => {
+                trace!("stop delayed ack timer")
+            }
+            AckDelayTimer::Immediate => {
+                trace!("stop delayed ack timer (was force-expired)")
+            }
+        }
+        self.ack_delay_timer = AckDelayTimer::Idle;
     }
 }
 
