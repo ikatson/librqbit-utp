@@ -28,7 +28,7 @@ use crate::{
     seq_nr::SeqNr,
     socket::ValidatedSocketOpts,
     stream_tx::Tx,
-    utils::{fill_buffer_from_rb, seq_nr_offset, spawn_print_error, update_optional_waker},
+    utils::{fill_buffer_from_rb, spawn_print_error, update_optional_waker},
     UtpSocket,
 };
 
@@ -37,13 +37,16 @@ use crate::{
 #[derive(Clone, Copy)]
 enum VirtualSocketState {
     Established,
+
+    //
     DeviceDead,
+    Finished,
 
     // We sent FIN, not yet ACKed
     FinWait1 { our_fin: SeqNr },
 
     // Our fin was ACKed
-    FinWait2 { our_fin: SeqNr },
+    FinWait2,
 
     // We received a FIN, but we may still send data.
     CloseWait,
@@ -57,42 +60,79 @@ enum VirtualSocketState {
 }
 
 impl VirtualSocketState {
-    fn transition_to_fin_sent(&mut self, our_fin: SeqNr) -> bool {
+    fn is_done(&self) -> bool {
+        matches!(
+            self,
+            VirtualSocketState::DeviceDead | VirtualSocketState::Finished
+        )
+    }
+
+    fn transition_to_fin_sent(&mut self, our_fin: SeqNr) {
         match self {
-            VirtualSocketState::FinWait1 { .. }
-            | VirtualSocketState::FinWait2 { .. }
-            | VirtualSocketState::Closing { .. }
-            | VirtualSocketState::LastAck { .. }
-            | VirtualSocketState::DeviceDead => return false,
             VirtualSocketState::Established => *self = VirtualSocketState::FinWait1 { our_fin },
             VirtualSocketState::CloseWait => *self = VirtualSocketState::LastAck { our_fin },
+            _ => {}
         }
-        true
     }
 
     fn our_fin_if_unacked(&self) -> Option<SeqNr> {
         match *self {
-            VirtualSocketState::Established
-            | VirtualSocketState::DeviceDead
-            | VirtualSocketState::CloseWait
-            | VirtualSocketState::FinWait2 { .. } => None,
-
             VirtualSocketState::FinWait1 { our_fin }
             | VirtualSocketState::Closing { our_fin }
             | VirtualSocketState::LastAck { our_fin } => Some(our_fin),
+            _ => None,
         }
     }
 
-    fn transition_to_fin_received(&mut self, remote_ack_nr: SeqNr) -> bool {
+    fn on_incoming_packet(&mut self, is_fin: bool, remote_ack_nr: SeqNr) {
+        // To decrease combinations, first process remote_ack_nr, then process "is_fin"
+
+        // Maybe ACK our fin
         match *self {
-            VirtualSocketState::Established => *self = VirtualSocketState::CloseWait,
-            VirtualSocketState::DeviceDead | VirtualSocketState::CloseWait => return false,
-            VirtualSocketState::FinWait1 { our_fin } => todo!(),
-            VirtualSocketState::FinWait2 { our_fin } => todo!(),
-            VirtualSocketState::Closing { our_fin } => todo!(),
-            VirtualSocketState::LastAck { our_fin } => todo!(),
+            VirtualSocketState::FinWait1 { our_fin } => {
+                if remote_ack_nr == our_fin {
+                    *self = VirtualSocketState::FinWait2;
+                }
+            }
+            VirtualSocketState::Closing { our_fin } => {
+                // For simplicity, we don't need to wait until the last side receives our FIN.
+                // This would be smth like TimeWait, but it's not worth it.
+                if remote_ack_nr == our_fin {
+                    *self = VirtualSocketState::Finished;
+                    return;
+                }
+            }
+            VirtualSocketState::LastAck { our_fin } => {
+                if our_fin == remote_ack_nr {
+                    *self = VirtualSocketState::Finished;
+                    return;
+                }
+            }
+            _ => {}
         }
-        true
+
+        if !is_fin {
+            return;
+        }
+
+        // Process remote FIN.
+        match *self {
+            VirtualSocketState::Established => {
+                *self = VirtualSocketState::CloseWait;
+            }
+            VirtualSocketState::DeviceDead | VirtualSocketState::Finished => {}
+            VirtualSocketState::FinWait1 { our_fin } => {
+                *self = VirtualSocketState::Closing { our_fin };
+            }
+            VirtualSocketState::FinWait2 { .. } => {
+                *self = VirtualSocketState::Finished;
+            }
+            VirtualSocketState::CloseWait
+            | VirtualSocketState::Closing { .. }
+            | VirtualSocketState::LastAck { .. } => {
+                // fin retransmission, ignore
+            }
+        }
     }
 }
 
@@ -255,7 +295,6 @@ impl VirtualSocket {
                 })
                 .context("bug: wasn't able to serialize the buffer")?;
 
-            self.rtte.on_send(self.this_poll.now, header.seq_nr);
             self.this_poll.udp_socket_full |=
                 sock.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.addr)?;
 
@@ -506,6 +545,14 @@ impl VirtualSocket {
     ) -> anyhow::Result<()> {
         trace!("on_message");
 
+        self.state.on_incoming_packet(
+            matches!(msg.header.get_type(), Type::ST_FIN),
+            msg.header.ack_nr,
+        );
+        if self.state.is_done() {
+            return Ok(());
+        }
+
         // Remove everything from tx_buffer that was acked by this message.
         let (removed_headers, removed_bytes) = self.tx.remove_up_to_ack(msg.header.ack_nr);
         if removed_headers > 0 {
@@ -535,6 +582,58 @@ impl VirtualSocket {
         self.congestion_controller
             .set_remote_window(msg.header.wnd_size as usize);
 
+        self.rtte.on_ack(self.this_poll.now, msg.header.ack_nr);
+        self.congestion_controller
+            .on_ack(self.this_poll.now, removed_bytes, &self.rtte);
+
+        // Fast retransmit in case of duplicate ACKs
+        match self.local_rx_last_ack {
+            // Duplicate ACK if payload empty and ACK doesn't move send window ->
+            // Increment duplicate ACK count and set for retransmit if we just received
+            // the third duplicate ACK
+            Some(last_rx_ack)
+                if last_rx_ack == msg.header.ack_nr
+                    && self.last_sent_seq_nr > msg.header.ack_nr
+                    && !is_window_update =>
+            {
+                // Increment duplicate ACK count
+                self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
+
+                // Inform congestion controller of duplicate ACK
+                self.congestion_controller
+                    .on_duplicate_ack(self.this_poll.now);
+
+                debug!(
+                    "received duplicate ACK for seq {} (duplicate nr {}{})",
+                    msg.header.ack_nr,
+                    self.local_rx_dup_acks,
+                    if self.local_rx_dup_acks == u8::MAX {
+                        "+"
+                    } else {
+                        ""
+                    }
+                );
+
+                if self.local_rx_dup_acks == 3 {
+                    self.timers.kind.set_for_fast_retransmit();
+                    debug!("started fast retransmit");
+                }
+            }
+            // No duplicate ACK -> Reset state and update last received ACK
+            _ => {
+                if self.local_rx_dup_acks > 0 {
+                    self.local_rx_dup_acks = 0;
+                    trace!("reset duplicate ACK count");
+                }
+                self.local_rx_last_ack = Some(msg.header.ack_nr);
+            }
+        };
+
+        let ack_all = msg.header.ack_nr == self.last_sent_ack_nr;
+        if !self.timers.kind.is_retransmit() || ack_all {
+            self.timers.kind.set_for_idle();
+        }
+
         match msg.header.get_type() {
             Type::ST_DATA => {
                 trace!(payload_size = msg.payload().len(), "received ST_DATA");
@@ -559,18 +658,10 @@ impl VirtualSocket {
 
                 let assembler_was_empty = self.assembler.is_empty();
 
-                let ack_nr = msg.header.ack_nr;
-
                 match self.assembler.add_remove(msg, offset as usize, |msg| {
                     let _ = self.user_rx_sender.send(UserRxMessage::UtpMessage(msg));
                 }) {
                     Ok(count) => {
-                        self.rtte.on_ack(self.this_poll.now, ack_nr);
-                        self.congestion_controller.on_ack(
-                            self.this_poll.now,
-                            removed_bytes,
-                            &self.rtte,
-                        );
                         if count > 0 {
                             trace!(count, "dequeued messages to user rx");
                         } else {
@@ -623,61 +714,7 @@ impl VirtualSocket {
                 }
                 Ok(())
             }
-            Type::ST_STATE => {
-                // Fast retransmit in case of duplicate ACKs
-                match self.local_rx_last_ack {
-                    // Duplicate ACK if payload empty and ACK doesn't move send window ->
-                    // Increment duplicate ACK count and set for retransmit if we just received
-                    // the third duplicate ACK
-                    Some(last_rx_ack)
-                        if last_rx_ack == msg.header.ack_nr
-                            && self.last_sent_seq_nr > msg.header.ack_nr
-                            && !is_window_update =>
-                    {
-                        // Increment duplicate ACK count
-                        self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
-
-                        // Inform congestion controller of duplicate ACK
-                        self.congestion_controller
-                            .on_duplicate_ack(self.this_poll.now);
-
-                        debug!(
-                            "received duplicate ACK for seq {} (duplicate nr {}{})",
-                            msg.header.ack_nr,
-                            self.local_rx_dup_acks,
-                            if self.local_rx_dup_acks == u8::MAX {
-                                "+"
-                            } else {
-                                ""
-                            }
-                        );
-
-                        if self.local_rx_dup_acks == 3 {
-                            self.timers.kind.set_for_fast_retransmit();
-                            debug!("started fast retransmit");
-                        }
-                    }
-                    // No duplicate ACK -> Reset state and update last received ACK
-                    _ => {
-                        if self.local_rx_dup_acks > 0 {
-                            self.local_rx_dup_acks = 0;
-                            trace!("reset duplicate ACK count");
-                        }
-                        self.local_rx_last_ack = Some(msg.header.ack_nr);
-                    }
-                };
-
-                let ack_all = msg.header.ack_nr == self.last_sent_ack_nr;
-                if !self.timers.kind.is_retransmit() || ack_all {
-                    self.timers.kind.set_for_idle();
-                }
-                self.rtte.on_ack(self.this_poll.now, msg.header.ack_nr);
-                self.congestion_controller
-                    .on_ack(self.this_poll.now, removed_bytes, &self.rtte);
-
-                Ok(())
-            }
-
+            Type::ST_STATE => Ok(()),
             Type::ST_RESET => bail!("ST_RESET received"),
             Type::ST_FIN => {
                 todo!();
