@@ -40,11 +40,6 @@ use crate::{
 enum VirtualSocketState {
     Established,
 
-    // The UTP socket disconnected (either panicked or it was dropped).
-    // TODO: this is not true. It just means we got removed from socket.streams!
-    // Device is dead only when socket is dropped.
-    // DeviceDead,
-
     // We are fully done - both sides sent and acked FINs.
     Finished,
 
@@ -70,12 +65,13 @@ impl VirtualSocketState {
         matches!(self, VirtualSocketState::Finished)
     }
 
-    fn transition_to_fin_sent(&mut self, our_fin: SeqNr) {
+    fn transition_to_fin_sent(&mut self, our_fin: SeqNr) -> bool {
         match self {
             VirtualSocketState::Established => *self = VirtualSocketState::FinWait1 { our_fin },
             VirtualSocketState::CloseWait => *self = VirtualSocketState::LastAck { our_fin },
-            _ => {}
-        }
+            _ => return false,
+        };
+        true
     }
 
     fn our_fin_if_unacked(&self) -> Option<SeqNr> {
@@ -141,8 +137,8 @@ impl VirtualSocketState {
 
 enum UserRxMessage {
     UtpMessage(UtpMessage),
+    Error(String),
     Eof,
-    DeviceClosed,
 }
 
 // An equivalent of a TCP socket for uTP.
@@ -541,14 +537,17 @@ impl<T: Transport> VirtualSocket<T> {
         Ok(())
     }
 
-    // fn transition_to_device_dead(&mut self) {
-    //     if !matches!(self.state, VirtualSocketState::DeviceDead) {
-    //         debug!("marking device dead as rx is closed");
-    //         self.state = VirtualSocketState::DeviceDead;
-    //         let _ = self.user_rx_sender.send(UserRxMessage::DeviceClosed);
-    //         self.user_tx.locked.lock().mark_stream_dead();
-    //     }
-    // }
+    fn just_before_death(&mut self, error: Option<&anyhow::Error>) {
+        // This will close the reader with a useful message.
+        let _ = self.user_rx_sender.send(
+            error
+                .map(|e| UserRxMessage::Error(format!("{e:#}")))
+                .unwrap_or(UserRxMessage::Eof),
+        );
+
+        // This will close the writer.
+        self.user_tx.locked.lock().mark_stream_dead();
+    }
 
     fn process_all_incoming_messages(
         &mut self,
@@ -570,8 +569,9 @@ impl<T: Transport> VirtualSocket<T> {
                     //    We need to send FIN in this case, but we can't wait for its ACK to arrive back, cause we can't
                     //    receive any messages!
 
-                    todo!();
-                    // self.transition_to_device_dead();
+                    self.state.transition_to_fin_sent(self.next_seq_nr);
+                    self.maybe_send_fin(cx, socket)?;
+                    self.state = VirtualSocketState::Finished;
                     return Ok(());
                 }
             };
@@ -942,10 +942,10 @@ impl<T> AsyncRead for UtpStreamReadHalf<T> {
 
             let msg = match this.rx.poll_recv(cx) {
                 Poll::Ready(Some(UserRxMessage::UtpMessage(msg))) => msg,
-                Poll::Ready(Some(UserRxMessage::Eof)) => return Poll::Ready(Ok(())),
-                Poll::Ready(Some(UserRxMessage::DeviceClosed)) => {
-                    return Poll::Ready(Err(std::io::Error::other("device closed")))
+                Poll::Ready(Some(UserRxMessage::Error(msg))) => {
+                    return Poll::Ready(Err(std::io::Error::other(msg)))
                 }
+                Poll::Ready(Some(UserRxMessage::Eof)) => return Poll::Ready(Ok(())),
                 Poll::Ready(None) => return Poll::Ready(Err(std::io::Error::other("socket died"))),
                 Poll::Pending => return Poll::Pending,
             };
@@ -1391,19 +1391,23 @@ impl<T: Transport> std::future::Future for VirtualSocket<T> {
         macro_rules! bail_if_err {
             ($e:expr) => {
                 match $e {
-                    Ok(val) => {
-                        if this.state.is_done() {
-                            debug!(?this.state, "closing event loop");
-                            return Poll::Ready(Ok(()));
-                        }
-                        val
-                    }
+                    Ok(val) => val,
                     Err(e) => {
-                        // TODO: can do cleanup here.
+                        this.just_before_death(Some(&e));
                         return Poll::Ready(Err(e));
-                    },
+                    }
                 }
             };
+        }
+
+        macro_rules! bail_if_cannot_send {
+            ($e:expr) => {{
+                let val = bail_if_err!($e);
+                if this.this_poll.transport_pending {
+                    return Poll::Pending;
+                }
+                val
+            }};
         }
 
         // Doing this once here not to upgrade too often below.
@@ -1418,20 +1422,21 @@ impl<T: Transport> std::future::Future for VirtualSocket<T> {
             // Read incoming stream.
             bail_if_err!(this.process_all_incoming_messages(cx, socket));
 
-            bail_if_err!(this.maybe_send_delayed_ack(cx, socket));
+            bail_if_cannot_send!(this.maybe_send_delayed_ack(cx, socket));
 
             this.maybe_prepare_for_retransmission();
 
             // Fragment data sent by user
-            bail_if_err!(this.fragment_tx_queue(cx));
+            bail_if_cannot_send!(this.fragment_tx_queue(cx));
 
             // (Re)send tx queue.
-            bail_if_err!(this.send_tx_queue(cx, socket));
+            bail_if_cannot_send!(this.send_tx_queue(cx, socket));
 
-            bail_if_err!(this.maybe_send_fin(cx, socket));
+            bail_if_cannot_send!(this.maybe_send_fin(cx, socket));
 
-            if this.this_poll.transport_pending {
-                return Poll::Pending;
+            if this.state.is_done() {
+                this.just_before_death(None);
+                return Poll::Ready(Ok(()));
             }
 
             match this.next_poll_send_to_at() {
