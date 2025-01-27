@@ -13,8 +13,13 @@ use crate::Transport;
 
 type Msg = (SocketAddr, Vec<u8>);
 
+// Without this indirection rust analyzer doesn't work somehow
+struct MockUtpTransportInnerLocked {
+    rx: UnboundedReceiver<Msg>,
+}
+
 struct MockUtpTransportInner {
-    rx: Mutex<UnboundedReceiver<Msg>>,
+    locked: Mutex<MockUtpTransportInnerLocked>,
     tx: UnboundedSender<Msg>,
 }
 
@@ -28,7 +33,7 @@ impl MockUtpTransport {
         let (tx, rx) = unbounded_channel();
         Self {
             inner: Arc::new(MockUtpTransportInner {
-                rx: Mutex::new(rx),
+                locked: Mutex::new(MockUtpTransportInnerLocked { rx }),
                 tx,
             }),
         }
@@ -42,8 +47,8 @@ impl Transport for MockUtpTransport {
         &'a self,
         buf: &'a mut [u8],
     ) -> std::io::Result<(usize, std::net::SocketAddr)> {
-        let f = poll_fn(|cx| self.inner.rx.lock().poll_recv(cx));
-        let (addr, data): Msg = f.await.unwrap();
+        let f = poll_fn(|cx| self.inner.locked.lock().rx.poll_recv(cx));
+        let (addr, data) = f.await.unwrap();
         assert!(data.len() <= buf.len());
         buf[..data.len()].copy_from_slice(&data);
         Ok((data.len(), addr))
