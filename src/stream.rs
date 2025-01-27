@@ -818,7 +818,8 @@ impl<T: Transport> VirtualSocket<T> {
         self.timers.ack_delay_timer = AckDelayTimer::Idle;
     }
 
-    fn poll_at(&self) -> PollAt {
+    // When do we need to send smth timer-based next time.
+    fn next_poll_send_to_at(&self) -> PollAt {
         let want_ack = self.ack_to_transmit();
 
         let delayed_ack_poll_at = match (want_ack, self.timers.ack_delay_timer) {
@@ -1429,11 +1430,12 @@ impl<T: Transport> std::future::Future for VirtualSocket<T> {
 
             bail_if_err!(this.maybe_send_fin(cx, socket));
 
-            match this.poll_at() {
+            if this.this_poll.transport_pending {
+                return Poll::Pending;
+            }
+
+            match this.next_poll_send_to_at() {
                 PollAt::Now => {
-                    if this.this_poll.transport_pending {
-                        return Poll::Pending;
-                    }
                     trace!("need to repoll");
                     continue;
                 }
