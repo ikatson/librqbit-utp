@@ -637,10 +637,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             matches!(msg.header.get_type(), Type::ST_FIN),
             msg.header.ack_nr,
         );
-        if self.state.is_done() {
-            trace!(?self.state);
-            return Ok(());
-        }
 
         // Remove everything from tx_buffer that was acked by this message.
         let (removed_headers, removed_bytes) = self.tx.remove_up_to_ack(msg.header.ack_nr);
@@ -806,7 +802,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             Type::ST_STATE => Ok(()),
             Type::ST_RESET => bail!("ST_RESET received"),
             Type::ST_FIN => {
-                self.send_ack(cx, socket)?;
+                // acknowledge the remote FIN.
+                let mut ack = self.outgoing_header();
+                ack.ack_nr = msg.header.seq_nr;
+
+                self.send_control_packet(cx, socket, ack)?;
                 let _ = self.user_rx_sender.send(UserRxMessage::Eof);
                 Ok(())
             }
@@ -1901,7 +1901,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fin_shutdown_sequence() {
+    async fn test_fin_shutdown_sequence_initiated_by_explicit_shutdown() {
         setup_test_logging();
         let mut t = make_test_vsock();
 
@@ -1982,6 +1982,7 @@ mod tests {
             "",
         );
         let result = t.poll_once().await;
+
         // We should acknowledge remote's FIN
         let sent = t.take_sent();
         assert_eq!(sent.len(), 1);

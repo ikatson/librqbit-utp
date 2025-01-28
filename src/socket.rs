@@ -753,10 +753,6 @@ mod tests {
         .instrument(error_span!("accept"));
 
         try_join!(connect, accept)?;
-
-        // See logs to see if it was cleaned up.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-
         Ok(())
     }
 }
