@@ -1146,7 +1146,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
                             .serialize(&mut buf)
                             .context("bug: can't serialize header")?;
                         socket
-                            .udp_socket
+                            .transport
                             .send_to(&buf, vsock.remote)
                             .await
                             .context("error sending initial ACK")?;

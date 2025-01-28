@@ -19,6 +19,7 @@ use crate::{
     UtpStream,
 };
 use anyhow::{bail, Context};
+use dashmap::DashMap;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
@@ -32,7 +33,7 @@ type Key = (SocketAddr, ConnectionId);
 type UtpHeaderMessage = (UtpHeader, SocketAddr);
 
 struct Connecting {
-    sender: tokio::sync::oneshot::Sender<anyhow::Result<UtpHeaderMessage>>,
+    sender: oneshot::Sender<anyhow::Result<UtpHeaderMessage>>,
 }
 
 #[derive(Default)]
@@ -111,14 +112,14 @@ pub(crate) struct ValidatedSocketOpts {
 
 pub struct UtpSocket<Transport, Env> {
     // Todo private/public
-    pub(crate) udp_socket: Transport,
+    pub(crate) transport: Transport,
     pub(crate) created: Instant,
-    pub(crate) streams: dashmap::DashMap<Key, UnboundedSender<UtpMessage>>,
+    pub(crate) streams: DashMap<Key, UnboundedSender<UtpMessage>>,
 
-    accept_tx: UnboundedSender<tokio::sync::oneshot::Sender<UtpHeaderMessage>>,
+    accept_tx: UnboundedSender<oneshot::Sender<UtpHeaderMessage>>,
 
     connection_id: AtomicU16,
-    connecting: dashmap::DashMap<Key, Connecting>,
+    connecting: DashMap<Key, Connecting>,
     local_addr: SocketAddr,
     opts: ValidatedSocketOpts,
 
@@ -152,7 +153,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let (accept_tx, accept_rx) = unbounded_channel();
 
         let sock = Arc::new(Self {
-            udp_socket: sock,
+            transport: sock,
             created: env.now(),
             connection_id: AtomicU16::new(env.random_u16()),
             accept_tx,
@@ -175,7 +176,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 
     async fn dispatcher(
         self: Arc<Self>,
-        mut accept_rx: UnboundedReceiver<tokio::sync::oneshot::Sender<UtpHeaderMessage>>,
+        mut accept_rx: UnboundedReceiver<oneshot::Sender<UtpHeaderMessage>>,
     ) -> anyhow::Result<()> {
         let packet_pool =
             { PacketPool::new(self.opts.packet_pool_max_packets, self.opts.max_packet_size) };
@@ -184,7 +185,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             let mut packet = packet_pool.get().await;
             let buf = packet.get_mut();
             let (size, from) = self
-                .udp_socket
+                .transport
                 .recv_from(buf)
                 .await
                 .context("error receiving")?;
@@ -247,7 +248,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 
     #[tracing::instrument(name="utp_socket:accept", skip(self), fields(local=?self.local_addr))]
     pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream<T, Env>> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         self.accept_tx.send(tx).context("error accepting")?;
 
         let (header, addr) = rx.await.context("bug")?;
@@ -301,7 +302,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 
         let syn_sent_ts = Instant::now();
 
-        self.udp_socket
+        self.transport
             .send_to(&buf, remote)
             .await
             .inspect_err(|e| {
@@ -351,7 +352,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         buf: &[u8],
         addr: SocketAddr,
     ) -> anyhow::Result<bool> {
-        match self.udp_socket.poll_send_to(cx, buf, addr) {
+        match self.transport.poll_send_to(cx, buf, addr) {
             Poll::Ready(Ok(sz)) => {
                 if sz != buf.len() {
                     warn!(
