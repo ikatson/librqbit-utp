@@ -977,6 +977,12 @@ impl AsyncWrite for UtpStreamWriteHalf {
             return Poll::Ready(Err(std::io::Error::other("socket died")));
         }
 
+        if g.closed {
+            return Poll::Ready(Err(std::io::Error::other(
+                "shutdown was initiated, can't write",
+            )));
+        }
+
         let count = g.buffer.enqueue_slice(buf);
         if count == 0 {
             assert!(g.buffer.is_full());
@@ -1501,7 +1507,7 @@ pub(crate) enum PollAt {
 
 #[cfg(test)]
 mod tests {
-    use std::{pin::Pin, sync::Arc, task::Poll, time::Duration};
+    use std::{future::poll_fn, pin::Pin, sync::Arc, task::Poll, time::Duration};
 
     use futures::FutureExt;
     use tokio::{
@@ -1948,6 +1954,9 @@ mod tests {
         // Initiate shutdown. It must complete immediately as all the data should have been flushed.
         stream.shutdown().await.unwrap();
 
+        // Ensure we get error on calling "write" again.
+        assert!(stream.write(b"test").await.is_err());
+
         t.poll_once_assert_pending().await;
         // Should send FIN after data is acknowledged
         let sent = t.take_sent();
@@ -1992,5 +2001,140 @@ mod tests {
             matches!(result, Poll::Ready(Ok(()))),
             "Connection should complete cleanly"
         );
+    }
+
+    #[tokio::test]
+    async fn test_fin_sent_when_writer_dropped() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        let (_reader, mut writer) = t.stream.take().unwrap().split();
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Write some data and initiate shutdown
+        writer.write_all(b"hello").await.unwrap();
+
+        // Ensure it's processed and sent.
+        t.poll_once_assert_pending().await;
+
+        // Should have sent the data
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
+        assert_eq!(sent[0].payload(), b"hello");
+        let data_seq_nr = sent[0].header.seq_nr;
+
+        // Acknowledge the data
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: data_seq_nr,
+                ..Default::default()
+            },
+            "",
+        );
+        // Deliver the ACK.
+        t.poll_once_assert_pending().await;
+
+        // Initiate FIN.
+        drop(writer);
+
+        t.poll_once_assert_pending().await;
+        // Should send FIN after data is acknowledged
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
+        let fin_seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            fin_seq_nr.0,
+            data_seq_nr.0 + 1,
+            "FIN should use next sequence number after data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_flush_works() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        let (_reader, writer) = t.stream.take().unwrap().split();
+        let mut writer = tokio::io::BufWriter::new(writer);
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Write some data and initiate shutdown
+        writer.write_all(b"hello").await.unwrap();
+
+        // Ensure nothing gets sent.
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 0);
+
+        // Ensure flush blocks at first
+        let flush_result = poll_fn(|cx| {
+            let res = Pin::new(&mut writer).poll_flush(cx);
+            Poll::Ready(res)
+        })
+        .await;
+        assert!(flush_result.is_pending());
+
+        // Now we send the data.
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
+        assert_eq!(sent[0].payload(), b"hello");
+        let data_seq_nr = sent[0].header.seq_nr;
+
+        // Ensure flush is still blocked until the data is ACKed.
+        let flush_result = poll_fn(|cx| {
+            let res = Pin::new(&mut writer).poll_flush(cx);
+            Poll::Ready(res)
+        })
+        .await;
+        assert!(flush_result.is_pending());
+
+        // Acknowledge the data
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: data_seq_nr,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Ensure flush completes at first
+        let flush_result = poll_fn(|cx| {
+            let res = Pin::new(&mut writer).poll_flush(cx);
+            Poll::Ready(res)
+        })
+        .await;
+        match flush_result {
+            Poll::Ready(result) => result.unwrap(),
+            Poll::Pending => panic!("flushed should have completed"),
+        };
     }
 }
