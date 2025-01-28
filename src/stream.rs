@@ -36,7 +36,7 @@ use crate::{
 
 // This contains more states than Rust could model with its enums, but I'm keeping
 // the names for 1:1 TCP mapping.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VirtualSocketState {
     Established,
 
@@ -72,6 +72,18 @@ impl VirtualSocketState {
             _ => return false,
         };
         true
+    }
+
+    // True if we are not sending any more data.
+    fn is_fin_or_later(&self) -> bool {
+        match self {
+            VirtualSocketState::Established | VirtualSocketState::CloseWait => false,
+            VirtualSocketState::Finished
+            | VirtualSocketState::FinWait1 { .. }
+            | VirtualSocketState::FinWait2
+            | VirtualSocketState::Closing { .. }
+            | VirtualSocketState::LastAck { .. } => true,
+        }
     }
 
     fn our_fin_if_unacked(&self) -> Option<SeqNr> {
@@ -909,6 +921,7 @@ pub struct UtpStreamWriteHalf {
 
 impl UtpStreamWriteHalf {
     fn close(&mut self) {
+        trace!("closing writer on drop to send FIN");
         let mut g = self.user_tx.locked.lock();
         g.closed = true;
         if let Some(w) = g.buffer_has_data.take() {
@@ -1473,6 +1486,12 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
                 return Poll::Ready(Ok(()));
             }
 
+            if this.user_rx_sender.is_closed() && this.state.is_fin_or_later() {
+                trace!("both halves are dead, no reason to continue");
+                this.just_before_death(None);
+                return Poll::Ready(Ok(()));
+            }
+
             match this.next_poll_send_to_at() {
                 PollAt::Now => {
                     trace!("need to repoll");
@@ -1519,6 +1538,7 @@ mod tests {
     use crate::{
         message::UtpMessage,
         raw::{Type, UtpHeader},
+        stream::VirtualSocketState,
         test_util::{
             env::MockUtpEnvironment, setup_test_logging, transport::RememberingTransport, ADDR_1,
             ADDR_2,
@@ -1607,7 +1627,7 @@ mod tests {
 
         let args = StreamArgs::new_incoming(100.into(), &remote_syn);
 
-        let (stream, mut vsock, _) = UtpStream::new_internal(&socket, ADDR_2, rx, args);
+        let (stream, vsock, _) = UtpStream::new_internal(&socket, ADDR_2, rx, args);
 
         TestVsock {
             transport,
@@ -2318,5 +2338,74 @@ mod tests {
         let sent = t.take_sent();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].payload(), b"e");
+    }
+
+    #[tokio::test]
+    async fn test_resource_cleanup() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        let (reader, mut writer) = t.stream.take().unwrap().split();
+
+        // Write some data
+        writer.write_all(b"hello").await.unwrap();
+        t.poll_once_assert_pending().await;
+
+        // Data should be sent
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
+        let seq_nr = sent[0].header.seq_nr;
+
+        // Drop the writer - this should trigger sending FIN.
+        drop(writer);
+        t.poll_once_assert_pending().await;
+
+        // Nothing should happen until it's ACKed.
+        assert_eq!(t.take_sent().len(), 0);
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Should see the FIN
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
+        let fin_nr = sent[0].header.seq_nr;
+
+        assert_eq!(
+            t.vsock.state,
+            VirtualSocketState::FinWait1 { our_fin: fin_nr }
+        );
+
+        // Drop the reader - this should cause the stream to complete without waiting for FIN ACK
+        drop(reader);
+
+        // Poll should complete immediately even though we never got ACKs
+        let result = t.poll_once().await;
+        assert!(
+            matches!(result, Poll::Ready(Ok(()))),
+            "Poll should complete after both halves are dropped"
+        );
     }
 }
