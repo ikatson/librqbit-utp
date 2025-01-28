@@ -1751,4 +1751,55 @@ mod tests {
         let sent = t.take_sent();
         assert_eq!(sent.len(), 0);
     }
+
+    #[tokio::test]
+    async fn test_basic_retransmission() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        // First allow sending by setting window size
+        t.vsock.last_remote_window = 1024;
+
+        // Write some data
+        t.stream.write_all(b"hello").await.unwrap();
+        t.poll_once_assert_pending().await;
+
+        // First transmission should happen
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
+        assert_eq!(sent[0].payload(), b"hello");
+        let original_seq_nr = sent[0].header.seq_nr;
+
+        // Wait for retransmission timeout
+        t.env.increment_now(Duration::from_secs(1));
+        t.poll_once_assert_pending().await;
+
+        // Should retransmit the same data
+        let resent = t.take_sent();
+        assert_eq!(resent.len(), 1, "Should have retransmitted");
+        assert_eq!(resent[0].header.get_type(), Type::ST_DATA);
+        assert_eq!(resent[0].payload(), b"hello");
+        assert_eq!(
+            resent[0].header.seq_nr, original_seq_nr,
+            "Retransmitted packet should have same sequence number"
+        );
+
+        // Until time goes on, nothing should happen.
+        t.poll_once_assert_pending().await;
+        let resent = t.take_sent();
+        assert_eq!(resent.len(), 0, "Should not have retransmitted");
+
+        // Wait again for 2nd retransmission.
+        t.env.increment_now(Duration::from_secs(1));
+        t.poll_once_assert_pending().await;
+        let resent = t.take_sent();
+        assert_eq!(resent.len(), 1, "Should have retransmitted");
+        assert_eq!(resent[0].header.get_type(), Type::ST_DATA);
+        assert_eq!(resent[0].payload(), b"hello");
+        assert_eq!(
+            resent[0].header.seq_nr, original_seq_nr,
+            "Retransmitted packet should have same sequence number"
+        );
+    }
 }
