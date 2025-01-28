@@ -40,7 +40,7 @@ impl Type {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UtpHeader {
     pub htype: Type,                            // 4 bits type and 4 bits version
-    pub connection_id: u16,                     // Connection ID
+    pub connection_id: SeqNr,                   // Connection ID
     pub timestamp_microseconds: u32,            // Timestamp in microseconds
     pub timestamp_difference_microseconds: u32, // Timestamp difference in microseconds
     pub wnd_size: u32,                          // Window size
@@ -103,7 +103,7 @@ impl UtpHeader {
         }
         header.htype = Type::from_number(typenum)?;
         let mut next_ext = buffer[1];
-        header.connection_id = u16::from_be_bytes(buffer[2..4].try_into().unwrap());
+        header.connection_id = u16::from_be_bytes(buffer[2..4].try_into().unwrap()).into();
         header.timestamp_microseconds = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
         header.timestamp_difference_microseconds =
             u32::from_be_bytes(buffer[8..12].try_into().unwrap());

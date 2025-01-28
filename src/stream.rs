@@ -144,7 +144,7 @@ enum UserRxMessage {
 }
 
 // An equivalent of a TCP socket for uTP.
-struct VirtualSocket<T, Env> {
+struct VirtualSocket<T: Transport, Env: UtpEnvironment> {
     state: VirtualSocketState,
     socket: Weak<UtpSocket<T, Env>>,
     socket_created: Instant,
@@ -153,7 +153,7 @@ struct VirtualSocket<T, Env> {
     remote: SocketAddr,
 
     assembler: AssembledRx,
-    conn_id_send: u16,
+    conn_id_send: SeqNr,
 
     // Triggers delay-based operations
     timers: Timers,
@@ -860,8 +860,8 @@ struct UserTx {
 struct UtpStreamDropGuard<T: Transport, Env: UtpEnvironment> {
     sock: Weak<UtpSocket<T, Env>>,
     remote: SocketAddr,
-    id1: u16,
-    id2: u16,
+    id1: SeqNr,
+    id2: SeqNr,
 }
 
 impl<T: Transport, Env: UtpEnvironment> Drop for UtpStreamDropGuard<T, Env> {
@@ -870,16 +870,12 @@ impl<T: Transport, Env: UtpEnvironment> Drop for UtpStreamDropGuard<T, Env> {
             let addr = self.remote;
             let id1 = self.id1;
             let id2 = self.id2;
-            tokio::spawn(async move {
-                tokio::time::sleep(GRACEFUL_TERMINATION_TIMEOUT).await;
-                sock.streams.remove(&(addr, id1));
-                sock.streams.remove(&(addr, id2));
-            });
+            todo!()
         }
     }
 }
 
-impl<T, E> Drop for VirtualSocket<T, E> {
+impl<T: Transport, E: UtpEnvironment> Drop for VirtualSocket<T, E> {
     fn drop(&mut self) {
         self.user_tx.locked.lock().mark_stream_dead();
     }
@@ -1057,8 +1053,8 @@ impl<T: Transport, Env: UtpEnvironment> AsyncWrite for UtpStream<T, Env> {
 
 // See field descriptions / meanings in struct VirtualSocket
 pub struct StreamArgs {
-    conn_id_recv: u16,
-    conn_id_send: u16,
+    conn_id_recv: SeqNr,
+    conn_id_send: SeqNr,
     last_remote_timestamp: u32,
 
     next_seq_nr: SeqNr,
@@ -1082,7 +1078,7 @@ impl StreamArgs {
         let conn_id = remote_ack.connection_id;
         Self {
             conn_id_recv: conn_id,
-            conn_id_send: conn_id.wrapping_add(1),
+            conn_id_send: conn_id + 1,
             last_remote_timestamp: remote_ack.timestamp_microseconds,
             remote_window: remote_ack.wnd_size,
 
@@ -1105,7 +1101,7 @@ impl StreamArgs {
 
     pub fn new_incoming(next_seq_nr: SeqNr, remote_syn: &UtpHeader) -> Self {
         Self {
-            conn_id_recv: remote_syn.connection_id.wrapping_add(1),
+            conn_id_recv: remote_syn.connection_id + 1,
             conn_id_send: remote_syn.connection_id,
             last_remote_timestamp: remote_syn.timestamp_microseconds,
             remote_window: 0, // remote_syn.wnd_size should be 0 anyway. We can't send anything first.
@@ -1135,7 +1131,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
         let (stream, vsock, first_packet) = Self::new_internal(socket, remote, rx, args);
 
         spawn_print_error(
-            error_span!("utp_stream", conn_id_send = vsock.conn_id_send),
+            error_span!("utp_stream", conn_id_send = ?vsock.conn_id_send),
             {
                 let socket = socket.clone();
                 async move {
@@ -1504,10 +1500,11 @@ mod tests {
 
     use crate::{
         raw::{Type, UtpHeader},
+        socket::Dispatcher,
         test_util::{
             env::MockUtpEnvironment,
             transport::{MockInterface, MockUtpTransport},
-            MockUtpStream, ADDR_1, ADDR_2,
+            MockDispatcher, MockUtpStream, ADDR_1, ADDR_2,
         },
         traits::UtpEnvironment,
     };
@@ -1516,6 +1513,7 @@ mod tests {
 
     #[allow(unused)]
     struct TestStream {
+        dispatcher: MockDispatcher,
         stream: MockUtpStream,
         vsock: VirtualSocket<MockUtpTransport, MockUtpEnvironment>,
         ack_to_send: Option<UtpHeader>,
@@ -1530,15 +1528,15 @@ mod tests {
 
     fn create_2_internal_vsockets() -> TestStreams {
         let interface = MockInterface::new();
-        let sock1 = interface.create_socket(ADDR_1);
-        let sock2 = interface.create_socket(ADDR_2);
+        let (sock1, mut sock1dispatch) = interface.create_socket_with_dispatcher(ADDR_1);
+        let (sock2, mut sock2dispatch) = interface.create_socket_with_dispatcher(ADDR_2);
 
         let env = interface.env.clone();
 
         let (tx1, rx1) = unbounded_channel();
         let (tx2, rx2) = unbounded_channel();
 
-        let connection_id = 0;
+        let connection_id = 0.into();
 
         let syn = UtpHeader {
             htype: Type::ST_SYN,
@@ -1563,21 +1561,31 @@ mod tests {
             panic!("did not expect first packet");
         };
 
-        sock1.streams.insert((ADDR_2, connection_id), tx1.clone());
-        sock1.streams.insert((ADDR_2, connection_id + 1), tx1);
+        sock1dispatch
+            .streams
+            .insert((ADDR_2, connection_id), tx1.clone());
+        sock1dispatch
+            .streams
+            .insert((ADDR_2, connection_id + 1), tx1);
 
-        sock2.streams.insert((ADDR_2, connection_id), tx2.clone());
-        sock2.streams.insert((ADDR_2, connection_id + 1), tx2);
+        sock2dispatch
+            .streams
+            .insert((ADDR_2, connection_id), tx2.clone());
+        sock2dispatch
+            .streams
+            .insert((ADDR_2, connection_id + 1), tx2);
 
         TestStreams {
             interface,
             s1: TestStream {
                 stream: stream1,
+                dispatcher: sock1dispatch,
                 vsock: vsock1,
                 ack_to_send: Some(ack),
             },
             s2: TestStream {
                 stream: stream2,
+                dispatcher: sock2dispatch,
                 vsock: vsock2,
                 ack_to_send: None,
             },

@@ -3,13 +3,14 @@ use std::net::{Ipv4Addr, SocketAddr};
 use env::MockUtpEnvironment;
 use transport::MockUtpTransport;
 
-use crate::{UtpSocket, UtpStream};
+use crate::{socket::Dispatcher, UtpSocket, UtpStream};
 
 pub mod env;
 pub mod transport;
 
 pub type MockUtpSocket = UtpSocket<MockUtpTransport, MockUtpEnvironment>;
 pub type MockUtpStream = UtpStream<MockUtpTransport, MockUtpEnvironment>;
+pub type MockDispatcher = Dispatcher<MockUtpTransport, MockUtpEnvironment>;
 
 pub fn setup_test_logging() {
     if std::env::var("RUST_LOG").is_err() {

@@ -4,9 +4,9 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::trace;
 
-use crate::{raw::UtpHeader, Transport};
+use crate::{raw::UtpHeader, socket::Dispatcher, Transport};
 
-use super::{env::MockUtpEnvironment, MockUtpSocket};
+use super::{env::MockUtpEnvironment, MockDispatcher, MockUtpSocket};
 
 type Msg = (SocketAddr, Vec<u8>);
 
@@ -23,17 +23,28 @@ impl MockInterface {
         })
     }
 
-    pub fn create_socket(self: &Arc<Self>, bind_addr: SocketAddr) -> Arc<MockUtpSocket> {
+    pub fn create_socket_with_dispatcher(
+        self: &Arc<Self>,
+        bind_addr: SocketAddr,
+    ) -> (Arc<MockUtpSocket>, MockDispatcher) {
         let (tx, rx) = unbounded_channel();
         let transport = MockUtpTransport::new(bind_addr, rx, self.clone());
         let env = self.env.clone();
 
-        let socket = MockUtpSocket::new_with_opts(transport, env, Default::default()).unwrap();
+        let socket =
+            MockUtpSocket::new_with_opts_and_dispatcher(transport, env, Default::default())
+                .unwrap();
 
         if self.sockets.insert(bind_addr, tx).is_some() {
             panic!("socket with {} already existed", bind_addr)
         }
         socket
+    }
+
+    pub fn create_socket(self: &Arc<Self>, bind_addr: SocketAddr) -> Arc<MockUtpSocket> {
+        let (sock, dispatcher) = self.create_socket_with_dispatcher(bind_addr);
+        tokio::spawn(dispatcher.run_forever());
+        sock
     }
 }
 

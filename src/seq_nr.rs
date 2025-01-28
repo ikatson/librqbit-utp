@@ -2,7 +2,7 @@ use std::{cmp::Ordering, ops::Deref};
 
 use crate::{constants::WRAP_TOLERANCE, utils::seq_nr_offset};
 
-#[derive(PartialEq, Eq, Clone, Copy, Default)]
+#[derive(PartialEq, Eq, Clone, Copy, Default, Hash)]
 pub struct SeqNr(pub u16);
 
 impl Deref for SeqNr {

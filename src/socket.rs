@@ -1,7 +1,8 @@
 use std::{
+    collections::{hash_map::Entry, HashMap},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU16, Ordering},
+        atomic::{AtomicU16, AtomicU64, Ordering},
         Arc,
     },
     task::Poll,
@@ -11,8 +12,9 @@ use std::{
 use crate::{
     constants::{DEFAULT_MTU, IPV4_HEADER, MIN_UDP_HEADER, UTP_HEADER_SIZE},
     message::UtpMessage,
-    packet_pool::PacketPool,
+    packet_pool::{Packet, PacketPool},
     raw::{Type, UtpHeader},
+    seq_nr::SeqNr,
     stream::StreamArgs,
     traits::{DefaultUtpEnvironment, Transport, UtpEnvironment},
     utils::spawn_print_error,
@@ -26,15 +28,11 @@ use tokio::sync::{
 };
 use tracing::{debug, error_span, trace, warn};
 
-type ConnectionId = u16;
+type ConnectionId = SeqNr;
 
 type Key = (SocketAddr, ConnectionId);
 
 type UtpHeaderMessage = (UtpHeader, SocketAddr);
-
-struct Connecting {
-    sender: oneshot::Sender<anyhow::Result<UtpHeaderMessage>>,
-}
 
 #[derive(Default)]
 pub struct SocketOpts {
@@ -110,23 +108,345 @@ pub(crate) struct ValidatedSocketOpts {
     pub nagle: bool,
 }
 
-pub struct UtpSocket<Transport, Env> {
-    // Todo private/public
-    pub(crate) transport: Transport,
-    pub(crate) created: Instant,
-    pub(crate) streams: DashMap<Key, UnboundedSender<UtpMessage>>,
-
-    accept_tx: UnboundedSender<oneshot::Sender<UtpHeaderMessage>>,
-
-    connection_id: AtomicU16,
-    connecting: DashMap<Key, Connecting>,
-    local_addr: SocketAddr,
-    opts: ValidatedSocketOpts,
-
-    pub(crate) env: Env,
+pub(crate) struct DropGuardSendBeforeDeath<Msg> {
+    pub msg: Option<Msg>,
+    pub tx: UnboundedSender<Msg>,
 }
 
-impl<Transport, Env> std::fmt::Debug for UtpSocket<Transport, Env> {
+impl<Msg> DropGuardSendBeforeDeath<Msg> {
+    fn new(msg: Msg, tx: UnboundedSender<Msg>) -> Self {
+        Self { msg: Some(msg), tx }
+    }
+    fn disarm(&mut self) {
+        self.msg = None;
+    }
+}
+
+impl<Msg> Drop for DropGuardSendBeforeDeath<Msg> {
+    fn drop(&mut self) {
+        if let Some(msg) = self.msg.take() {
+            let _ = self.tx.send(msg);
+        }
+    }
+}
+
+enum ControlRequest<T: Transport, E: UtpEnvironment> {
+    ConnectRequest(SocketAddr, ConnectToken, oneshot::Sender<UtpStream<T, E>>),
+    ConnectDropped(SocketAddr, ConnectToken),
+
+    Shutdown {
+        remote: SocketAddr,
+        conn_id_1: SeqNr,
+        conn_id_2: SeqNr,
+    },
+}
+
+static NEXT_CONNECT_TOKEN: AtomicU64 = AtomicU64::new(0);
+type ConnectToken = u64;
+
+struct Connecting<T: Transport, E: UtpEnvironment> {
+    token: ConnectToken,
+    seq_nr: SeqNr,
+    tx: oneshot::Sender<UtpStream<T, E>>,
+}
+
+const MAX_CONNECTING_PER_ADDR: usize = 4;
+
+#[derive(Default)]
+struct ConnectingPerAddr<T: Transport, E: UtpEnvironment> {
+    slots: [Option<Connecting<T, E>>; MAX_CONNECTING_PER_ADDR],
+    len: usize,
+}
+
+impl<T: Transport, E: UtpEnvironment> ConnectingPerAddr<T, E> {
+    fn new() -> Self {
+        Self {
+            // Default() would propagate through all generics so I can't just write
+            // [None; MAX_CONNECTING_PER_ADDR]
+            slots: [None, None, None, None],
+            len: 0,
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn insert(&mut self, c: Connecting<T, E>) -> bool {
+        for slot in self.slots.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(c);
+                self.len += 1;
+                return true;
+            }
+        }
+        false
+    }
+    fn pop(&mut self, s: SeqNr) -> Option<Connecting<T, E>> {
+        for slot in self.slots.iter_mut() {
+            if let Some(c) = slot {
+                if c.seq_nr == s {
+                    self.len -= 1;
+                    return slot.take();
+                }
+            }
+        }
+        None
+    }
+
+    fn pop_by_token(&mut self, token: ConnectToken) -> Option<Connecting<T, E>> {
+        for slot in self.slots.iter_mut() {
+            if let Some(c) = slot {
+                if c.token == token {
+                    self.len -= 1;
+                    return slot.take();
+                }
+            }
+        }
+        None
+    }
+}
+
+pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
+    packet_pool: Arc<PacketPool>,
+    env: E,
+    socket: Arc<UtpSocket<T, E>>,
+
+    next_accept: Option<oneshot::Sender<UtpStream<T, E>>>,
+    accept_rx: UnboundedReceiver<oneshot::Sender<UtpStream<T, E>>>,
+
+    pub(crate) streams: HashMap<Key, UnboundedSender<UtpMessage>>,
+    connecting: HashMap<SocketAddr, ConnectingPerAddr<T, E>>,
+    control_rx: UnboundedReceiver<ControlRequest<T, E>>,
+    next_connection_id: SeqNr,
+}
+
+async fn recv_from(
+    pool: &PacketPool,
+    transport: &impl Transport,
+) -> anyhow::Result<(SocketAddr, Packet, usize)> {
+    let mut packet = pool.get().await;
+    let buf = packet.get_mut();
+    let (size, addr) = transport.recv_from(buf).await.context("error receiving")?;
+    Ok((addr, packet, size))
+}
+
+impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
+    pub(crate) async fn run_forever(mut self) -> anyhow::Result<()> {
+        loop {
+            tokio::select! {
+                control_request = self.control_rx.recv() => {
+                    let control = control_request.unwrap();
+                    // If this blocks it should be short lived enough?;
+                    // TODO: do smth about this
+                    self.on_control(control).await?;
+                },
+                recv = recv_from(&self.packet_pool, &self.socket.transport) => {
+                    let (addr, packet, len) = recv.context("error receiving")?;
+                    self.on_recv(addr, packet, len)?;
+                }
+            }
+        }
+    }
+
+    fn get_next_free_conn_id(&mut self, addr: SocketAddr) -> SeqNr {
+        while self.streams.contains_key(&(addr, self.next_connection_id)) {
+            self.next_connection_id += 2;
+        }
+        self.next_connection_id
+    }
+
+    // This would only block if the socket is full. It will block the dispatcher but it's a resonable tradeoff.
+    async fn on_control(&mut self, msg: ControlRequest<T, E>) -> anyhow::Result<()> {
+        match msg {
+            ControlRequest::ConnectRequest(addr, token, sender) => {
+                let conn_id = self.get_next_free_conn_id(addr);
+                let header = UtpHeader {
+                    htype: Type::ST_SYN,
+                    connection_id: conn_id,
+                    timestamp_microseconds: (self.env.now() - self.socket.created).as_millis()
+                        as u32,
+                    timestamp_difference_microseconds: 0,
+                    wnd_size: 0,
+                    seq_nr: self.env.random_u16().into(),
+                    ack_nr: 0.into(),
+                };
+                let mut buf = [0u8; UTP_HEADER_SIZE];
+                header.serialize(&mut buf).unwrap();
+                self.socket
+                    .transport
+                    .send_to(&buf, addr)
+                    .await
+                    .context("can't send")?;
+                let c = Connecting {
+                    token,
+                    seq_nr: header.seq_nr,
+                    tx: sender,
+                };
+                if self
+                    .connecting
+                    .entry(addr)
+                    .or_insert_with(|| ConnectingPerAddr::new())
+                    .insert(c)
+                {
+                    self.next_connection_id += 2;
+                } else {
+                    warn!("too many concurrent connectins to {addr}");
+                }
+            }
+            ControlRequest::ConnectDropped(addr, token) => {
+                match self.connecting.entry(addr) {
+                    Entry::Occupied(mut occ) => {
+                        if occ.get_mut().pop_by_token(token).is_some() && occ.get().is_empty() {
+                            occ.remove();
+                        }
+                    }
+                    Entry::Vacant(_) => {}
+                };
+            }
+            ControlRequest::Shutdown {
+                remote,
+                conn_id_1,
+                conn_id_2,
+            } => {
+                self.streams.remove(&(remote, conn_id_1));
+                self.streams.remove(&(remote, conn_id_2));
+            }
+        }
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all, fields(addr, seq_nr=?msg.header.seq_nr, ack_nr=?msg.header.ack_nr))]
+    fn on_maybe_connect_ack(&mut self, addr: SocketAddr, msg: UtpMessage) -> anyhow::Result<()> {
+        let mut occ = match self.connecting.entry(addr) {
+            Entry::Occupied(occ) => occ,
+            Entry::Vacant(_) => {
+                debug!("dropping packet, noone is connecting, and no registered streams");
+                return Ok(());
+            }
+        };
+
+        let conn = if let Some(conn) = occ.get_mut().pop(msg.header.ack_nr) {
+            if occ.get_mut().is_empty() {
+                occ.remove();
+            }
+            conn
+        } else {
+            debug!("dropping packet. we are connecting to this addr, but ack_nr doens't match");
+            return Ok(());
+        };
+
+        let (tx, rx) = unbounded_channel();
+        let args = StreamArgs::new_incoming(conn.seq_nr, &msg.header);
+
+        let stream = UtpStream::new(&self.socket, addr, rx, args);
+        let key1 = (addr, conn.seq_nr);
+        let key2 = (addr, conn.seq_nr + 1);
+
+        if self.streams.contains_key(&key1) || self.streams.contains_key(&key2) {
+            warn!("clashing sequence numbers, dropping");
+            // TODO: send RST or FIN
+            return Ok(());
+        }
+
+        if conn.tx.send(stream).is_ok() {
+            self.streams.insert(key1, tx.clone());
+            self.streams.insert(key2, tx);
+        } else {
+            debug!("connecting receiver is dead. dropping");
+        }
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all, fields(addr, seq_nr=?msg.header.seq_nr))]
+    fn on_syn(&mut self, addr: SocketAddr, msg: UtpMessage) -> anyhow::Result<()> {
+        let key1 = (addr, msg.header.connection_id);
+        let key2 = (addr, msg.header.connection_id + 1);
+        if self.streams.contains_key(&key1) || self.streams.contains_key(&key2) {
+            trace!("invalid SYN, it clashes, dropping");
+            return Ok(());
+        }
+
+        // TODO: Fuck. This can cause a race. We need to queue a few accepts. Refactor.
+        let accept_token = match self.accept_rx.try_recv() {
+            Ok(t) => t,
+            Err(_) => {
+                warn!("nothing is accepting, dropping SYN");
+                return Ok(());
+            }
+        };
+
+        let args = StreamArgs::new_incoming(self.env.random_u16().into(), &msg.header);
+        let (tx, rx) = unbounded_channel();
+        let stream = UtpStream::new(&self.socket, addr, rx, args);
+
+        if accept_token.send(stream).is_ok() {
+            self.streams.insert(key1, tx.clone());
+            self.streams.insert(key2, tx);
+        } else {
+            // TODO: try next accept
+            warn!("next acceptor dead, dropping SYN");
+        }
+        Ok(())
+    }
+
+    fn on_recv(&mut self, addr: SocketAddr, packet: Packet, len: usize) -> anyhow::Result<()> {
+        trace!(?addr, len, "received a message");
+
+        let message = match UtpMessage::deserialize(packet, len) {
+            Some(msg) => msg,
+            None => {
+                debug!(
+                    len,
+                    ?addr,
+                    "error desserializing and validating UTP message"
+                );
+                return Ok(());
+            }
+        };
+
+        trace!(?addr, len, ?message, "received");
+
+        let key = (addr, message.header.connection_id);
+
+        if let Some(tx) = self.streams.get(&key) {
+            if let Err(_) = tx.send(message) {
+                debug!(?key, "stream dead");
+                self.streams.remove(&key);
+            }
+            return Ok(());
+        }
+
+        match message.header.get_type() {
+            Type::ST_STATE => {
+                self.on_maybe_connect_ack(addr, message)?;
+            }
+            Type::ST_SYN => {
+                self.on_syn(addr, message)?;
+            }
+            _ => {
+                trace!("dropping unknown packet");
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct UtpSocket<T: Transport, E: UtpEnvironment> {
+    // The underlying transport, usually UDP.
+    pub(crate) transport: T,
+    // When was the socket created. All the uTP "timestamp_microsends" are relative to it.
+    pub(crate) created: Instant,
+    pub(crate) control_requests: UnboundedSender<ControlRequest<T, E>>,
+    pub(crate) env: E,
+
+    accept_requests: UnboundedSender<oneshot::Sender<UtpStream<T, E>>>,
+
+    local_addr: SocketAddr,
+    opts: ValidatedSocketOpts,
+}
+
+impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UtpSocket")
             .field("addr", &self.local_addr)
@@ -146,126 +466,78 @@ impl UtpSocket<tokio::net::UdpSocket, DefaultUtpEnvironment> {
 
 impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     pub fn new_with_opts(transport: T, env: Env, opts: SocketOpts) -> anyhow::Result<Arc<Self>> {
+        let (sock, dispatcher) = Self::new_with_opts_and_dispatcher(transport, env, opts)?;
+        spawn_print_error(
+            error_span!("utp_socket", addr=?sock.transport.bind_addr()),
+            dispatcher.run_forever(),
+        );
+        Ok(sock)
+    }
+
+    pub(crate) fn new_with_opts_and_dispatcher(
+        transport: T,
+        env: Env,
+        opts: SocketOpts,
+    ) -> anyhow::Result<(Arc<Self>, Dispatcher<T, Env>)> {
         let opts = opts.validate().context("error validating socket options")?;
         let sock = transport;
         let local_addr = sock.bind_addr();
 
         let (accept_tx, accept_rx) = unbounded_channel();
+        let (control_tx, control_rx) = unbounded_channel();
 
         let sock = Arc::new(Self {
             transport: sock,
             created: env.now(),
-            connection_id: AtomicU16::new(env.random_u16()),
-            accept_tx,
-            streams: Default::default(),
-            connecting: Default::default(),
+            control_requests: control_tx,
             local_addr,
             opts,
-            env,
+            env: env.copy(),
+            accept_requests: accept_tx,
         });
-        spawn_print_error(
-            error_span!("utp_socket", addr=?local_addr),
-            sock.clone().dispatcher(accept_rx),
-        );
-        Ok(sock)
+
+        let dispatcher = Dispatcher {
+            packet_pool: PacketPool::new(opts.packet_pool_max_packets, opts.max_packet_size),
+            next_accept: None,
+            streams: Default::default(),
+            connecting: Default::default(),
+            next_connection_id: env.random_u16().into(),
+            control_rx,
+            socket: sock.clone(),
+            env,
+            accept_rx,
+        };
+
+        Ok((sock, dispatcher))
     }
 
     pub(crate) fn opts(&self) -> &ValidatedSocketOpts {
         &self.opts
     }
 
-    async fn dispatcher(
-        self: Arc<Self>,
-        mut accept_rx: UnboundedReceiver<oneshot::Sender<UtpHeaderMessage>>,
-    ) -> anyhow::Result<()> {
-        let packet_pool =
-            { PacketPool::new(self.opts.packet_pool_max_packets, self.opts.max_packet_size) };
-
-        'outer: loop {
-            let mut packet = packet_pool.get().await;
-            let buf = packet.get_mut();
-            let (size, from) = self
-                .transport
-                .recv_from(buf)
-                .await
-                .context("error receiving")?;
-
-            trace!(addr = ?from, size, "received a message");
-
-            let message = match UtpMessage::deserialize(packet, size) {
-                Some(msg) => msg,
-                None => {
-                    debug!(
-                        size,
-                        ?from,
-                        "error desserializing and validating UTP message"
-                    );
-                    continue;
-                }
-            };
-
-            trace!(addr = ?from, size, ?message, "received");
-
-            // If it's a SYN, consider someone connecting to us.
-            if let Type::ST_SYN = message.header.get_type() {
-                let msg = (message.header, from);
-                loop {
-                    match accept_rx.try_recv() {
-                        Ok(chan) => match chan.send(msg) {
-                            Ok(()) => continue 'outer,
-                            Err(_) => {
-                                warn!("acceptor dead, trying next one");
-                            }
-                        },
-                        Err(e) => {
-                            warn!("error accepting incoming uTP connection: {e:?}");
-                            continue 'outer;
-                        }
-                    }
-                }
-            }
-
-            let cid = message.header.connection_id;
-
-            // Try creaging a connecting stream first.
-            if let Type::ST_STATE = message.header.get_type() {
-                if let Some((_, conn)) = self.connecting.remove(&(from, cid)) {
-                    let _ = conn.sender.send(Ok((message.header, from)));
-                    continue;
-                }
-            }
-
-            // Dispatch the message to an existing stream.
-            if let Some(s) = self.streams.get(&(from, cid)) {
-                if s.send(message).is_err() {
-                    if let Some((k, _)) = self.streams.remove(&(from, cid)) {
-                        debug!(key=?k, "stream dead");
-                    }
-                }
-            }
-        }
-    }
-
     #[tracing::instrument(name="utp_socket:accept", skip(self), fields(local=?self.local_addr))]
     pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream<T, Env>> {
         let (tx, rx) = oneshot::channel();
-        self.accept_tx.send(tx).context("error accepting")?;
+        self.accept_requests.send(tx).context("dispatcher dead")?;
 
-        let (header, addr) = rx.await.context("bug")?;
-
-        let (tx, rx) = unbounded_channel();
-
-        trace!(?addr, "accepted uTP connection");
-
-        let conn_id_recv = header.connection_id.wrapping_add(1);
-        let conn_id_send = header.connection_id;
-
-        let stream_args = StreamArgs::new_incoming(self.env.random_u16().into(), &header);
-        let stream = UtpStream::new(self, addr, rx, stream_args);
-
-        self.streams.insert((addr, conn_id_recv), tx.clone());
-        self.streams.insert((addr, conn_id_send), tx);
+        let stream = rx.await.context("dispatcher dead")?;
         Ok(stream)
+
+        // let (header, addr) = rx.await.context("bug")?;
+
+        // let (tx, rx) = unbounded_channel();
+
+        // trace!(?addr, "accepted uTP connection");
+
+        // let conn_id_recv = header.connection_id.wrapping_add(1);
+        // let conn_id_send = header.connection_id;
+
+        // let stream_args = StreamArgs::new_incoming(self.env.random_u16().into(), &header);
+        // let stream = UtpStream::new(self, addr, rx, stream_args);
+
+        // self.streams.insert((addr, conn_id_recv), tx.clone());
+        // self.streams.insert((addr, conn_id_send), tx);
+        // Ok(stream)
     }
 
     #[tracing::instrument(name="utp_socket:connect", skip(self), fields(local=?self.local_addr))]
@@ -273,74 +545,19 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         self: &Arc<Self>,
         remote: SocketAddr,
     ) -> anyhow::Result<UtpStream<T, Env>> {
-        // create a "connecting" future. On received message, resolve the oneshot.
-
-        // One for send one for recv.
-        let connection_id = self.connection_id.fetch_add(2, Ordering::Relaxed);
-
-        let mut buf = [0u8; UTP_HEADER_SIZE];
-        let seq_nr = self.env.random_u16().into();
-        let mut header = UtpHeader {
-            connection_id,
-            timestamp_microseconds: (self.env.now() - self.created).as_micros() as u32,
-            seq_nr,
-            ..Default::default()
-        };
-
-        header.set_type(Type::ST_SYN);
-
-        header
-            .serialize(&mut buf)
-            .context("bug: error serializing SYN")?;
-
         let (tx, rx) = oneshot::channel();
+        let token = NEXT_CONNECT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        self.control_requests
+            .send(ControlRequest::ConnectRequest(remote, token, tx))
+            .context("dispatcher dead")?;
 
-        self.connecting
-            .insert((remote, connection_id), Connecting { sender: tx });
+        let mut guard = DropGuardSendBeforeDeath::new(
+            ControlRequest::ConnectDropped(remote, token),
+            self.control_requests.clone(),
+        );
 
-        trace!(remote = ?remote, sock=?self.local_addr, connection_id = connection_id, "sending SYN");
-
-        let syn_sent_ts = Instant::now();
-
-        self.transport
-            .send_to(&buf, remote)
-            .await
-            .inspect_err(|e| {
-                debug!("error sending: {e:?}");
-                self.connecting.remove(&(remote, connection_id));
-            })
-            .context("error sending")?;
-
-        let (ack_header, from) = match tokio::time::timeout(Duration::from_secs(10), rx).await {
-            Ok(Ok(Ok(reply))) => reply,
-            Ok(Ok(Err(e))) => return Err(e).context("error processing STATE"),
-            Ok(Err(_)) => bail!("bug: oneshow rx recv error"),
-            Err(_) => {
-                self.connecting.remove(&(remote, connection_id));
-                bail!("timeout connecting")
-            }
-        };
-
-        let ack_received_ts = Instant::now();
-
-        if ack_header.ack_nr != seq_nr {
-            bail!("wrong ack")
-        }
-
-        if ack_header.connection_id != connection_id {
-            bail!("bug: wrong connection id")
-        }
-
-        trace!(?from, remote_window = ack_header.wnd_size, "connected");
-
-        let (tx, rx) = unbounded_channel();
-
-        let stream_args = StreamArgs::new_outgoing(&ack_header, syn_sent_ts, ack_received_ts);
-        let stream = UtpStream::new(self, remote, rx, stream_args);
-
-        self.streams.insert((remote, connection_id), tx.clone());
-        self.streams
-            .insert((remote, connection_id.wrapping_add(1)), tx);
+        let stream = rx.await.context("dispatcher dead")?;
+        guard.disarm();
 
         Ok(stream)
     }
