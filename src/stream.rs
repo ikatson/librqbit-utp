@@ -631,13 +631,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         socket: &UtpSocket<T, Env>,
         msg: UtpMessage,
     ) -> anyhow::Result<()> {
-        trace!("on_message");
+        trace!(state=?self.state, "on_message");
 
         self.state.on_incoming_packet(
             matches!(msg.header.get_type(), Type::ST_FIN),
             msg.header.ack_nr,
         );
         if self.state.is_done() {
+            trace!(?self.state);
             return Ok(());
         }
 
@@ -1504,7 +1505,7 @@ mod tests {
 
     use futures::FutureExt;
     use tokio::{
-        io::{AsyncRead, AsyncWriteExt},
+        io::{AsyncRead, AsyncWrite, AsyncWriteExt},
         sync::mpsc::{unbounded_channel, UnboundedSender},
     };
     use tracing::trace;
@@ -1530,7 +1531,7 @@ mod tests {
         env: MockUtpEnvironment,
         _socket: Arc<UtpSocket<RememberingTransport, MockUtpEnvironment>>,
         vsock: VirtualSocket<RememberingTransport, MockUtpEnvironment>,
-        stream: UtpStream,
+        stream: Option<UtpStream>,
         tx: UnboundedSender<UtpMessage>,
     }
 
@@ -1547,7 +1548,7 @@ mod tests {
             std::future::poll_fn(|cx| {
                 let mut buf = vec![0u8; 1024];
                 let mut rb = tokio::io::ReadBuf::new(&mut buf);
-                let mut s = Pin::new(&mut self.stream);
+                let mut s = Pin::new(self.stream.as_mut().unwrap());
 
                 loop {
                     match s.as_mut().poll_read(cx, &mut rb) {
@@ -1606,7 +1607,7 @@ mod tests {
             env,
             _socket: socket,
             vsock,
-            stream,
+            stream: Some(stream),
             tx,
         }
     }
@@ -1657,7 +1658,12 @@ mod tests {
 
         assert_eq!(t.vsock.last_remote_window, 0);
 
-        t.stream.write_all(b"hello").await.unwrap();
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(b"hello")
+            .await
+            .unwrap();
         t.poll_once_assert_pending().await;
         assert_eq!(t.take_sent().len(), 0);
 
@@ -1687,7 +1693,12 @@ mod tests {
 
         assert_eq!(t.vsock.last_remote_window, 0);
 
-        t.stream.write_all(b"hello").await.unwrap();
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(b"hello")
+            .await
+            .unwrap();
         t.poll_once_assert_pending().await;
         assert_eq!(t.take_sent().len(), 0);
 
@@ -1722,7 +1733,12 @@ mod tests {
 
         assert_eq!(t.vsock.last_remote_window, 0);
 
-        t.stream.write_all(b"hello world").await.unwrap();
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(b"hello world")
+            .await
+            .unwrap();
         t.poll_once_assert_pending().await;
         assert_eq!(t.take_sent().len(), 0);
 
@@ -1763,7 +1779,12 @@ mod tests {
         t.vsock.last_remote_window = 1024;
 
         // Write some data
-        t.stream.write_all(b"hello").await.unwrap();
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(b"hello")
+            .await
+            .unwrap();
         t.poll_once_assert_pending().await;
 
         // First transmission should happen
@@ -1826,7 +1847,12 @@ mod tests {
         t.send_msg(ack, "");
 
         // Write enough data to generate multiple packets
-        t.stream.write_all(b"helloworld").await.unwrap();
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(b"helloworld")
+            .await
+            .unwrap();
         t.poll_once_assert_pending().await;
 
         // Should have sent the data
@@ -1871,6 +1897,99 @@ mod tests {
             resent[0].payload(),
             b"world",
             "Should have retransmitted correct data"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fin_shutdown_sequence() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        let mut stream = t.stream.take().unwrap();
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Write some data and initiate shutdown
+        stream.write_all(b"hello").await.unwrap();
+
+        // Ensure it's processed and sent.
+        t.poll_once_assert_pending().await;
+
+        // Should have sent the data
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
+        assert_eq!(sent[0].payload(), b"hello");
+        let data_seq_nr = sent[0].header.seq_nr;
+
+        // Acknowledge the data
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: data_seq_nr,
+                ..Default::default()
+            },
+            "",
+        );
+        // Deliver the ACK.
+        t.poll_once_assert_pending().await;
+
+        // Initiate shutdown. It must complete immediately as all the data should have been flushed.
+        stream.shutdown().await.unwrap();
+
+        t.poll_once_assert_pending().await;
+        // Should send FIN after data is acknowledged
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
+        let fin_seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            fin_seq_nr.0,
+            data_seq_nr.0 + 1,
+            "FIN should use next sequence number after data"
+        );
+
+        // Remote acknowledges our FIN
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: fin_seq_nr,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Remote sends its FIN
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_FIN,
+                seq_nr: 1.into(),
+                ack_nr: fin_seq_nr,
+                ..Default::default()
+            },
+            "",
+        );
+        let result = t.poll_once().await;
+        // We should acknowledge remote's FIN
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_STATE);
+        assert_eq!(sent[0].header.ack_nr.0, 1);
+        assert!(
+            matches!(result, Poll::Ready(Ok(()))),
+            "Connection should complete cleanly"
         );
     }
 }
