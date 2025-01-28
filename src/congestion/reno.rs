@@ -68,3 +68,70 @@ impl Controller for Reno {
         }
     }
 }
+
+#[cfg(test)]
+mod test {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn test_reno() {
+        let remote_window = 64 * 1024;
+        let now = Instant::now();
+
+        for i in 0..10 {
+            for j in 0..9 {
+                let mut reno = Reno::new();
+                reno.set_mss(1480);
+
+                // Set remote window.
+                reno.set_remote_window(remote_window);
+
+                reno.on_ack(now, 4096, &RttEstimator::default());
+
+                let mut n = i;
+                for _ in 0..j {
+                    n *= i;
+                }
+
+                if i & 1 == 0 {
+                    reno.on_retransmit(now);
+                } else {
+                    reno.on_duplicate_ack(now);
+                }
+
+                let elapsed = now + Duration::from_millis(1000);
+                reno.on_ack(elapsed, n, &RttEstimator::default());
+
+                let cwnd = reno.window();
+                println!("Reno: elapsed = {elapsed:?}, cwnd = {cwnd}");
+
+                assert!(cwnd >= reno.min_cwnd);
+                assert!(reno.window() <= remote_window);
+            }
+        }
+    }
+
+    #[test]
+    fn reno_min_cwnd() {
+        let remote_window = 64 * 1024;
+        let now = Instant::now();
+
+        let mut reno = Reno::new();
+        reno.set_remote_window(remote_window);
+
+        for _ in 0..100 {
+            reno.on_retransmit(now);
+            assert!(reno.window() >= reno.min_cwnd);
+        }
+    }
+
+    #[test]
+    fn reno_set_rwnd() {
+        let mut reno = Reno::new();
+        reno.set_remote_window(64 * 1024 * 1024);
+
+        println!("{reno:?}");
+    }
+}
