@@ -2,7 +2,7 @@ use std::{collections::HashMap, future::poll_fn, net::SocketAddr, sync::Arc, tas
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tracing::trace;
+use tracing::{error_span, trace, Instrument};
 
 use crate::{raw::UtpHeader, Transport};
 
@@ -43,7 +43,11 @@ impl MockInterface {
 
     pub fn create_socket(self: &Arc<Self>, bind_addr: SocketAddr) -> Arc<MockUtpSocket> {
         let (sock, dispatcher) = self.create_socket_with_dispatcher(bind_addr);
-        tokio::spawn(dispatcher.run_forever());
+        tokio::spawn(
+            dispatcher
+                .run_forever()
+                .instrument(error_span!("sock", ?bind_addr)),
+        );
         sock
     }
 }

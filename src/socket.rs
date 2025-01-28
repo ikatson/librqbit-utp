@@ -275,27 +275,33 @@ async fn recv_from(
 impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     pub(crate) async fn run_forever(mut self) -> anyhow::Result<()> {
         loop {
-            // This should get us into a state where either there's no SYNs or no accepts available.
-            self.cleanup_accept_queue()?;
+            self.run_once().await?;
+        }
+    }
 
-            tokio::select! {
-                accept = self.accept_queue.rx.recv(), if !self.accept_queue.syn_queue_empty() => {
-                    let accept = accept.unwrap();
-                    assert!(self.accept_queue.next_available_acceptor.is_none());
-                    self.accept_queue.next_available_acceptor = Some(accept);
-                }
-                control_request = self.control_rx.recv() => {
-                    let control = control_request.unwrap();
-                    // If this blocks it should be short lived enough?;
-                    // TODO: do smth about this
-                    self.on_control(control).await?;
-                },
-                recv = recv_from(&self.packet_pool, &self.socket.transport) => {
-                    let (addr, packet, len) = recv.context("error receiving")?;
-                    self.on_recv(addr, packet, len)?;
-                }
+    async fn run_once(&mut self) -> anyhow::Result<()> {
+        // This should get us into a state where either there's no SYNs or no accepts available.
+        self.cleanup_accept_queue()?;
+
+        tokio::select! {
+            accept = self.accept_queue.rx.recv(), if !self.accept_queue.syn_queue_empty() => {
+                let accept = accept.unwrap();
+                assert!(self.accept_queue.next_available_acceptor.is_none());
+                self.accept_queue.next_available_acceptor = Some(accept);
+            }
+            control_request = self.control_rx.recv() => {
+                let control = control_request.unwrap();
+                // If this blocks it should be short lived enough?;
+                // TODO: do smth about this
+                self.on_control(control).await?;
+            },
+            recv = recv_from(&self.packet_pool, &self.socket.transport) => {
+                let (addr, packet, len) = recv.context("error receiving")?;
+                self.on_recv(addr, packet, len)?;
             }
         }
+
+        Ok(())
     }
 
     // Get into a state where we can't match acceptors with cached SYNs anymore.
@@ -410,8 +416,8 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             .with_parent_span(conn.requester.created_span.clone());
 
         let stream = UtpStream::new(&self.socket, addr, rx, args);
-        let key1 = (addr, conn.seq_nr);
-        let key2 = (addr, conn.seq_nr + 1);
+        let key1 = (addr, msg.header.connection_id);
+        let key2 = (addr, msg.header.connection_id + 1);
 
         if self.streams.contains_key(&key1) || self.streams.contains_key(&key2) {
             warn!("clashing sequence numbers, dropping");
@@ -517,6 +523,12 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             return Ok(());
         }
 
+        trace!(
+            exist = ?self.streams.keys().collect::<Vec<_>>(),
+            ?key,
+            "no matching live streams"
+        );
+
         match message.header.get_type() {
             Type::ST_STATE => {
                 self.on_maybe_connect_ack(addr, message)?;
@@ -525,7 +537,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 self.on_syn(addr, message)?;
             }
             _ => {
-                trace!("dropping unknown packet");
+                debug!("dropping packet");
             }
         }
         Ok(())
@@ -684,7 +696,10 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        time::Duration,
+    };
 
     use anyhow::{bail, Context};
     use tokio::{
@@ -737,6 +752,10 @@ mod tests {
         .instrument(error_span!("accept"));
 
         try_join!(connect, accept)?;
+
+        // See logs to see if it was cleaned up.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
         Ok(())
     }
 }
