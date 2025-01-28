@@ -13,7 +13,6 @@ smoltcp = { version = "0.12.0", default-features = false, features = [
 ] }
 tokio = { version = "1", features = ["net", "sync", "time", "io-util", "rt"] }
 anyhow = "1.0.95"
-dashmap = "6.1.0"
 rand = "0.8.5"
 tracing = "0.1.41"
 parking_lot = "0.12.3"

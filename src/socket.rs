@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, BinaryHeap, HashMap, VecDeque},
+    collections::{hash_map::Entry, HashMap, VecDeque},
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -108,7 +108,6 @@ pub(crate) struct ValidatedSocketOpts {
 pub type StreamRequester = oneshot::Sender<UtpStream>;
 
 pub(crate) enum ControlRequest {
-    AcceptRequest(StreamRequester),
     ConnectRequest(SocketAddr, ConnectToken, StreamRequester),
     ConnectDropped(SocketAddr, ConnectToken),
 
@@ -117,6 +116,26 @@ pub(crate) enum ControlRequest {
         conn_id_1: SeqNr,
         conn_id_2: SeqNr,
     },
+}
+
+impl std::fmt::Debug for ControlRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ControlRequest::ConnectRequest(socket_addr, token, _) => {
+                write!(f, "ConnectRequest({socket_addr}, {token})")
+            }
+            ControlRequest::ConnectDropped(socket_addr, token) => {
+                write!(f, "ConnectDropped({socket_addr}, {token})")
+            }
+            ControlRequest::Shutdown {
+                remote,
+                conn_id_1,
+                conn_id_2,
+            } => {
+                write!(f, "Shutdown({remote}, {conn_id_1}, {conn_id_2})")
+            }
+        }
+    }
 }
 
 static NEXT_CONNECT_TOKEN: AtomicU64 = AtomicU64::new(0);
@@ -183,7 +202,6 @@ const ACCEPT_QUEUE_MAX_SYNS: usize = 32;
 struct Syn {
     remote: SocketAddr,
     header: UtpHeader,
-    received: Instant,
 }
 
 enum MatchSynWithAccept {
@@ -211,7 +229,7 @@ impl AcceptQueue {
     }
 
     fn try_cache_syn(&mut self, syn: Syn) -> bool {
-        if self.syns.len() < ACCEPT_QUEUE_MAX_ACCEPTORS {
+        if self.syns.len() < ACCEPT_QUEUE_MAX_SYNS {
             self.syns.push_back(syn);
             return true;
         }
@@ -298,6 +316,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     // This would only block if the socket is full. It will block the dispatcher but it's a resonable tradeoff.
+    #[tracing::instrument(skip(self))]
     async fn on_control(&mut self, msg: ControlRequest) -> anyhow::Result<()> {
         match msg {
             ControlRequest::ConnectRequest(addr, token, sender) => {
@@ -325,12 +344,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     tx: sender,
                     start: self.env.now(),
                 };
-                if self
-                    .connecting
-                    .entry(addr)
-                    .or_insert_with(Default::default)
-                    .insert(c)
-                {
+                if self.connecting.entry(addr).or_default().insert(c) {
                     self.next_connection_id += 2;
                 } else {
                     warn!("too many concurrent connectins to {addr}");
@@ -353,9 +367,6 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             } => {
                 self.streams.remove(&(remote, conn_id_1));
                 self.streams.remove(&(remote, conn_id_2));
-            }
-            ControlRequest::AcceptRequest(sender) => {
-                // if self.accept_queue.acceptors
             }
         }
         Ok(())
@@ -431,7 +442,6 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let mut syn = Syn {
             remote,
             header: msg.header,
-            received: Instant::now(),
         };
         while let Some(acceptor) = self.accept_queue.try_next_acceptor() {
             match self.match_syn_with_accept(syn, acceptor) {
@@ -474,7 +484,12 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
         if let Some(tx) = self.streams.get(&key) {
             if tx.send(message).is_err() {
-                debug!(?key, "stream dead");
+                warn!(
+                    ?key,
+                    "stream dead. this branch should be rare and is probably a bug"
+                );
+                // TODO: we should clean up the other one too? it should have been deleted by
+                // the UtpStream drop guards, maybe it will.
                 self.streams.remove(&key);
             }
             return Ok(());

@@ -1,17 +1,17 @@
-use std::{future::poll_fn, net::SocketAddr, sync::Arc, task::Poll};
+use std::{collections::HashMap, future::poll_fn, net::SocketAddr, sync::Arc, task::Poll};
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::trace;
 
-use crate::{raw::UtpHeader, socket::Dispatcher, Transport};
+use crate::{raw::UtpHeader, Transport};
 
 use super::{env::MockUtpEnvironment, MockDispatcher, MockUtpSocket};
 
 type Msg = (SocketAddr, Vec<u8>);
 
 pub struct MockInterface {
-    sockets: dashmap::DashMap<SocketAddr, UnboundedSender<Msg>>,
+    sockets: Mutex<HashMap<SocketAddr, UnboundedSender<Msg>>>,
     pub env: MockUtpEnvironment,
 }
 
@@ -35,7 +35,7 @@ impl MockInterface {
             MockUtpSocket::new_with_opts_and_dispatcher(transport, env, Default::default())
                 .unwrap();
 
-        if self.sockets.insert(bind_addr, tx).is_some() {
+        if self.sockets.lock().insert(bind_addr, tx).is_some() {
             panic!("socket with {} already existed", bind_addr)
         }
         socket
@@ -85,7 +85,7 @@ impl MockUtpTransport {
         trace!(?header, payload_size = buf.len() - len, "sending");
         let len = buf.len();
 
-        match self.inner.interface.sockets.get(&target) {
+        match self.inner.interface.sockets.lock().get(&target) {
             Some(tx) => match tx.send((self.bind_addr, buf.to_owned())) {
                 Ok(_) => {}
                 Err(_) => return Err(std::io::Error::other(format!("target {target} is dead"))),

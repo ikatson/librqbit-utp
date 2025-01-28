@@ -21,17 +21,14 @@ use tracing::{debug, error_span, trace, warn};
 use crate::{
     assembled_rx::AssembledRx,
     congestion::{reno::Reno, Controller},
-    constants::{
-        ACK_DELAY, CHALLENGE_ACK_RATELIMIT, GRACEFUL_TERMINATION_TIMEOUT, IMMEDIATE_ACK_EVERY,
-        UTP_HEADER_SIZE,
-    },
+    constants::{ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, UTP_HEADER_SIZE},
     message::UtpMessage,
     raw::{Type, UtpHeader},
     rtte::RttEstimator,
     seq_nr::SeqNr,
     socket::{ControlRequest, ValidatedSocketOpts},
     stream_tx::Tx,
-    traits::{DefaultUtpEnvironment, Transport, UtpEnvironment},
+    traits::{Transport, UtpEnvironment},
     utils::{
         fill_buffer_from_rb, spawn_print_error, update_optional_waker, DropGuardSendBeforeDeath,
     },
