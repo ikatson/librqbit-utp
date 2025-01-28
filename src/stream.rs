@@ -562,6 +562,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             self.tx.enqueue(header, payload_size);
             remaining -= payload_size;
+            remote_window_remaining -= payload_size as u32;
             trace!(bytes = payload_size, "enqueued");
             self.next_seq_nr += 1;
         }
@@ -1678,7 +1679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sends_up_to_remote_window_only() {
+    async fn test_sends_up_to_remote_window_only_single_msg() {
         setup_test_logging();
         let mut t = make_test_vsock();
 
@@ -1705,5 +1706,49 @@ mod tests {
         assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
         assert_eq!(sent[0].header.ack_nr.0, 0);
         assert_eq!(sent[0].payload(), b"hell");
+
+        // Until window updates and/or we receive an ACK, we don't send anything
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sends_up_to_remote_window_only_multi_msg() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+        t.vsock.socket_opts.max_payload_size = 2;
+
+        assert_eq!(t.vsock.last_remote_window, 0);
+
+        t.stream.write_all(b"hello world").await.unwrap();
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 0);
+
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                // This is enough to send "hello" in 3 messages
+                wnd_size: 5,
+                ..Default::default()
+            },
+            "hello",
+        );
+        t.poll_once_assert_pending().await;
+
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 3, "{sent:#?}");
+        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
+        assert_eq!(sent[0].payload(), b"he");
+        assert_eq!(sent[1].header.get_type(), Type::ST_DATA);
+        assert_eq!(sent[1].payload(), b"ll");
+        assert_eq!(sent[2].header.get_type(), Type::ST_DATA);
+        assert_eq!(sent[2].payload(), b"o");
+
+        t.poll_once_assert_pending().await;
+
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 0);
     }
 }
