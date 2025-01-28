@@ -1487,7 +1487,7 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
             }
 
             if this.user_rx_sender.is_closed() && this.state.is_fin_or_later() {
-                trace!("both halves are dead, no reason to continue");
+                trace!(current_state=?this.state, "both halves are dead, no reason to continue");
                 this.just_before_death(None);
                 return Poll::Ready(Ok(()));
             }
@@ -2341,7 +2341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resource_cleanup() {
+    async fn test_resource_cleanup_both_sides_dropped_normally() {
         setup_test_logging();
         let mut t = make_test_vsock();
 
@@ -2407,5 +2407,88 @@ mod tests {
             matches!(result, Poll::Ready(Ok(()))),
             "Poll should complete after both halves are dropped"
         );
+    }
+
+    #[tokio::test]
+    async fn test_resource_cleanup_both_sides_dropped_abruptly() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        drop(t.stream.take());
+        let result = t.poll_once().await;
+        assert!(
+            matches!(result, Poll::Ready(Ok(()))),
+            "Poll should complete after both halves are dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resource_cleanup_with_pending_data() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        let (reader, mut writer) = t.stream.take().unwrap().split();
+
+        // Write data but don't wait for it to be sent
+        writer.write_all(b"hello").await.unwrap();
+
+        // Drop both handles immediately
+        drop(writer);
+        drop(reader);
+
+        // First poll should send the pending data
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload(), b"hello");
+        let data_seq_nr = sent[0].header.seq_nr;
+
+        // Nothing else whould be sent before ACK.
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 0);
+
+        // Send ACK
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Next poll should send FIN and die.
+        let result = t.poll_once().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
+        assert_eq!(sent[0].header.seq_nr.0, data_seq_nr.0 + 1);
+        assert!(matches!(result, Poll::Ready(Ok(()))));
     }
 }
