@@ -551,7 +551,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 let data_in_flight = !self.tx.is_empty();
 
                 if self.socket_opts.nagle && !can_send_full_payload && data_in_flight {
-                    trace!("nagle: buffering more data");
+                    trace!(payload_size, max_payload_size, "nagle: buffering more data");
                     break;
                 }
             }
@@ -2224,5 +2224,98 @@ mod tests {
         assert_eq!(acks.len(), 1);
         assert_eq!(acks[0].header.get_type(), Type::ST_STATE);
         assert_eq!(acks[0].header.ack_nr.0, 3); // Should acknowledge up to last packet
+    }
+
+    #[tokio::test]
+    async fn test_nagle_algorithm() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        // Enable Nagle (should be on by default, but let's be explicit)
+        t.vsock.socket_opts.nagle = true;
+        // Set a large max payload size to ensure we're testing Nagle, not fragmentation
+        t.vsock.socket_opts.max_payload_size = 1024;
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Write a small amount of data
+        t.stream.as_mut().unwrap().write_all(b"a").await.unwrap();
+        t.poll_once_assert_pending().await;
+
+        // First small write should be sent immediately
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload(), b"a");
+        let first_seq_nr = sent[0].header.seq_nr;
+
+        // Write another small chunk - should not be sent while first is unacked
+        t.stream.as_mut().unwrap().write_all(b"b").await.unwrap();
+        t.poll_once_assert_pending().await;
+        assert_eq!(
+            t.take_sent().len(),
+            0,
+            "Nagle should prevent sending small chunk while data is in flight"
+        );
+
+        // Write more data - still should not send
+        t.stream.as_mut().unwrap().write_all(b"c").await.unwrap();
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 0);
+
+        // As debugging, ensure we did not even fragment the new packets yet.
+        assert_eq!(t.vsock.tx.total_len_packets(), 1);
+        assert_eq!(t.vsock.tx.total_len_bytes(), 1);
+        assert_eq!(t.vsock.tx.first_seq_nr().unwrap(), first_seq_nr);
+
+        trace!("Acknowledge first packet");
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: first_seq_nr,
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+
+        assert_eq!(t.vsock.tx.total_len_packets(), 1);
+        assert_eq!(t.vsock.tx.total_len_bytes(), 2);
+
+        // After ACK, buffered data should be sent as one packet
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "Buffered data should be sent as one packet");
+        assert_eq!(
+            sent[0].payload(),
+            b"bc",
+            "Buffered data should be coalesced"
+        );
+
+        // Now disable Nagle
+        t.vsock.socket_opts.nagle = false;
+
+        // Small writes should be sent immediately
+        t.stream.as_mut().unwrap().write_all(b"d").await.unwrap();
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload(), b"d");
+
+        // Next small write should also go immediately, even without ACK
+        t.stream.as_mut().unwrap().write_all(b"e").await.unwrap();
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload(), b"e");
     }
 }

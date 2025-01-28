@@ -42,6 +42,11 @@ impl Tx {
         Some(self.headers.get_allocated(0, 1)[0].0.seq_nr)
     }
 
+    #[cfg(test)]
+    pub fn total_len_packets(&self) -> usize {
+        self.headers.len()
+    }
+
     pub fn total_len_bytes(&self) -> usize {
         self.iter().map(|i| i.payload_size()).sum()
     }
