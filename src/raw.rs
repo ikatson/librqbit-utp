@@ -1,7 +1,11 @@
+pub mod ext_close_reason;
+
 use anyhow::{bail, Context};
 use tracing::{debug, trace};
 
 use crate::{constants::UTP_HEADER_SIZE, seq_nr::SeqNr};
+
+const EXT_CLOSE_REASON: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
@@ -37,7 +41,12 @@ impl Type {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Extensions {
+    pub close_reason: Option<ext_close_reason::LibTorrentCloseReason>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UtpHeader {
     pub htype: Type,                            // 4 bits type and 4 bits version
     pub connection_id: SeqNr,                   // Connection ID
@@ -46,6 +55,7 @@ pub struct UtpHeader {
     pub wnd_size: u32,                          // Window size
     pub seq_nr: SeqNr,                          // Sequence number
     pub ack_nr: SeqNr,                          // Acknowledgment number
+    pub extensions: Option<Extensions>,
 }
 
 impl UtpHeader {
@@ -116,16 +126,58 @@ impl UtpHeader {
         let mut total_ext_size = 0usize;
 
         while next_ext > 0 {
+            total_ext_size += 2;
             let ext = next_ext;
             next_ext = *buffer.first()?;
             let ext_len = *buffer.get(1)? as usize;
 
-            debug!(ext, next_ext, ext_len, "unsupported extension, skipping");
-            total_ext_size += ext_len;
+            let ext_data = buffer.get(2..2 + ext_len)?;
+            match (ext, ext_len) {
+                (EXT_CLOSE_REASON, 4) => {
+                    header.extensions.get_or_insert_default().close_reason =
+                        Some(ext_close_reason::LibTorrentCloseReason::parse(
+                            ext_data.try_into().unwrap(),
+                        ));
+                }
+                _ => {
+                    debug!(ext, next_ext, ext_len, "unsupported extension, skipping");
+                }
+            }
 
+            total_ext_size += ext_len;
             buffer = buffer.get(2 + ext_len..)?;
         }
 
         Some((header, UTP_HEADER_SIZE + total_ext_size))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{raw::Type, test_util::setup_test_logging};
+
+    use super::UtpHeader;
+
+    #[test]
+    fn test_parse_fin_with_extension() {
+        setup_test_logging();
+        let packet = include_bytes!("../test/resources/packet_fin_with_extension.bin");
+        let (header, len) = UtpHeader::deserialize(packet).unwrap();
+        assert_eq!(
+            header,
+            UtpHeader {
+                htype: Type::ST_FIN,
+                connection_id: 30796.into(),
+                timestamp_microseconds: 2293274188,
+                timestamp_difference_microseconds: 1967430273,
+                wnd_size: 1048576,
+                seq_nr: 54661.into(),
+                ack_nr: 54397.into(),
+                extensions: Some(crate::raw::Extensions {
+                    close_reason: Some(crate::raw::ext_close_reason::LibTorrentCloseReason(15))
+                })
+            }
+        );
+        assert_eq!(len, packet.len());
     }
 }

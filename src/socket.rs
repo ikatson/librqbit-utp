@@ -349,6 +349,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     wnd_size: 0,
                     seq_nr: self.env.random_u16().into(),
                     ack_nr: 0.into(),
+                    extensions: None,
                 };
                 let mut buf = [0u8; UTP_HEADER_SIZE];
                 header.serialize(&mut buf).unwrap();
