@@ -568,7 +568,9 @@ impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
     }
 }
 
-impl UtpSocket<tokio::net::UdpSocket, DefaultUtpEnvironment> {
+pub type UtpSocketUdp = UtpSocket<tokio::net::UdpSocket, DefaultUtpEnvironment>;
+
+impl UtpSocketUdp {
     pub async fn new_udp(bind_addr: SocketAddr) -> anyhow::Result<Arc<Self>> {
         let opts = SocketOpts::default();
         let sock = tokio::net::UdpSocket::bind(bind_addr)

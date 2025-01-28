@@ -33,6 +33,6 @@ mod test_util;
 mod traits;
 mod utils;
 
-pub use socket::UtpSocket;
+pub use socket::{UtpSocket, UtpSocketUdp};
 pub use stream::{UtpStream, UtpStreamUdp};
 pub use traits::Transport;
