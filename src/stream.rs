@@ -2125,6 +2125,7 @@ mod tests {
             },
             "",
         );
+        t.poll_once_assert_pending().await;
 
         // Ensure flush completes at first
         let flush_result = poll_fn(|cx| {
@@ -2134,7 +2135,7 @@ mod tests {
         .await;
         match flush_result {
             Poll::Ready(result) => result.unwrap(),
-            Poll::Pending => panic!("flushed should have completed"),
+            Poll::Pending => panic!("flush should have completed"),
         };
     }
 }
