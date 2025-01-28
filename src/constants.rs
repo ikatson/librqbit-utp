@@ -18,4 +18,4 @@ pub const IMMEDIATE_ACK_EVERY: isize = 5;
 
 pub const WRAP_TOLERANCE: u16 = 1024;
 
-pub const GRACEFUL_TERMINATION_TIMEOUT: Duration = Duration::from_secs(1);
+// pub const GRACEFUL_TERMINATION_TIMEOUT: Duration = Duration::from_secs(1);

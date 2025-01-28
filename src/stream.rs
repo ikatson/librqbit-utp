@@ -1,6 +1,5 @@
 use std::{
     future::Future,
-    marker::PhantomData,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Weak},
