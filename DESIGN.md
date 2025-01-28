@@ -15,3 +15,11 @@ This will send the Shutdown message to UtpSocket immediately.
 ### Case 2. UtpSocket is dead.
 
 This will crash the dispatcher.
+
+
+### Accept buffering
+on accept request
+- we add it to the queue. If there's too many, we drop it
+
+on syn
+-

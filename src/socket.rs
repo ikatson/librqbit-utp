@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{hash_map::Entry, BinaryHeap, HashMap, VecDeque},
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -22,7 +22,7 @@ use crate::{
 };
 use anyhow::{bail, Context};
 use tokio::sync::{
-    mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
 use tracing::{debug, error_span, trace, warn};
@@ -105,8 +105,11 @@ pub(crate) struct ValidatedSocketOpts {
     pub nagle: bool,
 }
 
+pub type StreamRequester = oneshot::Sender<UtpStream>;
+
 pub(crate) enum ControlRequest {
-    ConnectRequest(SocketAddr, ConnectToken, oneshot::Sender<UtpStream>),
+    AcceptRequest(StreamRequester),
+    ConnectRequest(SocketAddr, ConnectToken, StreamRequester),
     ConnectDropped(SocketAddr, ConnectToken),
 
     Shutdown {
@@ -123,7 +126,7 @@ struct Connecting {
     token: ConnectToken,
     start: Instant,
     seq_nr: SeqNr,
-    tx: oneshot::Sender<UtpStream>,
+    tx: StreamRequester,
 }
 
 const MAX_CONNECTING_PER_ADDR: usize = 4;
@@ -174,13 +177,54 @@ impl ConnectingPerAddr {
     }
 }
 
+const ACCEPT_QUEUE_MAX_ACCEPTORS: usize = 32;
+const ACCEPT_QUEUE_MAX_SYNS: usize = 32;
+
+struct Syn {
+    remote: SocketAddr,
+    header: UtpHeader,
+    received: Instant,
+}
+
+enum MatchSynWithAccept {
+    Matched,
+    SynInvalid(StreamRequester),
+    ReceiverDead(Syn),
+}
+
+struct AcceptQueue {
+    syns: VecDeque<Syn>,
+    next_available_acceptor: Option<StreamRequester>,
+    rx: mpsc::Receiver<StreamRequester>,
+}
+
+impl AcceptQueue {
+    fn syn_queue_empty(&mut self) -> bool {
+        self.syns.is_empty()
+    }
+
+    fn try_next_acceptor(&mut self) -> Option<StreamRequester> {
+        if let Some(next) = self.next_available_acceptor.take() {
+            return Some(next);
+        }
+        self.rx.try_recv().ok()
+    }
+
+    fn try_cache_syn(&mut self, syn: Syn) -> bool {
+        if self.syns.len() < ACCEPT_QUEUE_MAX_ACCEPTORS {
+            self.syns.push_back(syn);
+            return true;
+        }
+        false
+    }
+}
+
 pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     packet_pool: Arc<PacketPool>,
     env: E,
     socket: Arc<UtpSocket<T, E>>,
 
-    next_accept: Option<oneshot::Sender<UtpStream>>,
-    accept_rx: UnboundedReceiver<oneshot::Sender<UtpStream>>,
+    accept_queue: AcceptQueue,
 
     pub(crate) streams: HashMap<Key, UnboundedSender<UtpMessage>>,
     connecting: HashMap<SocketAddr, ConnectingPerAddr>,
@@ -201,7 +245,15 @@ async fn recv_from(
 impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     pub(crate) async fn run_forever(mut self) -> anyhow::Result<()> {
         loop {
+            // This should get us into a state where either there's no SYNs or no accepts available.
+            self.cleanup_accept_queue()?;
+
             tokio::select! {
+                accept = self.accept_queue.rx.recv(), if !self.accept_queue.syn_queue_empty() => {
+                    let accept = accept.unwrap();
+                    assert!(self.accept_queue.next_available_acceptor.is_none());
+                    self.accept_queue.next_available_acceptor = Some(accept);
+                }
                 control_request = self.control_rx.recv() => {
                     let control = control_request.unwrap();
                     // If this blocks it should be short lived enough?;
@@ -214,6 +266,28 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 }
             }
         }
+    }
+
+    // Get into a state where we can't match acceptors with cached SYNs anymore.
+    fn cleanup_accept_queue(&mut self) -> anyhow::Result<()> {
+        while !self.accept_queue.syns.is_empty() {
+            let acceptor = match self.accept_queue.try_next_acceptor() {
+                Some(acc) => acc,
+                None => return Ok(()),
+            };
+            let syn = self.accept_queue.syns.pop_front().unwrap();
+            match self.match_syn_with_accept(syn, acceptor) {
+                MatchSynWithAccept::Matched => continue,
+                MatchSynWithAccept::SynInvalid(sender) => {
+                    self.accept_queue.next_available_acceptor = Some(sender);
+                }
+                MatchSynWithAccept::ReceiverDead(syn) => {
+                    self.accept_queue.syns.push_front(syn);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn get_next_free_conn_id(&mut self, addr: SocketAddr) -> SeqNr {
@@ -280,6 +354,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 self.streams.remove(&(remote, conn_id_1));
                 self.streams.remove(&(remote, conn_id_2));
             }
+            ControlRequest::AcceptRequest(sender) => {
+                // if self.accept_queue.acceptors
+            }
         }
         Ok(())
     }
@@ -328,36 +405,52 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         Ok(())
     }
 
-    #[tracing::instrument(skip_all, fields(addr, seq_nr=?msg.header.seq_nr))]
-    fn on_syn(&mut self, addr: SocketAddr, msg: UtpMessage) -> anyhow::Result<()> {
-        let key1 = (addr, msg.header.connection_id);
-        let key2 = (addr, msg.header.connection_id + 1);
+    fn match_syn_with_accept(&mut self, syn: Syn, accept: StreamRequester) -> MatchSynWithAccept {
+        let key1 = (syn.remote, syn.header.connection_id);
+        let key2 = (syn.remote, syn.header.connection_id + 1);
         if self.streams.contains_key(&key1) || self.streams.contains_key(&key2) {
             trace!("invalid SYN, it clashes, dropping");
-            return Ok(());
+            return MatchSynWithAccept::SynInvalid(accept);
         }
 
-        // TODO: Fuck. This can cause a race. We need to queue a few accepts. Refactor.
-        let accept_token = match self.accept_rx.try_recv() {
-            Ok(t) => t,
-            Err(_) => {
-                warn!("nothing is accepting, dropping SYN");
-                return Ok(());
-            }
-        };
-
-        let args = StreamArgs::new_incoming(self.env.random_u16().into(), &msg.header);
+        let args = StreamArgs::new_incoming(self.env.random_u16().into(), &syn.header);
         let (tx, rx) = unbounded_channel();
-        let stream = UtpStream::new(&self.socket, addr, rx, args);
+        let stream = UtpStream::new(&self.socket, syn.remote, rx, args);
 
-        if accept_token.send(stream).is_ok() {
+        if accept.send(stream).is_ok() {
             self.streams.insert(key1, tx.clone());
             self.streams.insert(key2, tx);
+            MatchSynWithAccept::Matched
         } else {
-            // TODO: try next accept
-            warn!("next acceptor dead, dropping SYN");
+            MatchSynWithAccept::ReceiverDead(syn)
         }
-        Ok(())
+    }
+
+    #[tracing::instrument(skip_all, fields(addr, seq_nr=?msg.header.seq_nr))]
+    fn on_syn(&mut self, remote: SocketAddr, msg: UtpMessage) -> anyhow::Result<()> {
+        let mut syn = Syn {
+            remote,
+            header: msg.header,
+            received: Instant::now(),
+        };
+        while let Some(acceptor) = self.accept_queue.try_next_acceptor() {
+            match self.match_syn_with_accept(syn, acceptor) {
+                MatchSynWithAccept::Matched => return Ok(()),
+                MatchSynWithAccept::SynInvalid(sender) => {
+                    self.accept_queue.next_available_acceptor = Some(sender);
+                    return Ok(());
+                }
+                MatchSynWithAccept::ReceiverDead(s) => syn = s,
+            }
+        }
+        match self.accept_queue.try_cache_syn(syn) {
+            true => Ok(()),
+            false => {
+                warn!("dropping SYN, no more space to cache them and no acceptors available");
+                // TODO: send anything?
+                Ok(())
+            }
+        }
     }
 
     fn on_recv(&mut self, addr: SocketAddr, packet: Packet, len: usize) -> anyhow::Result<()> {
@@ -408,9 +501,9 @@ pub struct UtpSocket<T: Transport, E: UtpEnvironment> {
     // When was the socket created. All the uTP "timestamp_microsends" are relative to it.
     pub(crate) created: Instant,
     pub(crate) control_requests: UnboundedSender<ControlRequest>,
-    pub(crate) env: E,
+    accept_requests: mpsc::Sender<StreamRequester>,
 
-    accept_requests: UnboundedSender<oneshot::Sender<UtpStream>>,
+    pub(crate) env: E,
 
     local_addr: SocketAddr,
     opts: ValidatedSocketOpts,
@@ -453,7 +546,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let sock = transport;
         let local_addr = sock.bind_addr();
 
-        let (accept_tx, accept_rx) = unbounded_channel();
+        let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_QUEUE_MAX_ACCEPTORS);
         let (control_tx, control_rx) = unbounded_channel();
 
         let sock = Arc::new(Self {
@@ -468,14 +561,17 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 
         let dispatcher = Dispatcher {
             packet_pool: PacketPool::new(opts.packet_pool_max_packets, opts.max_packet_size),
-            next_accept: None,
             streams: Default::default(),
             connecting: Default::default(),
             next_connection_id: env.random_u16().into(),
             control_rx,
             socket: sock.clone(),
             env,
-            accept_rx,
+            accept_queue: AcceptQueue {
+                syns: Default::default(),
+                next_available_acceptor: None,
+                rx: accept_rx,
+            },
         };
 
         Ok((sock, dispatcher))
@@ -488,7 +584,10 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     #[tracing::instrument(name="utp_socket:accept", skip(self), fields(local=?self.local_addr))]
     pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream> {
         let (tx, rx) = oneshot::channel();
-        self.accept_requests.send(tx).context("dispatcher dead")?;
+        self.accept_requests
+            .send(tx)
+            .await
+            .context("dispatcher dead")?;
 
         let stream = rx.await.context("dispatcher dead")?;
         Ok(stream)
