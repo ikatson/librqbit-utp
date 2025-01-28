@@ -420,6 +420,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
 
         if conn.requester.tx.send(stream).is_ok() {
+            trace!("created stream and passed to connector");
             self.streams.insert(key1, tx.clone());
             self.streams.insert(key2, tx);
         } else {
@@ -443,6 +444,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let stream = UtpStream::new(&self.socket, syn.remote, rx, args);
 
         if accept.tx.send(stream).is_ok() {
+            trace!("created stream and passed to acceptor");
             self.streams.insert(key1, tx.clone());
             self.streams.insert(key2, tx);
             MatchSynWithAccept::Matched
@@ -451,7 +453,6 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(addr, seq_nr=?msg.header.seq_nr))]
     fn on_syn(&mut self, remote: SocketAddr, msg: UtpMessage) -> anyhow::Result<()> {
         let mut syn = Syn {
             remote,
@@ -477,22 +478,29 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
 
+    #[tracing::instrument(name = "on_recv", skip_all, fields(from=?addr))]
     fn on_recv(&mut self, addr: SocketAddr, packet: Packet, len: usize) -> anyhow::Result<()> {
-        trace!(?addr, len, "received a message");
+        trace!("received");
 
         let message = match UtpMessage::deserialize(packet, len) {
             Some(msg) => msg,
             None => {
-                debug!(
-                    len,
-                    ?addr,
-                    "error desserializing and validating UTP message"
-                );
+                debug!(len, "error desserializing and validating UTP message");
                 return Ok(());
             }
         };
 
-        trace!(?addr, len, ?message, "received");
+        let span = error_span!(
+            "msg",
+            conn_id=?message.header.connection_id,
+            type=?message.header.get_type(),
+            seq_nr=?message.header.seq_nr,
+            ack_nr=?message.header.ack_nr,
+            payload=message.payload().len()
+        );
+        let _span = span.entered();
+
+        trace!("parsed");
 
         let key = (addr, message.header.connection_id);
 
@@ -683,6 +691,7 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         try_join,
     };
+    use tracing::{error_span, info, Instrument};
 
     use crate::test_util::{setup_test_logging, transport::MockInterface, MockUtpStream};
 
@@ -705,6 +714,7 @@ mod tests {
             if read != 42 {
                 bail!("expected 42, got {}", read);
             }
+            info!("received 42, closing echo");
             Ok(())
         }
 
@@ -717,12 +727,14 @@ mod tests {
             )
             .await
             .context("error running echo connect")
-        };
+        }
+        .instrument(error_span!("connect"));
         let accept = async {
             echo(server.accept().await.context("error accepting")?)
                 .await
                 .context("error running echo accept")
-        };
+        }
+        .instrument(error_span!("accept"));
 
         try_join!(connect, accept)?;
         Ok(())
