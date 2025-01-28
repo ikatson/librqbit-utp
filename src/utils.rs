@@ -3,7 +3,7 @@ use std::{cmp::Ordering, future::Future, task::Waker};
 use anyhow::bail;
 use smoltcp::storage::RingBuffer;
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
-use tracing::Instrument;
+use tracing::{trace, Instrument};
 
 pub fn spawn_print_error(
     span: tracing::Span,
@@ -115,6 +115,26 @@ impl<Msg> Drop for DropGuardSendBeforeDeath<Msg> {
             }
         }
     }
+}
+
+pub fn log_before_and_after_if_changed<
+    'a,
+    Object: 'a,
+    Value: PartialEq + Copy + std::fmt::Debug + 'static,
+    ChangeResult,
+>(
+    name: &'static str,
+    obj: &mut Object,
+    calc: impl Fn(&Object) -> Value,
+    maybe_change: impl FnOnce(&mut Object) -> ChangeResult,
+) -> ChangeResult {
+    let before = calc(obj);
+    let result = maybe_change(obj);
+    let after = calc(obj);
+    if before != after {
+        trace!(?before, ?after, "{} changed", name);
+    }
+    result
 }
 
 #[cfg(test)]

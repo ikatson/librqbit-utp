@@ -29,7 +29,8 @@ use crate::{
     stream_tx::Tx,
     traits::{Transport, UtpEnvironment},
     utils::{
-        fill_buffer_from_rb, spawn_print_error, update_optional_waker, DropGuardSendBeforeDeath,
+        fill_buffer_from_rb, log_before_and_after_if_changed, spawn_print_error,
+        update_optional_waker, DropGuardSendBeforeDeath,
     },
     UtpSocket,
 };
@@ -527,8 +528,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if g.buffer.is_empty() {
             update_optional_waker(&mut g.buffer_has_data, cx);
 
-            if g.closed && self.state.transition_to_fin_sent(self.next_seq_nr) {
-                trace!(?self.state, "writer closed, transitioned state");
+            if g.closed {
+                let changed = log_before_and_after_if_changed(
+                    "state",
+                    &mut self.state,
+                    |s| *s,
+                    |s| s.transition_to_fin_sent(self.next_seq_nr),
+                );
+                if changed {
+                    trace!("writer closed");
+                }
             }
 
             return Ok(());
@@ -649,9 +658,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     ) -> anyhow::Result<()> {
         trace!("processing message");
 
-        self.state.on_incoming_packet(
-            matches!(msg.header.get_type(), Type::ST_FIN),
-            msg.header.ack_nr,
+        log_before_and_after_if_changed(
+            "state",
+            self,
+            |s| s.state,
+            |s| {
+                s.state.on_incoming_packet(
+                    matches!(msg.header.get_type(), Type::ST_FIN),
+                    msg.header.ack_nr,
+                )
+            },
         );
 
         // Remove everything from tx_buffer that was acked by this message.
@@ -925,11 +941,13 @@ pub struct UtpStreamWriteHalf {
 
 impl UtpStreamWriteHalf {
     fn close(&mut self) {
-        trace!("closing writer on drop to send FIN");
         let mut g = self.user_tx.locked.lock();
-        g.closed = true;
-        if let Some(w) = g.buffer_has_data.take() {
-            w.wake();
+        if !g.closed {
+            trace!("closing writer");
+            g.closed = true;
+            if let Some(w) = g.buffer_has_data.take() {
+                w.wake();
+            }
         }
     }
 }
