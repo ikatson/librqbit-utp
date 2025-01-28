@@ -219,6 +219,22 @@ struct ThisPoll {
 }
 
 impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
+    async fn run_forever(self, first_packet: Option<UtpHeader>) -> anyhow::Result<()> {
+        if let Some(first_packet) = first_packet {
+            let sock = self.socket.upgrade().context("socket is dead")?;
+            let mut buf = [0u8; UTP_HEADER_SIZE];
+            first_packet
+                .serialize(&mut buf)
+                .context("bug: can't serialize header")?;
+            sock.transport
+                .send_to(&buf, self.remote)
+                .await
+                .context("error sending initial ACK")?;
+        }
+
+        self.await.context("error running utp stream event loop")
+    }
+
     fn timestamp_microseconds(&self) -> u32 {
         (self.this_poll.now - self.socket_created).as_micros() as u32
     }
@@ -1132,25 +1148,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
 
         spawn_print_error(
             error_span!("utp_stream", conn_id_send = ?vsock.conn_id_send),
-            {
-                let socket = socket.clone();
-                async move {
-                    // Send first "weird" ACK if this is an incoming connection.
-                    if let Some(first_packet) = first_packet {
-                        let mut buf = [0u8; UTP_HEADER_SIZE];
-                        first_packet
-                            .serialize(&mut buf)
-                            .context("bug: can't serialize header")?;
-                        socket
-                            .transport
-                            .send_to(&buf, vsock.remote)
-                            .await
-                            .context("error sending initial ACK")?;
-                    }
-
-                    vsock.await.context("error running utp stream event loop")
-                }
-            },
+            vsock.run_forever(first_packet),
         );
         stream
     }
@@ -1500,7 +1498,6 @@ mod tests {
 
     use crate::{
         raw::{Type, UtpHeader},
-        socket::Dispatcher,
         test_util::{
             env::MockUtpEnvironment,
             transport::{MockInterface, MockUtpTransport},

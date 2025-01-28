@@ -2,11 +2,11 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     net::SocketAddr,
     sync::{
-        atomic::{AtomicU16, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
     task::Poll,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use crate::{
@@ -21,7 +21,6 @@ use crate::{
     UtpStream,
 };
 use anyhow::{bail, Context};
-use dashmap::DashMap;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
@@ -31,8 +30,6 @@ use tracing::{debug, error_span, trace, warn};
 type ConnectionId = SeqNr;
 
 type Key = (SocketAddr, ConnectionId);
-
-type UtpHeaderMessage = (UtpHeader, SocketAddr);
 
 #[derive(Default)]
 pub struct SocketOpts {
@@ -130,7 +127,7 @@ impl<Msg> Drop for DropGuardSendBeforeDeath<Msg> {
     }
 }
 
-enum ControlRequest<T: Transport, E: UtpEnvironment> {
+pub(crate) enum ControlRequest<T: Transport, E: UtpEnvironment> {
     ConnectRequest(SocketAddr, ConnectToken, oneshot::Sender<UtpStream<T, E>>),
     ConnectDropped(SocketAddr, ConnectToken),
 
@@ -146,6 +143,7 @@ type ConnectToken = u64;
 
 struct Connecting<T: Transport, E: UtpEnvironment> {
     token: ConnectToken,
+    start: Instant,
     seq_nr: SeqNr,
     tx: oneshot::Sender<UtpStream<T, E>>,
 }
@@ -281,6 +279,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     token,
                     seq_nr: header.seq_nr,
                     tx: sender,
+                    start: self.env.now(),
                 };
                 if self
                     .connecting
@@ -335,8 +334,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             return Ok(());
         };
 
+        let now = self.env.now();
         let (tx, rx) = unbounded_channel();
-        let args = StreamArgs::new_incoming(conn.seq_nr, &msg.header);
+        let args = StreamArgs::new_outgoing(&msg.header, conn.start, now);
 
         let stream = UtpStream::new(&self.socket, addr, rx, args);
         let key1 = (addr, conn.seq_nr);
@@ -410,7 +410,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let key = (addr, message.header.connection_id);
 
         if let Some(tx) = self.streams.get(&key) {
-            if let Err(_) = tx.send(message) {
+            if tx.send(message).is_err() {
                 debug!(?key, "stream dead");
                 self.streams.remove(&key);
             }
