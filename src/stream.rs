@@ -1495,19 +1495,9 @@ mod tests {
 
     use futures::FutureExt;
     use tokio::{
-        io::{AsyncRead, AsyncReadExt},
+        io::{AsyncRead, AsyncWriteExt},
         sync::mpsc::{unbounded_channel, UnboundedSender},
     };
-
-    macro_rules! poll_once {
-        ($vsock:expr) => {
-            std::future::poll_fn(|cx| {
-                let res = $vsock.poll_unpin(cx);
-                Poll::Ready(res)
-            })
-            .await
-        };
-    }
 
     use crate::{
         message::UtpMessage,
@@ -1528,7 +1518,7 @@ mod tests {
     struct TestVsock {
         transport: RememberingTransport,
         env: MockUtpEnvironment,
-        socket: Arc<UtpSocket<RememberingTransport, MockUtpEnvironment>>,
+        _socket: Arc<UtpSocket<RememberingTransport, MockUtpEnvironment>>,
         vsock: VirtualSocket<RememberingTransport, MockUtpEnvironment>,
         stream: UtpStream,
         tx: UnboundedSender<UtpMessage>,
@@ -1604,7 +1594,7 @@ mod tests {
         TestVsock {
             transport,
             env,
-            socket,
+            _socket: socket,
             vsock,
             stream,
             tx,
@@ -1612,7 +1602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delayed_ack() {
+    async fn test_delayed_ack_sent_once() {
         setup_test_logging();
 
         let mut t = make_test_vsock();
@@ -1632,13 +1622,80 @@ mod tests {
         assert_eq!(&t.read_all_available().await.unwrap(), b"hello");
         assert_eq!(t.take_sent().len(), 0);
 
+        // Pretend it's 1 second later.
         t.env.increment_now(Duration::from_secs(1));
         t.poll_once_assert_pending().await;
         assert_eq!(&t.read_all_available().await.unwrap(), b"");
 
+        // Assert an ACK was sent.
         let sent = t.take_sent();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].header.get_type(), Type::ST_STATE);
         assert_eq!(sent[0].header.ack_nr.0, 1);
+
+        // Assert nothing else is sent later.
+        t.env.increment_now(Duration::from_secs(1));
+        t.poll_once_assert_pending().await;
+        assert_eq!(sent.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_doesnt_send_until_window_updated() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        assert_eq!(t.vsock.last_remote_window, 0);
+
+        t.stream.write_all(b"hello").await.unwrap();
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 0);
+
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "hello",
+        );
+        t.poll_once_assert_pending().await;
+
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
+        assert_eq!(sent[0].header.ack_nr.0, 0);
+        assert_eq!(sent[0].payload(), b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_sends_up_to_remote_window_only() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        assert_eq!(t.vsock.last_remote_window, 0);
+
+        t.stream.write_all(b"hello").await.unwrap();
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 0);
+
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 4,
+                ..Default::default()
+            },
+            "hello",
+        );
+        t.poll_once_assert_pending().await;
+
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
+        assert_eq!(sent[0].header.ack_nr.0, 0);
+        assert_eq!(sent[0].payload(), b"hell");
     }
 }
