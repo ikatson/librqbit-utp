@@ -306,10 +306,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         let mut last_sent = None;
-        let mut recv_wnd =
-            (self.last_remote_window as usize).min(self.congestion_controller.window());
-
-        trace!(recv_wnd);
+        let mut recv_wnd = self.effective_remote_receive_window();
 
         // Send only the stuff we haven't sent yet, up to sender's window.
         for item in self.tx.iter() {
@@ -356,6 +353,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             recv_wnd = recv_wnd.saturating_sub(item.payload_size());
 
             last_sent = Some(header);
+        }
+
+        if recv_wnd > 0 {
+            trace!(recv_wnd, "remaining recv_wnd after sending");
         }
 
         if let Some(header) = last_sent {
@@ -516,6 +517,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(())
     }
 
+    fn effective_remote_receive_window(&self) -> usize {
+        (self.last_remote_window as usize).min(self.congestion_controller.window())
+    }
+
     fn fragment_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
         let mut g = self.user_tx.locked.lock();
 
@@ -546,15 +551,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         let mut remaining = g.buffer.len() - tx_offset;
         let mut remote_window_remaining = self
-            .last_remote_window
-            .min(self.congestion_controller.window() as u32)
-            .saturating_sub(self.tx.total_len_bytes() as u32);
+            .effective_remote_receive_window()
+            .saturating_sub(self.tx.total_len_bytes());
 
         while !self.tx.is_full() && remaining > 0 && remote_window_remaining > 0 {
             let max_payload_size = self
                 .socket_opts
                 .max_payload_size
-                .min(remote_window_remaining as usize);
+                .min(remote_window_remaining);
             let payload_size = max_payload_size.min(remaining);
 
             // Run Nagle algorithm to prevent sending too many small segments.
@@ -574,8 +578,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             self.tx.enqueue(header, payload_size);
             remaining -= payload_size;
-            remote_window_remaining -= payload_size as u32;
-            trace!(bytes = payload_size, "enqueued");
+            remote_window_remaining -= payload_size;
+            trace!(bytes = payload_size, "fragmented");
             self.next_seq_nr += 1;
         }
 
@@ -643,7 +647,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         socket: &UtpSocket<T, Env>,
         msg: UtpMessage,
     ) -> anyhow::Result<()> {
-        trace!(state=?self.state, "on_message");
+        trace!("processing message");
 
         self.state.on_incoming_packet(
             matches!(msg.header.get_type(), Type::ST_FIN),
@@ -1536,6 +1540,7 @@ mod tests {
     use tracing::trace;
 
     use crate::{
+        congestion::Controller,
         message::UtpMessage,
         raw::{Type, UtpHeader},
         stream::VirtualSocketState,
@@ -2645,5 +2650,122 @@ mod tests {
         let sent = t.take_sent();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].payload(), b" world");
+    }
+
+    #[tokio::test]
+    async fn test_congestion_control_basics() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        let remote_wnd = 64 * 1024;
+
+        // Allow sending by setting large window
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: remote_wnd, // Large window to not interfere with congestion control
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+
+        let initial_window = t.vsock.congestion_controller.window();
+        assert!(
+            initial_window < remote_wnd as usize,
+            "{initial_window} >= {remote_wnd}, should be less"
+        );
+
+        // Write a lot of data to test windowing
+        let big_data = vec![0u8; 64 * 1024];
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(&big_data)
+            .await
+            .unwrap();
+        t.poll_once_assert_pending().await;
+
+        // Should only send up to initial window
+        let sent = t.take_sent();
+        assert!(
+            sent.iter().map(|m| m.payload().len()).sum::<usize>() == initial_window,
+            "Should respect initial window"
+        );
+        let first_batch_seq_nrs: Vec<_> = sent.iter().map(|m| m.header.seq_nr).collect();
+
+        // ACK all packets - window should increase
+        for seq_nr in &first_batch_seq_nrs {
+            t.send_msg(
+                UtpHeader {
+                    htype: Type::ST_STATE,
+                    seq_nr: 0.into(),
+                    ack_nr: *seq_nr,
+                    wnd_size: remote_wnd,
+                    ..Default::default()
+                },
+                "",
+            );
+        }
+        t.poll_once_assert_pending().await;
+
+        let intermediate_window = t.vsock.congestion_controller.window();
+
+        assert!(
+            intermediate_window > initial_window,
+            "Window should grow after ACKs"
+        );
+
+        let sent = t.take_sent();
+        assert!(
+            !sent.is_empty(),
+            "Should send more data due to increased window"
+        );
+
+        // Now simulate packet loss via duplicate ACKs
+        let lost_seq_nr = sent[0].header.seq_nr;
+        for _ in 0..4 {
+            t.send_msg(
+                UtpHeader {
+                    htype: Type::ST_STATE,
+                    seq_nr: 0.into(),
+                    ack_nr: lost_seq_nr,
+                    wnd_size: remote_wnd,
+                    ..Default::default()
+                },
+                "",
+            );
+        }
+        t.poll_once_assert_pending().await;
+
+        // Should trigger fast retransmit
+        let resent = t.take_sent();
+        assert!(
+            !resent.is_empty(),
+            "Should retransmit on triple duplicate ACK"
+        );
+
+        // Window should be reduced
+        let window_after_loss = t.vsock.congestion_controller.window();
+        assert!(
+            window_after_loss < intermediate_window,
+            "Window should decrease after loss"
+        );
+
+        // Simulate timeout by advancing time
+        t.env.increment_now(Duration::from_secs(10));
+        t.poll_once_assert_pending().await;
+
+        // Should retransmit and reduce window further
+        let resent = t.take_sent();
+        assert!(!resent.is_empty(), "Should retransmit on timeout");
+
+        let window_after_timeout = t.vsock.congestion_controller.window();
+        assert!(
+            window_after_timeout <= window_after_loss,
+            "Window should decrease or stay same after timeout"
+        );
     }
 }
