@@ -42,6 +42,10 @@ impl Tx {
         Some(self.headers.get_allocated(0, 1)[0].0.seq_nr)
     }
 
+    pub fn total_len_bytes(&self) -> usize {
+        self.iter().map(|i| i.payload_size()).sum()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.headers.is_empty()
     }

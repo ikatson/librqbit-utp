@@ -533,13 +533,21 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         let mut remaining = g.buffer.len() - tx_offset;
+        let mut remote_window_remaining = self
+            .last_remote_window
+            .min(self.congestion_controller.window() as u32)
+            .saturating_sub(self.tx.total_len_bytes() as u32);
 
-        while !self.tx.is_full() && remaining > 0 {
-            let payload_size = self.socket_opts.max_payload_size.min(remaining);
+        while !self.tx.is_full() && remaining > 0 && remote_window_remaining > 0 {
+            let max_payload_size = self
+                .socket_opts
+                .max_payload_size
+                .min(remote_window_remaining as usize);
+            let payload_size = max_payload_size.min(remaining);
 
             // Run Nagle algorithm to prevent sending too many small segments.
             {
-                let can_send_full_payload = payload_size == self.socket_opts.max_payload_size;
+                let can_send_full_payload = payload_size == max_payload_size;
                 let data_in_flight = !self.tx.is_empty();
 
                 if self.socket_opts.nagle && !can_send_full_payload && data_in_flight {
