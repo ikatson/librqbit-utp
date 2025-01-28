@@ -697,10 +697,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::{Ipv4Addr, SocketAddr},
-        time::Duration,
-    };
+    use std::net::{Ipv4Addr, SocketAddr};
 
     use anyhow::{bail, Context};
     use tokio::{

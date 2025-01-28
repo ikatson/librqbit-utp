@@ -1,13 +1,11 @@
 use std::{
     collections::HashMap,
     future::{poll_fn, Future},
-    io::Write,
     net::SocketAddr,
     sync::Arc,
     task::Poll,
 };
 
-use futures::channel::mpsc::unbounded;
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{error_span, trace, Instrument};
@@ -139,18 +137,13 @@ impl Transport for MockUtpTransport {
 #[derive(Clone)]
 pub struct RememberingTransport {
     pub bind_addr: SocketAddr,
-    recv_from_rx: Arc<Mutex<UnboundedReceiver<Msg>>>,
-    pub recv_from_tx: UnboundedSender<Msg>,
     pub messages: Arc<Mutex<Vec<Msg>>>,
 }
 
 impl RememberingTransport {
     pub fn new(bind_addr: SocketAddr) -> Self {
-        let (tx, rx) = unbounded_channel();
         Self {
             bind_addr,
-            recv_from_rx: Arc::new(Mutex::new(rx)),
-            recv_from_tx: tx,
             messages: Default::default(),
         }
     }
@@ -176,15 +169,11 @@ impl RememberingTransport {
 }
 
 impl Transport for RememberingTransport {
-    async fn recv_from<'a>(
+    fn recv_from<'a>(
         &'a self,
-        mut buf: &'a mut [u8],
-    ) -> std::io::Result<(usize, SocketAddr)> {
-        let (addr, data) = std::future::poll_fn(|cx| self.recv_from_rx.lock().poll_recv(cx))
-            .await
-            .unwrap();
-        buf.write_all(&data).unwrap();
-        Ok((data.len(), addr))
+        _buf: &'a mut [u8],
+    ) -> impl Future<Output = std::io::Result<(usize, SocketAddr)>> {
+        std::future::pending()
     }
 
     async fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr) -> std::io::Result<usize> {
@@ -194,7 +183,7 @@ impl Transport for RememberingTransport {
 
     fn poll_send_to(
         &self,
-        cx: &mut std::task::Context<'_>,
+        _cx: &mut std::task::Context<'_>,
         buf: &[u8],
         target: SocketAddr,
     ) -> Poll<std::io::Result<usize>> {

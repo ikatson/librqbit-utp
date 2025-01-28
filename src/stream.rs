@@ -2491,4 +2491,159 @@ mod tests {
         assert_eq!(sent[0].header.seq_nr.0, data_seq_nr.0 + 1);
         assert!(matches!(result, Poll::Ready(Ok(()))));
     }
+
+    #[tokio::test]
+    async fn test_flow_control() {
+        // TODO: write this.
+        //
+        // We now have only assembler for flow control, but not actual reader consuming data.
+    }
+
+    #[tokio::test]
+    async fn test_sender_flow_control() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        // Set initial remote window very small
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 5, // Only allow 5 bytes
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Try to write more data than window allows
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(b"hello world")
+            .await
+            .unwrap();
+        t.poll_once_assert_pending().await;
+
+        // Should only send up to window size
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload(), b"hello");
+        let first_seq_nr = sent[0].header.seq_nr;
+
+        // No more data should be sent until window updates
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 0);
+
+        // ACK first packet but keep window small
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: first_seq_nr,
+                wnd_size: 4, // Reduce window further
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+
+        // Should send up to new window size
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload(), b" wor"); // Only 4 bytes
+        let second_seq_nr = sent[0].header.seq_nr;
+
+        // Remote increases window and ACKs
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: second_seq_nr,
+                wnd_size: 10, // Open window
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+
+        // Should send remaining data
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload(), b"ld");
+
+        // Verify total data sent matches original write
+        assert_eq!(
+            t.vsock.next_seq_nr.0 - first_seq_nr.0,
+            3, // 3 packets total
+            "Should have split data into correct number of packets"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_zero_window_handling() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        // Set initial window to allow some data
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 5,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Write data
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(b"hello world")
+            .await
+            .unwrap();
+        t.poll_once_assert_pending().await;
+
+        // First chunk should be sent
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload(), b"hello");
+        let seq_nr = sent[0].header.seq_nr;
+
+        // ACK data but advertise zero window
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: seq_nr,
+                wnd_size: 0, // Zero window
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+
+        // Nothing should be sent
+        assert_eq!(t.take_sent().len(), 0);
+
+        // Remote sends window update
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: seq_nr,
+                wnd_size: 1024, // Open window
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+
+        // Remaining data should now be sent
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload(), b" world");
+    }
 }
