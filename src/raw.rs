@@ -3,7 +3,7 @@ use tracing::{debug, trace};
 
 use crate::{constants::UTP_HEADER_SIZE, seq_nr::SeqNr};
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 pub enum Type {
     ST_DATA = 0,

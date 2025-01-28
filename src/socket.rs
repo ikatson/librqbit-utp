@@ -256,6 +256,7 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
 
     accept_queue: AcceptQueue,
 
+    // TODO: we need to insert here only once!
     pub(crate) streams: HashMap<Key, UnboundedSender<UtpMessage>>,
     connecting: HashMap<SocketAddr, ConnectingPerAddr>,
     control_rx: UnboundedReceiver<ControlRequest>,

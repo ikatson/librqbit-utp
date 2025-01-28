@@ -220,19 +220,24 @@ struct ThisPoll {
 }
 
 impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
+    async fn send_packet(&self, packet: UtpHeader) -> anyhow::Result<()> {
+        let mut buf = [0u8; UTP_HEADER_SIZE];
+        packet
+            .serialize(&mut buf)
+            .context("bug: can't serialize header")?;
+        self.socket
+            .upgrade()
+            .context("socket dead")?
+            .transport
+            .send_to(&buf, self.remote)
+            .await
+            .context("error sending")?;
+        Ok(())
+    }
+
     async fn run_forever(self, first_packet: Option<UtpHeader>) -> anyhow::Result<()> {
-        if let Some(first_packet) = first_packet {
-            let mut buf = [0u8; UTP_HEADER_SIZE];
-            first_packet
-                .serialize(&mut buf)
-                .context("bug: can't serialize header")?;
-            self.socket
-                .upgrade()
-                .context("socket dead")?
-                .transport
-                .send_to(&buf, self.remote)
-                .await
-                .context("error sending initial ACK")?;
+        if let Some(packet) = first_packet {
+            self.send_packet(packet).await?;
         }
 
         self.await.context("error running utp stream event loop")
@@ -1486,105 +1491,148 @@ pub(crate) enum PollAt {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{pin::Pin, sync::Arc, task::Poll, time::Duration};
 
-    use tokio::sync::mpsc::unbounded_channel;
+    use futures::FutureExt;
+    use tokio::{
+        io::{AsyncRead, AsyncReadExt},
+        sync::mpsc::{unbounded_channel, UnboundedSender},
+    };
+
+    macro_rules! poll_once {
+        ($vsock:expr) => {
+            std::future::poll_fn(|cx| {
+                let res = $vsock.poll_unpin(cx);
+                Poll::Ready(res)
+            })
+            .await
+        };
+    }
 
     use crate::{
+        message::UtpMessage,
         raw::{Type, UtpHeader},
         test_util::{
-            env::MockUtpEnvironment,
-            transport::{MockInterface, MockUtpTransport},
-            MockDispatcher, MockUtpStream, ADDR_1, ADDR_2,
+            env::MockUtpEnvironment, setup_test_logging, transport::RememberingTransport, ADDR_1,
+            ADDR_2,
         },
-        traits::UtpEnvironment,
+        UtpSocket,
     };
 
     use super::{StreamArgs, UtpStream, VirtualSocket};
 
-    #[allow(unused)]
-    struct TestStream {
-        dispatcher: MockDispatcher,
-        stream: MockUtpStream,
-        vsock: VirtualSocket<MockUtpTransport, MockUtpEnvironment>,
-        ack_to_send: Option<UtpHeader>,
+    fn make_msg(header: UtpHeader, payload: &str) -> UtpMessage {
+        UtpMessage::new_test(header, payload.as_bytes()).unwrap()
     }
 
-    #[allow(unused)]
-    struct TestStreams {
-        interface: Arc<MockInterface>,
-        s1: TestStream,
-        s2: TestStream,
+    struct TestVsock {
+        transport: RememberingTransport,
+        env: MockUtpEnvironment,
+        socket: Arc<UtpSocket<RememberingTransport, MockUtpEnvironment>>,
+        vsock: VirtualSocket<RememberingTransport, MockUtpEnvironment>,
+        stream: UtpStream,
+        tx: UnboundedSender<UtpMessage>,
     }
 
-    fn create_2_internal_vsockets() -> TestStreams {
-        let interface = MockInterface::new();
-        let (sock1, mut sock1dispatch) = interface.create_socket_with_dispatcher(ADDR_1);
-        let (sock2, mut sock2dispatch) = interface.create_socket_with_dispatcher(ADDR_2);
+    impl TestVsock {
+        fn send_msg(&mut self, header: UtpHeader, payload: &str) {
+            self.tx.send(make_msg(header, payload)).unwrap()
+        }
 
-        let env = interface.env.clone();
+        fn take_sent(&self) -> Vec<UtpMessage> {
+            self.transport.take_sent_utpmessages()
+        }
 
-        let (tx1, rx1) = unbounded_channel();
-        let (tx2, rx2) = unbounded_channel();
+        async fn read_all_available(&mut self) -> std::io::Result<Vec<u8>> {
+            std::future::poll_fn(|cx| {
+                let mut buf = vec![0u8; 1024];
+                let mut rb = tokio::io::ReadBuf::new(&mut buf);
+                let mut s = Pin::new(&mut self.stream);
 
-        let connection_id = 0.into();
+                loop {
+                    match s.as_mut().poll_read(cx, &mut rb) {
+                        Poll::Ready(Ok(())) => continue,
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => return Poll::Ready(Ok(buf)),
+                    }
+                }
+            })
+            .await
+        }
 
-        let syn = UtpHeader {
+        async fn poll_once(&mut self) -> Poll<anyhow::Result<()>> {
+            std::future::poll_fn(|cx| {
+                let res = self.vsock.poll_unpin(cx);
+                Poll::Ready(res)
+            })
+            .await
+        }
+
+        async fn poll_once_assert_pending(&mut self) {
+            let res = self.poll_once().await;
+            match res {
+                Poll::Pending => {}
+                Poll::Ready(res) => {
+                    res.unwrap();
+                    panic!("unexpected finish");
+                }
+            };
+        }
+    }
+
+    fn make_test_vsock() -> TestVsock {
+        let transport = RememberingTransport::new(ADDR_1);
+        let env = MockUtpEnvironment::new();
+        let socket =
+            UtpSocket::new_with_opts(transport.clone(), env.clone(), Default::default()).unwrap();
+        let (tx, rx) = unbounded_channel();
+
+        let remote_syn = UtpHeader {
             htype: Type::ST_SYN,
-            connection_id,
-            timestamp_microseconds: 0,
-            timestamp_difference_microseconds: 0,
-            wnd_size: 0,
-            seq_nr: 0.into(),
-            ack_nr: 0.into(),
+            ..Default::default()
         };
 
-        let stream_args = StreamArgs::new_incoming(0.into(), &syn);
-        let (stream1, vsock1, ack) = UtpStream::new_internal(&sock1, ADDR_2, rx1, stream_args);
-        let ack = ack.unwrap();
+        let args = StreamArgs::new_incoming(100.into(), &remote_syn);
 
-        let (stream2, vsock2, None) = UtpStream::new_internal(
-            &sock2,
-            ADDR_2,
-            rx2,
-            StreamArgs::new_outgoing(&ack, env.now(), env.now()),
-        ) else {
-            panic!("did not expect first packet");
-        };
-
-        sock1dispatch
-            .streams
-            .insert((ADDR_2, connection_id), tx1.clone());
-        sock1dispatch
-            .streams
-            .insert((ADDR_2, connection_id + 1), tx1);
-
-        sock2dispatch
-            .streams
-            .insert((ADDR_2, connection_id), tx2.clone());
-        sock2dispatch
-            .streams
-            .insert((ADDR_2, connection_id + 1), tx2);
-
-        TestStreams {
-            interface,
-            s1: TestStream {
-                stream: stream1,
-                dispatcher: sock1dispatch,
-                vsock: vsock1,
-                ack_to_send: Some(ack),
-            },
-            s2: TestStream {
-                stream: stream2,
-                dispatcher: sock2dispatch,
-                vsock: vsock2,
-                ack_to_send: None,
-            },
+        let (stream, vsock, _) = UtpStream::new_internal(&socket, ADDR_2, rx, args);
+        TestVsock {
+            transport,
+            env,
+            socket,
+            vsock,
+            stream,
+            tx,
         }
     }
 
     #[tokio::test]
-    async fn test_create_2_vsocks() {
-        create_2_internal_vsockets();
+    async fn test_delayed_ack() {
+        setup_test_logging();
+
+        let mut t = make_test_vsock();
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 0);
+
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_DATA,
+                seq_nr: 1.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                ..Default::default()
+            },
+            "hello",
+        );
+        t.poll_once_assert_pending().await;
+        assert_eq!(&t.read_all_available().await.unwrap(), b"hello");
+        assert_eq!(t.take_sent().len(), 0);
+
+        t.env.increment_now(Duration::from_secs(1));
+        t.poll_once_assert_pending().await;
+        assert_eq!(&t.read_all_available().await.unwrap(), b"");
+
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_STATE);
+        assert_eq!(sent[0].header.ack_nr.0, 1);
     }
 }

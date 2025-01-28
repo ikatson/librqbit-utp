@@ -23,6 +23,17 @@ impl std::fmt::Debug for UtpMessage {
 }
 
 impl UtpMessage {
+    #[cfg(test)]
+    pub fn new_test(header: UtpHeader, payload: &[u8]) -> anyhow::Result<Self> {
+        let packet = Packet::new_test(payload.to_vec());
+        Ok(UtpMessage {
+            header,
+            payload_start: 0,
+            size: payload.len(),
+            data: packet,
+        })
+    }
+
     pub fn deserialize(packet: Packet, size: usize) -> Option<Self> {
         let mut packet = packet;
         let (header, hsize) = UtpHeader::deserialize(packet.get_mut())?;

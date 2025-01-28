@@ -44,14 +44,15 @@ impl MockUtpEnvironment {
             })),
         }
     }
+
+    pub fn increment_now(&self, dur: Duration) {
+        self.inner.lock().now += dur;
+    }
 }
 
 impl UtpEnvironment for MockUtpEnvironment {
     fn now(&self) -> Instant {
-        let mut g = self.inner.lock();
-        let ret = g.now;
-        g.now += Duration::from_millis(1);
-        ret
+        self.inner.lock().now
     }
 
     fn copy(&self) -> Self {

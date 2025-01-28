@@ -10,6 +10,15 @@ pub struct Packet {
 }
 
 impl Packet {
+    #[cfg(test)]
+    pub fn new_test(data: Vec<u8>) -> Self {
+        Self {
+            id: 0,
+            buf: data,
+            pool: Default::default(),
+        }
+    }
+
     fn return_to_pool(&mut self) {
         if let Some(pool) = self.pool.upgrade() {
             pool.return_packet(self);
