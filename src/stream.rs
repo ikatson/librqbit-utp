@@ -1507,6 +1507,7 @@ mod tests {
         io::{AsyncRead, AsyncWriteExt},
         sync::mpsc::{unbounded_channel, UnboundedSender},
     };
+    use tracing::trace;
 
     use crate::{
         message::UtpMessage,
@@ -1645,6 +1646,7 @@ mod tests {
         // Assert nothing else is sent later.
         t.env.increment_now(Duration::from_secs(1));
         t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
         assert_eq!(sent.len(), 0);
     }
 
@@ -1800,6 +1802,75 @@ mod tests {
         assert_eq!(
             resent[0].header.seq_nr, original_seq_nr,
             "Retransmitted packet should have same sequence number"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fast_retransmit() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+        t.vsock.socket_opts.max_payload_size = 5;
+
+        // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
+        t.vsock.rtte.force_timeout(Duration::from_secs(10));
+
+        let mut ack = UtpHeader {
+            htype: Type::ST_STATE,
+            seq_nr: 0.into(),
+            ack_nr: t.vsock.last_sent_seq_nr,
+            wnd_size: 1024,
+            ..Default::default()
+        };
+
+        // Allow sending by setting window size
+        t.send_msg(ack, "");
+
+        // Write enough data to generate multiple packets
+        t.stream.write_all(b"helloworld").await.unwrap();
+        t.poll_once_assert_pending().await;
+
+        // Should have sent the data
+        let sent = t.take_sent();
+        assert!(sent.len() >= 2, "Should have sent multiple packets");
+        assert_eq!(sent[0].payload(), b"hello");
+        assert_eq!(sent[1].payload(), b"world");
+
+        let first_seq_nr = sent[0].header.seq_nr;
+
+        // Simulate receiving duplicate ACKs (as if first packet was lost but later ones arrived)
+        ack.ack_nr = first_seq_nr;
+
+        // First ACK
+        t.send_msg(ack, "");
+
+        // First duplicate ACK
+        t.send_msg(ack, "");
+
+        // Second duplicate ACK
+        t.send_msg(ack, "");
+
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.vsock.local_rx_dup_acks, 2);
+        assert_eq!(t.take_sent().len(), 0, "Should not retransmit yet");
+
+        // Third duplicate ACK should trigger fast retransmit
+        t.send_msg(ack, "");
+
+        t.poll_once_assert_pending().await;
+        trace!("s");
+
+        // Should have retransmitted the first packet immediately
+        let resent = t.take_sent();
+        assert_eq!(resent.len(), 1, "Should have retransmitted second packet");
+        assert_eq!(
+            resent[0].header.seq_nr,
+            first_seq_nr + 1,
+            "Should have retransmitted first packet"
+        );
+        assert_eq!(
+            resent[0].payload(),
+            b"world",
+            "Should have retransmitted correct data"
         );
     }
 }

@@ -23,6 +23,9 @@ pub struct RttEstimator {
     timestamp: Option<(Instant, SeqNr)>,
     max_seq_sent: Option<SeqNr>,
     rto_count: u8,
+
+    #[cfg(test)]
+    forced_timeout: Option<Duration>,
 }
 
 impl Default for RttEstimator {
@@ -33,12 +36,25 @@ impl Default for RttEstimator {
             timestamp: None,
             max_seq_sent: None,
             rto_count: 0,
+
+            #[cfg(test)]
+            forced_timeout: None,
         }
     }
 }
 
 impl RttEstimator {
+    #[cfg(test)]
+    pub fn force_timeout(&mut self, duration: Duration) {
+        self.forced_timeout = Some(duration);
+    }
+
     pub fn retransmission_timeout(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(t) = self.forced_timeout {
+            return t;
+        }
+
         let margin = RTTE_MIN_MARGIN.max(self.deviation * 4);
         let ms = (self.rtt + margin).clamp(RTTE_MIN_RTO, RTTE_MAX_RTO);
         Duration::from_millis(ms as u64)
