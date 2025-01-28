@@ -1607,7 +1607,8 @@ mod tests {
 
         let args = StreamArgs::new_incoming(100.into(), &remote_syn);
 
-        let (stream, vsock, _) = UtpStream::new_internal(&socket, ADDR_2, rx, args);
+        let (stream, mut vsock, _) = UtpStream::new_internal(&socket, ADDR_2, rx, args);
+
         TestVsock {
             transport,
             env,
@@ -2137,5 +2138,91 @@ mod tests {
             Poll::Ready(result) => result.unwrap(),
             Poll::Pending => panic!("flush should have completed"),
         };
+    }
+
+    #[tokio::test]
+    async fn test_out_of_order_delivery() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+
+        // First allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Send packets out of order. Sequence should be:
+        // seq 1: "hello"
+        // seq 2: "world"
+        // seq 3: "test!"
+
+        // Send seq 2 first
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_DATA,
+                seq_nr: 2.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                ..Default::default()
+            },
+            "world",
+        );
+        t.poll_once_assert_pending().await;
+
+        // Nothing should be readable yet as we're missing seq 1
+        assert_eq!(&t.read_all_available().await.unwrap(), b"");
+
+        // We should get an immediate ACK due to out-of-order delivery
+        let acks = t.take_sent();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].header.get_type(), Type::ST_STATE);
+        assert_eq!(acks[0].header.ack_nr, 0.into());
+
+        // Send seq 3
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_DATA,
+                seq_nr: 3.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                ..Default::default()
+            },
+            "test!",
+        );
+        t.poll_once_assert_pending().await;
+
+        // Still nothing readable
+        assert_eq!(&t.read_all_available().await.unwrap(), b"");
+
+        // Another immediate ACK due to out-of-order
+        let acks = t.take_sent();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].header.get_type(), Type::ST_STATE);
+        assert_eq!(acks[0].header.ack_nr, 0.into());
+
+        // Finally send seq 1
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_DATA,
+                seq_nr: 1.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                ..Default::default()
+            },
+            "hello",
+        );
+        t.poll_once_assert_pending().await;
+
+        // Now we should get all the data in correct order
+        assert_eq!(&t.read_all_available().await.unwrap(), b"helloworldtest!");
+
+        // And a final ACK for the in-order delivery
+        let acks = t.take_sent();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].header.get_type(), Type::ST_STATE);
+        assert_eq!(acks[0].header.ack_nr.0, 3); // Should acknowledge up to last packet
     }
 }
