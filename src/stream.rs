@@ -2283,6 +2283,7 @@ mod tests {
                 htype: Type::ST_STATE,
                 seq_nr: 0.into(),
                 ack_nr: first_seq_nr,
+                wnd_size: 1024,
                 ..Default::default()
             },
             "",
