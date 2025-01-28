@@ -2,6 +2,7 @@ use std::{cmp::Ordering, future::Future, task::Waker};
 
 use anyhow::bail;
 use smoltcp::storage::RingBuffer;
+use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
 use tracing::Instrument;
 
 pub fn spawn_print_error(
@@ -87,6 +88,33 @@ pub fn fill_buffer_from_rb(
     }
 
     Ok(())
+}
+
+pub(crate) struct DropGuardSendBeforeDeath<Msg> {
+    msg: Option<Msg>,
+    tx: WeakUnboundedSender<Msg>,
+}
+
+impl<Msg> DropGuardSendBeforeDeath<Msg> {
+    pub fn new(msg: Msg, tx: &UnboundedSender<Msg>) -> Self {
+        Self {
+            msg: Some(msg),
+            tx: tx.downgrade(),
+        }
+    }
+    pub fn disarm(&mut self) {
+        self.msg = None;
+    }
+}
+
+impl<Msg> Drop for DropGuardSendBeforeDeath<Msg> {
+    fn drop(&mut self) {
+        if let Some(msg) = self.msg.take() {
+            if let Some(tx) = self.tx.upgrade() {
+                let _ = tx.send(msg);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

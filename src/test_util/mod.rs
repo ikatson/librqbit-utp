@@ -9,7 +9,7 @@ pub mod env;
 pub mod transport;
 
 pub type MockUtpSocket = UtpSocket<MockUtpTransport, MockUtpEnvironment>;
-pub type MockUtpStream = UtpStream<MockUtpTransport, MockUtpEnvironment>;
+pub type MockUtpStream = UtpStream;
 pub type MockDispatcher = Dispatcher<MockUtpTransport, MockUtpEnvironment>;
 
 pub fn setup_test_logging() {

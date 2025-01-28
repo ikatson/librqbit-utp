@@ -29,10 +29,12 @@ use crate::{
     raw::{Type, UtpHeader},
     rtte::RttEstimator,
     seq_nr::SeqNr,
-    socket::ValidatedSocketOpts,
+    socket::{ControlRequest, ValidatedSocketOpts},
     stream_tx::Tx,
     traits::{DefaultUtpEnvironment, Transport, UtpEnvironment},
-    utils::{fill_buffer_from_rb, spawn_print_error, update_optional_waker},
+    utils::{
+        fill_buffer_from_rb, spawn_print_error, update_optional_waker, DropGuardSendBeforeDeath,
+    },
     UtpSocket,
 };
 
@@ -203,6 +205,8 @@ struct VirtualSocket<T: Transport, Env: UtpEnvironment> {
     this_poll: ThisPoll,
 
     env: Env,
+
+    _drop_guard: DropGuardSendBeforeDeath<ControlRequest>,
 }
 
 // Updated on every poll
@@ -221,12 +225,14 @@ struct ThisPoll {
 impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     async fn run_forever(self, first_packet: Option<UtpHeader>) -> anyhow::Result<()> {
         if let Some(first_packet) = first_packet {
-            let sock = self.socket.upgrade().context("socket is dead")?;
             let mut buf = [0u8; UTP_HEADER_SIZE];
             first_packet
                 .serialize(&mut buf)
                 .context("bug: can't serialize header")?;
-            sock.transport
+            self.socket
+                .upgrade()
+                .context("socket dead")?
+                .transport
                 .send_to(&buf, self.remote)
                 .await
                 .context("error sending initial ACK")?;
@@ -860,6 +866,7 @@ struct WakeableRingBuffer {
 }
 
 impl WakeableRingBuffer {
+    // This will send FIN (if not yet).
     fn mark_stream_dead(&mut self) {
         self.dead = true;
         if let Some(waker) = self.buffer_no_longer_full.take() {
@@ -872,44 +879,23 @@ struct UserTx {
     locked: Mutex<WakeableRingBuffer>,
 }
 
-// When both writer and reader are dropped, this will close the stream.
-struct UtpStreamDropGuard<T: Transport, Env: UtpEnvironment> {
-    sock: Weak<UtpSocket<T, Env>>,
-    remote: SocketAddr,
-    id1: SeqNr,
-    id2: SeqNr,
-}
-
-impl<T: Transport, Env: UtpEnvironment> Drop for UtpStreamDropGuard<T, Env> {
-    fn drop(&mut self) {
-        if let Some(sock) = self.sock.upgrade() {
-            let addr = self.remote;
-            let id1 = self.id1;
-            let id2 = self.id2;
-            todo!()
-        }
-    }
-}
-
 impl<T: Transport, E: UtpEnvironment> Drop for VirtualSocket<T, E> {
     fn drop(&mut self) {
         self.user_tx.locked.lock().mark_stream_dead();
     }
 }
 
-pub struct UtpStreamReadHalf<T: Transport, Env: UtpEnvironment> {
-    _guard: Arc<UtpStreamDropGuard<T, Env>>,
+pub struct UtpStreamReadHalf {
     rx: UnboundedReceiver<UserRxMessage>,
     current: Option<UtpMessage>,
     offset: usize,
 }
 
-pub struct UtpStreamWriteHalf<T: Transport, Env: UtpEnvironment> {
-    _guard: Arc<UtpStreamDropGuard<T, Env>>,
+pub struct UtpStreamWriteHalf {
     user_tx: Arc<UserTx>,
 }
 
-impl<T: Transport, Env: UtpEnvironment> UtpStreamWriteHalf<T, Env> {
+impl UtpStreamWriteHalf {
     fn close(&mut self) {
         let mut g = self.user_tx.locked.lock();
         g.closed = true;
@@ -919,13 +905,13 @@ impl<T: Transport, Env: UtpEnvironment> UtpStreamWriteHalf<T, Env> {
     }
 }
 
-impl<T: Transport, Env: UtpEnvironment> Drop for UtpStreamWriteHalf<T, Env> {
+impl Drop for UtpStreamWriteHalf {
     fn drop(&mut self) {
         self.close();
     }
 }
 
-impl<T: Transport, Env: UtpEnvironment> AsyncRead for UtpStreamReadHalf<T, Env> {
+impl AsyncRead for UtpStreamReadHalf {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -967,7 +953,7 @@ impl<T: Transport, Env: UtpEnvironment> AsyncRead for UtpStreamReadHalf<T, Env> 
     }
 }
 
-impl<T: Transport, Env: UtpEnvironment> AsyncWrite for UtpStreamWriteHalf<T, Env> {
+impl AsyncWrite for UtpStreamWriteHalf {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1025,15 +1011,14 @@ impl<T: Transport, Env: UtpEnvironment> AsyncWrite for UtpStreamWriteHalf<T, Env
     }
 }
 
-pub type UtpStreamUdp = UtpStream<tokio::net::UdpSocket, DefaultUtpEnvironment>;
+pub type UtpStreamUdp = UtpStream;
 
-pub struct UtpStream<T: Transport, Env: UtpEnvironment> {
-    reader: UtpStreamReadHalf<T, Env>,
-    writer: UtpStreamWriteHalf<T, Env>,
-    _phantom: PhantomData<T>,
+pub struct UtpStream {
+    reader: UtpStreamReadHalf,
+    writer: UtpStreamWriteHalf,
 }
 
-impl<T: Transport, Env: UtpEnvironment> AsyncRead for UtpStream<T, Env> {
+impl AsyncRead for UtpStream {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1043,7 +1028,7 @@ impl<T: Transport, Env: UtpEnvironment> AsyncRead for UtpStream<T, Env> {
     }
 }
 
-impl<T: Transport, Env: UtpEnvironment> AsyncWrite for UtpStream<T, Env> {
+impl AsyncWrite for UtpStream {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1137,8 +1122,8 @@ impl StreamArgs {
     }
 }
 
-impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
-    pub(crate) fn new(
+impl UtpStream {
+    pub(crate) fn new<T: Transport, Env: UtpEnvironment>(
         socket: &Arc<UtpSocket<T, Env>>,
         remote: SocketAddr,
         rx: UnboundedReceiver<UtpMessage>,
@@ -1154,7 +1139,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
     }
 
     // Exposed for tests.
-    fn new_internal(
+    fn new_internal<T: Transport, Env: UtpEnvironment>(
         socket: &Arc<UtpSocket<T, Env>>,
         remote: SocketAddr,
         rx: UnboundedReceiver<UtpMessage>,
@@ -1186,22 +1171,13 @@ impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
             }),
         });
 
-        let guard = Arc::new(UtpStreamDropGuard {
-            sock: Arc::downgrade(socket),
-            remote,
-            id1: conn_id_recv,
-            id2: conn_id_send,
-        });
-
         let read_half = UtpStreamReadHalf {
-            _guard: guard.clone(),
             rx: user_rx_receiver,
             current: None,
             offset: 0,
         };
 
         let write_half = UtpStreamWriteHalf {
-            _guard: guard,
             user_tx: user_tx.clone(),
         };
 
@@ -1259,6 +1235,14 @@ impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
                 controller.set_mss(socket_opts.max_payload_size);
                 controller
             },
+            _drop_guard: DropGuardSendBeforeDeath::new(
+                ControlRequest::Shutdown {
+                    remote,
+                    conn_id_1: conn_id_send,
+                    conn_id_2: conn_id_recv,
+                },
+                &socket.control_requests,
+            ),
         };
 
         let first_packet = if !is_outgoing {
@@ -1273,7 +1257,6 @@ impl<T: Transport, Env: UtpEnvironment> UtpStream<T, Env> {
         let stream = Self {
             reader: read_half,
             writer: write_half,
-            _phantom: PhantomData,
         };
         (stream, vsock, first_packet)
     }

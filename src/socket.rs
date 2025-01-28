@@ -17,7 +17,7 @@ use crate::{
     seq_nr::SeqNr,
     stream::StreamArgs,
     traits::{DefaultUtpEnvironment, Transport, UtpEnvironment},
-    utils::spawn_print_error,
+    utils::{spawn_print_error, DropGuardSendBeforeDeath},
     UtpStream,
 };
 use anyhow::{bail, Context};
@@ -105,30 +105,8 @@ pub(crate) struct ValidatedSocketOpts {
     pub nagle: bool,
 }
 
-pub(crate) struct DropGuardSendBeforeDeath<Msg> {
-    pub msg: Option<Msg>,
-    pub tx: UnboundedSender<Msg>,
-}
-
-impl<Msg> DropGuardSendBeforeDeath<Msg> {
-    fn new(msg: Msg, tx: UnboundedSender<Msg>) -> Self {
-        Self { msg: Some(msg), tx }
-    }
-    fn disarm(&mut self) {
-        self.msg = None;
-    }
-}
-
-impl<Msg> Drop for DropGuardSendBeforeDeath<Msg> {
-    fn drop(&mut self) {
-        if let Some(msg) = self.msg.take() {
-            let _ = self.tx.send(msg);
-        }
-    }
-}
-
-pub(crate) enum ControlRequest<T: Transport, E: UtpEnvironment> {
-    ConnectRequest(SocketAddr, ConnectToken, oneshot::Sender<UtpStream<T, E>>),
+pub(crate) enum ControlRequest {
+    ConnectRequest(SocketAddr, ConnectToken, oneshot::Sender<UtpStream>),
     ConnectDropped(SocketAddr, ConnectToken),
 
     Shutdown {
@@ -141,35 +119,27 @@ pub(crate) enum ControlRequest<T: Transport, E: UtpEnvironment> {
 static NEXT_CONNECT_TOKEN: AtomicU64 = AtomicU64::new(0);
 type ConnectToken = u64;
 
-struct Connecting<T: Transport, E: UtpEnvironment> {
+struct Connecting {
     token: ConnectToken,
     start: Instant,
     seq_nr: SeqNr,
-    tx: oneshot::Sender<UtpStream<T, E>>,
+    tx: oneshot::Sender<UtpStream>,
 }
 
 const MAX_CONNECTING_PER_ADDR: usize = 4;
 
 #[derive(Default)]
-struct ConnectingPerAddr<T: Transport, E: UtpEnvironment> {
-    slots: [Option<Connecting<T, E>>; MAX_CONNECTING_PER_ADDR],
+struct ConnectingPerAddr {
+    slots: [Option<Connecting>; MAX_CONNECTING_PER_ADDR],
     len: usize,
 }
 
-impl<T: Transport, E: UtpEnvironment> ConnectingPerAddr<T, E> {
-    fn new() -> Self {
-        Self {
-            // Default() would propagate through all generics so I can't just write
-            // [None; MAX_CONNECTING_PER_ADDR]
-            slots: [None, None, None, None],
-            len: 0,
-        }
-    }
+impl ConnectingPerAddr {
     fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    fn insert(&mut self, c: Connecting<T, E>) -> bool {
+    fn insert(&mut self, c: Connecting) -> bool {
         for slot in self.slots.iter_mut() {
             if slot.is_none() {
                 *slot = Some(c);
@@ -179,7 +149,7 @@ impl<T: Transport, E: UtpEnvironment> ConnectingPerAddr<T, E> {
         }
         false
     }
-    fn pop(&mut self, s: SeqNr) -> Option<Connecting<T, E>> {
+    fn pop(&mut self, s: SeqNr) -> Option<Connecting> {
         for slot in self.slots.iter_mut() {
             if let Some(c) = slot {
                 if c.seq_nr == s {
@@ -191,7 +161,7 @@ impl<T: Transport, E: UtpEnvironment> ConnectingPerAddr<T, E> {
         None
     }
 
-    fn pop_by_token(&mut self, token: ConnectToken) -> Option<Connecting<T, E>> {
+    fn pop_by_token(&mut self, token: ConnectToken) -> Option<Connecting> {
         for slot in self.slots.iter_mut() {
             if let Some(c) = slot {
                 if c.token == token {
@@ -209,12 +179,12 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     env: E,
     socket: Arc<UtpSocket<T, E>>,
 
-    next_accept: Option<oneshot::Sender<UtpStream<T, E>>>,
-    accept_rx: UnboundedReceiver<oneshot::Sender<UtpStream<T, E>>>,
+    next_accept: Option<oneshot::Sender<UtpStream>>,
+    accept_rx: UnboundedReceiver<oneshot::Sender<UtpStream>>,
 
     pub(crate) streams: HashMap<Key, UnboundedSender<UtpMessage>>,
-    connecting: HashMap<SocketAddr, ConnectingPerAddr<T, E>>,
-    control_rx: UnboundedReceiver<ControlRequest<T, E>>,
+    connecting: HashMap<SocketAddr, ConnectingPerAddr>,
+    control_rx: UnboundedReceiver<ControlRequest>,
     next_connection_id: SeqNr,
 }
 
@@ -254,7 +224,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     // This would only block if the socket is full. It will block the dispatcher but it's a resonable tradeoff.
-    async fn on_control(&mut self, msg: ControlRequest<T, E>) -> anyhow::Result<()> {
+    async fn on_control(&mut self, msg: ControlRequest) -> anyhow::Result<()> {
         match msg {
             ControlRequest::ConnectRequest(addr, token, sender) => {
                 let conn_id = self.get_next_free_conn_id(addr);
@@ -284,7 +254,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 if self
                     .connecting
                     .entry(addr)
-                    .or_insert_with(|| ConnectingPerAddr::new())
+                    .or_insert_with(Default::default)
                     .insert(c)
                 {
                     self.next_connection_id += 2;
@@ -437,10 +407,10 @@ pub struct UtpSocket<T: Transport, E: UtpEnvironment> {
     pub(crate) transport: T,
     // When was the socket created. All the uTP "timestamp_microsends" are relative to it.
     pub(crate) created: Instant,
-    pub(crate) control_requests: UnboundedSender<ControlRequest<T, E>>,
+    pub(crate) control_requests: UnboundedSender<ControlRequest>,
     pub(crate) env: E,
 
-    accept_requests: UnboundedSender<oneshot::Sender<UtpStream<T, E>>>,
+    accept_requests: UnboundedSender<oneshot::Sender<UtpStream>>,
 
     local_addr: SocketAddr,
     opts: ValidatedSocketOpts,
@@ -516,35 +486,16 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     }
 
     #[tracing::instrument(name="utp_socket:accept", skip(self), fields(local=?self.local_addr))]
-    pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream<T, Env>> {
+    pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream> {
         let (tx, rx) = oneshot::channel();
         self.accept_requests.send(tx).context("dispatcher dead")?;
 
         let stream = rx.await.context("dispatcher dead")?;
         Ok(stream)
-
-        // let (header, addr) = rx.await.context("bug")?;
-
-        // let (tx, rx) = unbounded_channel();
-
-        // trace!(?addr, "accepted uTP connection");
-
-        // let conn_id_recv = header.connection_id.wrapping_add(1);
-        // let conn_id_send = header.connection_id;
-
-        // let stream_args = StreamArgs::new_incoming(self.env.random_u16().into(), &header);
-        // let stream = UtpStream::new(self, addr, rx, stream_args);
-
-        // self.streams.insert((addr, conn_id_recv), tx.clone());
-        // self.streams.insert((addr, conn_id_send), tx);
-        // Ok(stream)
     }
 
     #[tracing::instrument(name="utp_socket:connect", skip(self), fields(local=?self.local_addr))]
-    pub async fn connect(
-        self: &Arc<Self>,
-        remote: SocketAddr,
-    ) -> anyhow::Result<UtpStream<T, Env>> {
+    pub async fn connect(self: &Arc<Self>, remote: SocketAddr) -> anyhow::Result<UtpStream> {
         let (tx, rx) = oneshot::channel();
         let token = NEXT_CONNECT_TOKEN.fetch_add(1, Ordering::Relaxed);
         self.control_requests
@@ -553,7 +504,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 
         let mut guard = DropGuardSendBeforeDeath::new(
             ControlRequest::ConnectDropped(remote, token),
-            self.control_requests.clone(),
+            &self.control_requests,
         );
 
         let stream = rx.await.context("dispatcher dead")?;
