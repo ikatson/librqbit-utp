@@ -1553,7 +1553,13 @@ mod tests {
                     match s.as_mut().poll_read(cx, &mut rb) {
                         Poll::Ready(Ok(())) => continue,
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => return Poll::Ready(Ok(buf)),
+                        Poll::Pending => {
+                            return Poll::Ready(Ok({
+                                let filled = rb.filled().len();
+                                buf.truncate(filled);
+                                buf
+                            }))
+                        }
                     }
                 }
             })
