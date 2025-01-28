@@ -203,6 +203,7 @@ struct VirtualSocket<T: Transport, Env: UtpEnvironment> {
     env: Env,
 
     _drop_guard: DropGuardSendBeforeDeath<ControlRequest>,
+    parent_span: Option<tracing::Span>,
 }
 
 // Updated on every poll
@@ -1064,6 +1065,8 @@ pub struct StreamArgs {
     remote_window: u32,
 
     is_outgoing: bool,
+
+    parent_span: Option<tracing::Span>,
 }
 
 impl StreamArgs {
@@ -1093,6 +1096,8 @@ impl StreamArgs {
             ack_received_ts: Some(ack_received_ts),
 
             is_outgoing: true,
+
+            parent_span: None,
         }
     }
 
@@ -1114,7 +1119,13 @@ impl StreamArgs {
             ack_received_ts: None,
 
             is_outgoing: false,
+            parent_span: None,
         }
+    }
+
+    pub fn with_parent_span(mut self, parent_span: tracing::Span) -> Self {
+        self.parent_span = Some(parent_span);
+        self
     }
 }
 
@@ -1127,10 +1138,12 @@ impl UtpStream {
     ) -> Self {
         let (stream, vsock, first_packet) = Self::new_internal(socket, remote, rx, args);
 
-        spawn_print_error(
-            error_span!("utp_stream", conn_id_send = ?vsock.conn_id_send),
-            vsock.run_forever(first_packet),
-        );
+        let span = match vsock.parent_span.clone() {
+            Some(s) => error_span!(parent: s, "utp_stream", conn_id_send = ?vsock.conn_id_send),
+            None => error_span!(parent: None, "utp_stream", conn_id_send = ?vsock.conn_id_send),
+        };
+
+        spawn_print_error(span, vsock.run_forever(first_packet));
         stream
     }
 
@@ -1153,6 +1166,7 @@ impl UtpStream {
             ack_received_ts,
             remote_window,
             is_outgoing,
+            parent_span,
         } = args;
 
         let (user_rx_sender, user_rx_receiver) = unbounded_channel();
@@ -1231,6 +1245,7 @@ impl UtpStream {
                 controller.set_mss(socket_opts.max_payload_size);
                 controller
             },
+            parent_span,
             _drop_guard: DropGuardSendBeforeDeath::new(
                 ControlRequest::Shutdown {
                     remote,

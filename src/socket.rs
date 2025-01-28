@@ -105,7 +105,19 @@ pub(crate) struct ValidatedSocketOpts {
     pub nagle: bool,
 }
 
-pub type StreamRequester = oneshot::Sender<UtpStream>;
+pub(crate) struct StreamRequester {
+    created_span: tracing::Span,
+    tx: oneshot::Sender<UtpStream>,
+}
+
+impl StreamRequester {
+    fn new(tx: oneshot::Sender<UtpStream>) -> Self {
+        Self {
+            created_span: tracing::Span::current(),
+            tx,
+        }
+    }
+}
 
 pub(crate) enum ControlRequest {
     ConnectRequest(SocketAddr, ConnectToken, StreamRequester),
@@ -145,7 +157,7 @@ struct Connecting {
     token: ConnectToken,
     start: Instant,
     seq_nr: SeqNr,
-    tx: StreamRequester,
+    requester: StreamRequester,
 }
 
 const MAX_CONNECTING_PER_ADDR: usize = 4;
@@ -341,7 +353,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 let c = Connecting {
                     token,
                     seq_nr: header.seq_nr,
-                    tx: sender,
+                    requester: sender,
                     start: self.env.now(),
                 };
                 if self.connecting.entry(addr).or_default().insert(c) {
@@ -394,7 +406,8 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
         let now = self.env.now();
         let (tx, rx) = unbounded_channel();
-        let args = StreamArgs::new_outgoing(&msg.header, conn.start, now);
+        let args = StreamArgs::new_outgoing(&msg.header, conn.start, now)
+            .with_parent_span(conn.requester.created_span.clone());
 
         let stream = UtpStream::new(&self.socket, addr, rx, args);
         let key1 = (addr, conn.seq_nr);
@@ -406,7 +419,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             return Ok(());
         }
 
-        if conn.tx.send(stream).is_ok() {
+        if conn.requester.tx.send(stream).is_ok() {
             self.streams.insert(key1, tx.clone());
             self.streams.insert(key2, tx);
         } else {
@@ -424,11 +437,12 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             return MatchSynWithAccept::SynInvalid(accept);
         }
 
-        let args = StreamArgs::new_incoming(self.env.random_u16().into(), &syn.header);
+        let args = StreamArgs::new_incoming(self.env.random_u16().into(), &syn.header)
+            .with_parent_span(accept.created_span.clone());
         let (tx, rx) = unbounded_channel();
         let stream = UtpStream::new(&self.socket, syn.remote, rx, args);
 
-        if accept.send(stream).is_ok() {
+        if accept.tx.send(stream).is_ok() {
             self.streams.insert(key1, tx.clone());
             self.streams.insert(key2, tx);
             MatchSynWithAccept::Matched
@@ -600,7 +614,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream> {
         let (tx, rx) = oneshot::channel();
         self.accept_requests
-            .send(tx)
+            .send(StreamRequester::new(tx))
             .await
             .context("dispatcher dead")?;
 
@@ -613,7 +627,11 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let (tx, rx) = oneshot::channel();
         let token = NEXT_CONNECT_TOKEN.fetch_add(1, Ordering::Relaxed);
         self.control_requests
-            .send(ControlRequest::ConnectRequest(remote, token, tx))
+            .send(ControlRequest::ConnectRequest(
+                remote,
+                token,
+                StreamRequester::new(tx),
+            ))
             .context("dispatcher dead")?;
 
         let mut guard = DropGuardSendBeforeDeath::new(
