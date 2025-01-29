@@ -1,3 +1,4 @@
+mod cubic;
 pub mod reno;
 
 use std::time::Instant;
@@ -18,7 +19,7 @@ pub trait Controller {
 
     fn on_duplicate_ack(&mut self, now: Instant) {}
 
-    // fn pre_transmit(&mut self, now: Instant) {}
+    fn pre_transmit(&mut self, now: Instant) {}
 
     // fn post_transmit(&mut self, now: Instant, len: usize) {}
 

@@ -330,6 +330,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         let mut last_sent = None;
+        self.congestion_controller.pre_transmit(self.this_poll.now);
         let mut recv_wnd = self.effective_remote_receive_window();
 
         // Send only the stuff we haven't sent yet, up to sender's window.
@@ -582,6 +583,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         let mut remaining = g.buffer.len() - tx_offset;
+        self.congestion_controller.pre_transmit(self.this_poll.now);
         let mut remote_window_remaining = self
             .effective_remote_receive_window()
             .saturating_sub(self.tx.total_len_bytes());
