@@ -182,7 +182,7 @@ struct VirtualSocket<T: Transport, Env: UtpEnvironment> {
     last_sent_seq_nr: SeqNr,
 
     // Last remote sequence number that we fully processed.
-    last_consumed_ack_nr: SeqNr,
+    last_consumed_remote_seq_nr: SeqNr,
 
     // Last ACK that we sent out. This is different from "ack_nr" because we don't ACK
     // every packet. This must be <= ack_nr.
@@ -269,7 +269,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .timestamp_microseconds
             .wrapping_sub(self.last_remote_timestamp);
         header.seq_nr = self.last_sent_seq_nr;
-        header.ack_nr = self.last_consumed_ack_nr;
+        header.ack_nr = self.last_consumed_remote_seq_nr;
         header.wnd_size = self.rx_window();
         header
     }
@@ -282,7 +282,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         header.timestamp_difference_microseconds = header
             .timestamp_microseconds
             .wrapping_sub(self.last_remote_timestamp);
-        header.ack_nr = self.last_consumed_ack_nr;
+        header.ack_nr = self.last_consumed_remote_seq_nr;
         header.wnd_size = self.rx_window();
         header
     }
@@ -703,49 +703,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.congestion_controller
             .on_ack(self.this_poll.now, removed_bytes, &self.rtte);
 
-        // Fast retransmit in case of duplicate ACKs
-        match self.local_rx_last_ack {
-            // Duplicate ACK if payload empty and ACK doesn't move send window ->
-            // Increment duplicate ACK count and set for retransmit if we just received
-            // the third duplicate ACK
-            Some(last_rx_ack)
-                if last_rx_ack == msg.header.ack_nr
-                    && self.last_sent_seq_nr > msg.header.ack_nr
-                    && !is_window_update =>
-            {
-                // Increment duplicate ACK count
-                self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
-
-                // Inform congestion controller of duplicate ACK
-                self.congestion_controller
-                    .on_duplicate_ack(self.this_poll.now);
-
-                debug!(
-                    "received duplicate ACK for seq {} (duplicate nr {}{})",
-                    msg.header.ack_nr,
-                    self.local_rx_dup_acks,
-                    if self.local_rx_dup_acks == u8::MAX {
-                        "+"
-                    } else {
-                        ""
-                    }
-                );
-
-                if self.local_rx_dup_acks == 3 {
-                    self.timers.kind.set_for_fast_retransmit();
-                    debug!("started fast retransmit");
-                }
-            }
-            // No duplicate ACK -> Reset state and update last received ACK
-            _ => {
-                if self.local_rx_dup_acks > 0 {
-                    self.local_rx_dup_acks = 0;
-                    trace!("reset duplicate ACK count");
-                }
-                self.local_rx_last_ack = Some(msg.header.ack_nr);
-            }
-        };
-
         let ack_all = msg.header.ack_nr == self.last_sent_ack_nr;
         if !self.timers.kind.is_retransmit() || ack_all {
             self.timers.kind.set_for_idle();
@@ -757,10 +714,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                 let msg_seq_nr = msg.header.seq_nr;
 
-                let offset = msg_seq_nr - (self.last_consumed_ack_nr + 1);
+                let offset = msg_seq_nr - (self.last_consumed_remote_seq_nr + 1);
                 if offset < 0 {
                     trace!(
-                        %self.last_consumed_ack_nr,
+                        %self.last_consumed_remote_seq_nr,
                         "dropping message, we already ACKed it"
                     );
                     self.send_challenge_ack(cx, socket)?;
@@ -769,7 +726,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                 trace!(
                     offset,
-                    %self.last_consumed_ack_nr,
+                    %self.last_consumed_remote_seq_nr,
                     "adding ST_DATA message to assember"
                 );
 
@@ -785,7 +742,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                             trace!(asm = %self.assembler.debug_string(), "out of order");
                         }
 
-                        self.last_consumed_ack_nr += count as u16;
+                        self.last_consumed_remote_seq_nr += count as u16;
                     }
                     Err(_) => {
                         trace!("cannot reassemble message, dropping");
@@ -831,7 +788,51 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
                 Ok(())
             }
-            Type::ST_STATE => Ok(()),
+            Type::ST_STATE => {
+                // Fast retransmit in case of duplicate ACKs
+                match self.local_rx_last_ack {
+                    // Duplicate ACK if payload empty and ACK doesn't move send window ->
+                    // Increment duplicate ACK count and set for retransmit if we just received
+                    // the third duplicate ACK
+                    Some(last_rx_ack)
+                        if last_rx_ack == msg.header.ack_nr
+                            && self.last_sent_seq_nr > msg.header.ack_nr
+                            && !is_window_update =>
+                    {
+                        // Increment duplicate ACK count
+                        self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
+
+                        // Inform congestion controller of duplicate ACK
+                        self.congestion_controller
+                            .on_duplicate_ack(self.this_poll.now);
+
+                        debug!(
+                            "received duplicate ACK for seq {} (duplicate nr {}{})",
+                            msg.header.ack_nr,
+                            self.local_rx_dup_acks,
+                            if self.local_rx_dup_acks == u8::MAX {
+                                "+"
+                            } else {
+                                ""
+                            }
+                        );
+
+                        if self.local_rx_dup_acks == 3 {
+                            self.timers.kind.set_for_fast_retransmit();
+                            debug!("started fast retransmit");
+                        }
+                    }
+                    // No duplicate ACK -> Reset state and update last received ACK
+                    _ => {
+                        if self.local_rx_dup_acks > 0 {
+                            self.local_rx_dup_acks = 0;
+                            trace!("reset duplicate ACK count");
+                        }
+                        self.local_rx_last_ack = Some(msg.header.ack_nr);
+                    }
+                };
+                Ok(())
+            }
             Type::ST_RESET => bail!("ST_RESET received"),
             Type::ST_FIN => {
                 // acknowledge the remote FIN.
@@ -862,11 +863,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     /// byte of new data. For details, see
     /// <https://elixir.bootlin.com/linux/v6.11.4/source/net/ipv4/tcp_input.c#L5747>.
     fn immediate_ack_to_transmit(&self) -> bool {
-        self.last_consumed_ack_nr - self.last_sent_ack_nr >= IMMEDIATE_ACK_EVERY
+        self.last_consumed_remote_seq_nr - self.last_sent_ack_nr >= IMMEDIATE_ACK_EVERY
     }
 
     fn ack_to_transmit(&self) -> bool {
-        self.last_consumed_ack_nr > self.last_sent_ack_nr
+        self.last_consumed_remote_seq_nr > self.last_sent_ack_nr
     }
 
     fn delayed_ack_expired(&self) -> bool {
@@ -1308,7 +1309,7 @@ impl UtpStream {
             last_remote_window: remote_window,
             next_seq_nr,
             last_sent_seq_nr,
-            last_consumed_ack_nr,
+            last_consumed_remote_seq_nr: last_consumed_ack_nr,
             last_sent_ack_nr,
             rx,
             tx: Tx::new(),
@@ -2855,11 +2856,12 @@ mod tests {
         assert!(sent.len() == 2, "Should have sent 2 packets");
         assert_eq!(sent[0].payload(), b"hello");
         assert_eq!(sent[1].payload(), b"world");
+        assert_eq!(t.vsock.tx.total_len_packets(), 2);
 
         let first_seq_nr = sent[0].header.seq_nr;
 
         // Send three duplicate ACKs using different packet types
-        let mut ack = UtpHeader {
+        let mut header = UtpHeader {
             htype: Type::ST_STATE,
             seq_nr: 0.into(),
             ack_nr: first_seq_nr,
@@ -2868,34 +2870,48 @@ mod tests {
         };
 
         // First normal ST_STATE ACK
-        t.send_msg(ack, "");
+        t.send_msg(header, "");
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.vsock.local_rx_dup_acks, 0);
+        assert_eq!(t.vsock.tx.total_len_packets(), 1);
 
         // Change to ST_DATA with same ACK - shouldn't count as duplicate
-        ack.htype = Type::ST_DATA;
-        t.send_msg(ack, "a");
+        header.htype = Type::ST_DATA;
+        header.seq_nr += 1;
+        t.send_msg(header, "a");
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.vsock.local_rx_dup_acks, 0);
+        assert_eq!(t.vsock.tx.total_len_packets(), 1);
 
         // Another ST_DATA - shouldn't count
-        t.send_msg(ack, "b");
+        header.seq_nr += 1;
+        t.send_msg(header, "b");
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.vsock.local_rx_dup_acks, 0);
+        assert_eq!(t.vsock.tx.total_len_packets(), 1);
 
         // ST_FIN with same ACK - shouldn't count
-        ack.htype = Type::ST_FIN;
-        t.send_msg(ack, "c");
+        header.htype = Type::ST_FIN;
+        header.seq_nr += 1;
+        t.send_msg(header, "");
 
         t.poll_once_assert_pending().await;
 
         // Duplicate ACK count should be 0 since non-ST_STATE packets don't count
         assert_eq!(t.vsock.local_rx_dup_acks, 0);
+        assert_eq!(t.vsock.tx.total_len_packets(), 1);
+        let sent = t.take_sent();
         assert_eq!(
-            t.take_sent().len(),
+            sent.len(),
             0,
-            "Should not have triggered fast retransmit"
+            "Should not have sent anything, but sent this: {sent:?}"
         );
 
         // Now send three ST_STATE duplicates
-        ack.htype = Type::ST_STATE;
-        t.send_msg(ack, "");
-        t.send_msg(ack, "");
-        t.send_msg(ack, "");
+        header.htype = Type::ST_STATE;
+        t.send_msg(header, "");
+        t.send_msg(header, "");
+        t.send_msg(header, "");
 
         t.poll_once_assert_pending().await;
 
