@@ -6,7 +6,7 @@ use std::{
         Arc,
     },
     task::Poll,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -309,7 +309,13 @@ async fn recv_from(
     pool: &PacketPool,
     transport: &impl Transport,
 ) -> anyhow::Result<(SocketAddr, Packet, usize)> {
+    let start = Instant::now();
+    const LOG_DURATION: Duration = Duration::from_millis(100);
     let mut packet = pool.get().await;
+    let elapsed = start.elapsed();
+    if elapsed > LOG_DURATION {
+        warn!(?elapsed, "packet pool took too long to give a packet");
+    }
     let buf = packet.get_mut();
     let (size, addr) = transport.recv_from(buf).await.context("error receiving")?;
     Ok((addr, packet, size))
