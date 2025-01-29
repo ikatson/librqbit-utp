@@ -1549,7 +1549,7 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
 
             match this.next_poll_send_to_at() {
                 PollAt::Now => {
-                    trace!(?this.timers.kind, ?this.timers.ack_delay_timer, this.ack_to_transmit=?this.ack_to_transmit(), "need to repoll");
+                    trace!("need to repoll");
                     continue;
                 }
                 PollAt::Time(instant) => {
