@@ -70,12 +70,12 @@ impl CongestionController for Cubic {
 
     fn pre_transmit(&mut self, now: Instant) {
         let Some(recovery_start) = self.recovery_start else {
-            self.recovery_start = Some(now);
+            // self.recovery_start = Some(now);
             return;
         };
 
         // If the last update was less than 100ms ago, don't update the congestion window.
-        if self.last_update > recovery_start && (now - self.last_update).as_millis() < 100 {
+        if self.last_update >= recovery_start && (now - self.last_update).as_millis() < 100 {
             return;
         }
 

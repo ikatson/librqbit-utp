@@ -67,6 +67,8 @@ impl CongestionController for Reno {
             self.rwnd = remote_window;
         }
     }
+
+    fn pre_transmit(&mut self, _now: Instant) {}
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ use tracing::{debug, error_span, trace, warn};
 
 use crate::{
     assembled_rx::AssembledRx,
-    congestion::{cubic::Cubic, reno::Reno, CongestionController},
+    congestion::{cubic::Cubic, tracing::TracingController, CongestionController},
     constants::{ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, UTP_HEADER_SIZE},
     message::UtpMessage,
     raw::{Type, UtpHeader},
@@ -1363,6 +1363,8 @@ impl UtpStream {
                 let mut controller = Cubic::new(now);
                 controller.set_mss(socket_opts.max_outgoing_payload_size);
 
+                let controller = TracingController::new(controller);
+
                 Box::new(controller)
             },
             parent_span,
@@ -1622,7 +1624,6 @@ mod tests {
     use tracing::trace;
 
     use crate::{
-        congestion::CongestionController,
         message::UtpMessage,
         raw::{Type, UtpHeader},
         stream::VirtualSocketState,
@@ -2752,6 +2753,7 @@ mod tests {
             },
             "",
         );
+        t.env.increment_now(Duration::from_secs(1));
         t.poll_once_assert_pending().await;
 
         let initial_window = t.vsock.congestion_controller.window();
@@ -2769,6 +2771,8 @@ mod tests {
             .write_all(&big_data)
             .await
             .unwrap();
+
+        t.env.increment_now(Duration::from_secs(1));
         t.poll_once_assert_pending().await;
 
         assert_eq!(
@@ -2799,6 +2803,7 @@ mod tests {
                 "",
             );
         }
+        t.env.increment_now(Duration::from_secs(1));
         t.poll_once_assert_pending().await;
 
         let intermediate_window = t.vsock.congestion_controller.window();
@@ -2829,6 +2834,7 @@ mod tests {
                 "",
             );
         }
+        t.env.increment_now(Duration::from_secs(1));
         t.poll_once_assert_pending().await;
 
         // Should trigger fast retransmit
