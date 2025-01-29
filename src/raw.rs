@@ -1,6 +1,8 @@
 pub mod ext_close_reason;
+pub mod selective_ack;
 
 use anyhow::{bail, Context};
+
 use tracing::{debug, trace};
 
 use crate::{constants::UTP_HEADER_SIZE, seq_nr::SeqNr};

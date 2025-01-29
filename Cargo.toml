@@ -17,6 +17,7 @@ rand = "0.8.5"
 tracing = "0.1.41"
 parking_lot = "0.12.3"
 mtu = "0.2.4"
+bitvec = "1.0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
