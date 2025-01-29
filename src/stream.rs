@@ -2952,6 +2952,7 @@ mod tests {
         t.send_msg(header, "");
         t.poll_once_assert_pending().await;
         assert_eq!(t.take_sent().len(), 0);
+        assert_eq!(t.vsock.tx.total_len_packets(), 1);
 
         // Now send the FIN
         header.set_type(Type::ST_FIN);
@@ -2963,11 +2964,18 @@ mod tests {
             0,
             "the FIN should not be acked until all our queue gets ACKed send all the data"
         );
+        assert_eq!(t.vsock.tx.total_len_packets(), 1);
 
         // Ensure nothing gets sent until we ack the second header.
         header.set_type(Type::ST_STATE);
         header.ack_nr += 1;
+        t.send_msg(header, "");
         t.poll_once_assert_pending().await;
+        assert_eq!(
+            t.vsock.tx.total_len_packets(),
+            0,
+            "TX queue should have cleared"
+        );
         let sent = t.take_sent();
         assert_eq!(
             sent.len(),
