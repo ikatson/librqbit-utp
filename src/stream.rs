@@ -2819,4 +2819,94 @@ mod tests {
             "Window should decrease or stay same after timeout"
         );
     }
+
+    #[tokio::test]
+    async fn test_duplicate_ack_only_on_st_state() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+        t.vsock.socket_opts.max_outgoing_payload_size = 5;
+
+        // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
+        t.vsock.rtte.force_timeout(Duration::from_secs(10));
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Write enough data to generate multiple packets
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(b"helloworld")
+            .await
+            .unwrap();
+        t.poll_once_assert_pending().await;
+
+        // Should have sent the data
+        let sent = t.take_sent();
+        assert!(sent.len() == 2, "Should have sent 2 packets");
+        assert_eq!(sent[0].payload(), b"hello");
+        assert_eq!(sent[1].payload(), b"world");
+
+        let first_seq_nr = sent[0].header.seq_nr;
+
+        // Send three duplicate ACKs using different packet types
+        let mut ack = UtpHeader {
+            htype: Type::ST_STATE,
+            seq_nr: 0.into(),
+            ack_nr: first_seq_nr,
+            wnd_size: 1024,
+            ..Default::default()
+        };
+
+        // First normal ST_STATE ACK
+        t.send_msg(ack, "");
+
+        // Change to ST_DATA with same ACK - shouldn't count as duplicate
+        ack.htype = Type::ST_DATA;
+        t.send_msg(ack, "a");
+
+        // Another ST_DATA - shouldn't count
+        t.send_msg(ack, "b");
+
+        // ST_FIN with same ACK - shouldn't count
+        ack.htype = Type::ST_FIN;
+        t.send_msg(ack, "c");
+
+        t.poll_once_assert_pending().await;
+
+        // Duplicate ACK count should be 0 since non-ST_STATE packets don't count
+        assert_eq!(t.vsock.local_rx_dup_acks, 0);
+        assert_eq!(
+            t.take_sent().len(),
+            0,
+            "Should not have triggered fast retransmit"
+        );
+
+        // Now send three ST_STATE duplicates
+        ack.htype = Type::ST_STATE;
+        t.send_msg(ack, "");
+        t.send_msg(ack, "");
+        t.send_msg(ack, "");
+
+        t.poll_once_assert_pending().await;
+
+        // Now we should see duplicate ACKs counted and fast retransmit triggered
+        assert_eq!(t.vsock.local_rx_dup_acks, 3);
+        let resent = t.take_sent();
+        assert_eq!(resent.len(), 1, "Should have triggered fast retransmit");
+        assert_eq!(
+            resent[0].header.seq_nr,
+            first_seq_nr + 1,
+            "Should have retransmitted correct packet"
+        );
+    }
 }
