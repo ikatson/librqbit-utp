@@ -311,7 +311,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn rx_window(&self) -> u32 {
-        self.assembler.window() as u32
+        (self.user_rx_sender.capacity() * self.socket_opts.max_user_rx_buffered_packets) as u32
     }
 
     // Returns true if UDP socket is full
@@ -1317,10 +1317,7 @@ impl UtpStream {
             socket_created: socket.created,
             socket_opts: *socket_opts,
             remote,
-            assembler: AssembledRx::new(
-                socket_opts.virtual_socket_tx_packets,
-                socket_opts.max_incoming_packet_size,
-            ),
+            assembler: AssembledRx::new(socket_opts.max_rx_out_of_order_packets),
             conn_id_send,
             timers: Timers {
                 kind: TimerKind::new(),

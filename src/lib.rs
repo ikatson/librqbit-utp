@@ -12,17 +12,15 @@
 // TODO: Initial SYN - keep resending it with increasing delay. This would require refactoring SYN
 // into the VirtualSocket state machine (like smoltcp), cause otherwise it'll get nasty.
 //
-// TODO: packet pool is inefficient as:
-// - the packet sizes vary greatly
-// - detecting MTU might work only for outgoing hosts, but not for incoming hosts
+// TODO: remove smoltcp dependency. copy-paste assembler and wring buffer or write our own.
 //
-// TODO: memory management. Think about a data structure that will let the UDP incoming packet
-// get written straight out to use Rx buffer.
-
 // TODO: LEDBAT congestion control
 //
 // TODO: extensions
 // - selective ACKs
+//
+// TODO: memory management. Think about a data structure that will let the UDP incoming packet
+// get written straight out to use Rx buffer.//
 //
 // TODO: built-in connection timeouts?
 

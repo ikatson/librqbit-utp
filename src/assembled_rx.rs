@@ -8,26 +8,14 @@ use crate::{message::UtpMessage, stream::UserRxMessage};
 pub struct AssembledRx {
     assembler: Assembler,
     rx: RingBuffer<'static, UtpMessage>,
-    max_payload_size: usize,
 }
 
 impl AssembledRx {
-    pub fn new(tx_buf_len: usize, max_payload_size: usize) -> Self {
+    pub fn new(tx_buf_len: usize) -> Self {
         Self {
             assembler: Assembler::new(),
             rx: RingBuffer::new(vec![Default::default(); tx_buf_len]),
-            max_payload_size,
         }
-    }
-
-    fn unacked_packets(&self) -> usize {
-        self.assembler.iter_data(0).map(|(s, e)| e - s).sum()
-    }
-
-    pub fn window(&self) -> usize {
-        let unacked = self.unacked_packets();
-        assert!(unacked <= self.rx.capacity());
-        (self.rx.capacity() - unacked) * self.max_payload_size
     }
 
     pub fn is_empty(&self) -> bool {

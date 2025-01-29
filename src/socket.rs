@@ -53,7 +53,7 @@ pub struct SocketOpts {
     pub rx_bufsize_approx: Option<usize>,
 
     // How many out-of-order packets to track in the RX window.
-    pub tx_packets: Option<usize>,
+    pub max_rx_out_of_order_packets: Option<usize>,
 
     // How many bytes to allocate for each virtual socket's TX.
     pub tx_bytes: Option<usize>,
@@ -123,8 +123,8 @@ impl SocketOpts {
             bail!("max_user_rx_buffered_packets = 0. Increase rx_bufsize_approx, or decrease MTU")
         }
 
-        let virtual_socket_tx_packets = self.tx_packets.unwrap_or(64);
-        if virtual_socket_tx_packets == 0 {
+        let max_rx_out_of_order_packets = self.max_rx_out_of_order_packets.unwrap_or(64);
+        if max_rx_out_of_order_packets == 0 {
             bail!("invalid configuration: virtual_socket_tx_packets = 0");
         }
         let virtual_socket_tx_bytes = self.tx_bytes.unwrap_or(1024 * 1024);
@@ -136,7 +136,7 @@ impl SocketOpts {
             max_incoming_packet_size: incoming.max_packet_size,
             max_outgoing_payload_size: outgoing.max_payload_size,
             max_user_rx_buffered_packets,
-            virtual_socket_tx_packets,
+            max_rx_out_of_order_packets,
             virtual_socket_tx_bytes,
             nagle: !self.disable_nagle,
         })
@@ -150,7 +150,7 @@ pub(crate) struct ValidatedSocketOpts {
 
     pub max_user_rx_buffered_packets: usize,
 
-    pub virtual_socket_tx_packets: usize,
+    pub max_rx_out_of_order_packets: usize,
     pub virtual_socket_tx_bytes: usize,
 
     pub nagle: bool,
