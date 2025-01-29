@@ -974,7 +974,16 @@ impl AsyncRead for UtpStreamReadHalf {
             if let Some(current) = this.current.as_ref() {
                 let payload = &current.payload()[this.offset..];
                 let len = buf.remaining().min(payload.len());
+
                 assert!(len > 0);
+                trace!(
+                    seq_nr = ?current.header.seq_nr,
+                    offset = this.offset,
+                    len,
+                    payload_len = current.payload().len(),
+                    "reading from UtpMessage to user"
+                );
+
                 buf.put_slice(&payload[..len]);
                 this.offset += len;
                 if this.offset == current.payload().len() {
