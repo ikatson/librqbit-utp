@@ -836,10 +836,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             Type::ST_RESET => bail!("ST_RESET received"),
             Type::ST_FIN => {
                 // acknowledge the remote FIN.
-                let mut ack = self.outgoing_header();
-                ack.ack_nr = msg.header.seq_nr;
+                // let mut ack = self.outgoing_header();
+                // ack.ack_nr = msg.header.seq_nr;
 
-                self.send_control_packet(cx, socket, ack)?;
+                // self.send_control_packet(cx, socket, ack)?;
                 let _ = self.user_rx_sender.send(UserRxMessage::Eof);
                 Ok(())
             }
@@ -995,31 +995,7 @@ impl AsyncRead for UtpStreamReadHalf {
             }
 
             let msg = match this.rx.poll_recv(cx) {
-                Poll::Ready(Some(UserRxMessage::UtpMessage(msg))) => {
-                    let mut w = std::io::BufWriter::new(
-                        std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open("/tmp/debugdata")
-                            .unwrap(),
-                    );
-                    use std::io::Write;
-                    writeln!(
-                        &mut w,
-                        "{:#?}, payload_len={}",
-                        msg.header,
-                        msg.payload().len()
-                    )
-                    .unwrap();
-                    for chunk in msg.payload().chunks(50) {
-                        for byte in chunk {
-                            write!(&mut w, "{:02x} ", *byte).unwrap();
-                        }
-                        writeln!(&mut w, "").unwrap();
-                    }
-
-                    msg
-                }
+                Poll::Ready(Some(UserRxMessage::UtpMessage(msg))) => msg,
                 Poll::Ready(Some(UserRxMessage::Error(msg))) => {
                     return Poll::Ready(Err(std::io::Error::other(msg)))
                 }
@@ -2923,6 +2899,80 @@ mod tests {
             resent[0].header.seq_nr,
             first_seq_nr + 1,
             "Should have retransmitted correct packet"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finack_not_sent_until_all_data_sent() {
+        setup_test_logging();
+        let mut t = make_test_vsock();
+        t.vsock.socket_opts.max_outgoing_payload_size = 5;
+
+        // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
+        t.vsock.rtte.force_timeout(Duration::from_secs(10));
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Write enough data to generate multiple packets
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(b"helloworld")
+            .await
+            .unwrap();
+        t.poll_once_assert_pending().await;
+
+        // Should have sent the data
+        let sent = t.take_sent();
+        assert!(sent.len() == 2, "Should have sent 2 packets");
+        assert_eq!(sent[0].payload(), b"hello");
+        assert_eq!(sent[1].payload(), b"world");
+        assert_eq!(t.vsock.tx.total_len_packets(), 2);
+
+        let first_seq_nr = sent[0].header.seq_nr;
+
+        // ACK only first, then send FIN and ensure FIN is not acked until the data is sent.
+        let mut header = UtpHeader {
+            htype: Type::ST_STATE,
+            seq_nr: 0.into(),
+            ack_nr: first_seq_nr,
+            wnd_size: 1024,
+            ..Default::default()
+        };
+        t.send_msg(header, "");
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 0);
+
+        // Now send the FIN
+        header.set_type(Type::ST_FIN);
+        header.seq_nr += 1;
+        t.send_msg(header, "");
+        t.poll_once_assert_pending().await;
+        assert_eq!(
+            t.take_sent().len(),
+            0,
+            "the FIN should not be acked until all our queue gets ACKed send all the data"
+        );
+
+        // Ensure nothing gets sent until we ack the second header.
+        header.set_type(Type::ST_STATE);
+        header.ack_nr += 1;
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(
+            sent.len(),
+            1,
+            "should have sent an ACK for the FIN seq, but sent={sent:?}"
         );
     }
 }
