@@ -55,6 +55,8 @@ impl SocketOpts {
         // would be great to auto-detect it.
         let mtu = self.mtu.unwrap_or(DEFAULT_MTU);
 
+        // TODO: split into incoming and outgoing.
+
         let max_packet_size = mtu
             .checked_sub(IPV4_HEADER)
             .context("MTU too low")?
@@ -82,8 +84,9 @@ impl SocketOpts {
         }
 
         Ok(ValidatedSocketOpts {
-            max_packet_size,
-            max_payload_size,
+            max_incoming_packet_size: max_packet_size,
+            max_outgoing_payload_size: max_payload_size,
+            max_incoming_payload_size: max_payload_size,
             packet_pool_max_packets,
             virtual_socket_tx_packets,
             virtual_socket_tx_bytes,
@@ -94,8 +97,10 @@ impl SocketOpts {
 
 #[derive(Clone, Copy)]
 pub(crate) struct ValidatedSocketOpts {
-    pub max_packet_size: usize,
-    pub max_payload_size: usize,
+    pub max_incoming_packet_size: usize,
+
+    pub max_outgoing_payload_size: usize,
+    pub max_incoming_payload_size: usize,
 
     pub packet_pool_max_packets: usize,
 
@@ -613,7 +618,10 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         });
 
         let dispatcher = Dispatcher {
-            packet_pool: PacketPool::new(opts.packet_pool_max_packets, opts.max_packet_size),
+            packet_pool: PacketPool::new(
+                opts.packet_pool_max_packets,
+                opts.max_incoming_packet_size,
+            ),
             streams: Default::default(),
             connecting: Default::default(),
             next_connection_id: env.random_u16().into(),

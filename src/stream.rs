@@ -566,7 +566,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         while !self.tx.is_full() && remaining > 0 && remote_window_remaining > 0 {
             let max_payload_size = self
                 .socket_opts
-                .max_payload_size
+                .max_outgoing_payload_size
                 .min(remote_window_remaining);
             let payload_size = max_payload_size.min(remaining);
 
@@ -1294,7 +1294,7 @@ impl UtpStream {
             remote,
             assembler: AssembledRx::new(
                 socket_opts.virtual_socket_tx_packets,
-                socket_opts.max_payload_size,
+                socket_opts.max_incoming_packet_size,
             ),
             conn_id_send,
             timers: Timers {
@@ -1326,12 +1326,12 @@ impl UtpStream {
             },
             this_poll: ThisPoll {
                 now,
-                tmp_buf: vec![0u8; socket.opts().max_packet_size],
+                tmp_buf: vec![0u8; socket.opts().max_incoming_packet_size],
                 transport_pending: false,
             },
             congestion_controller: {
                 let mut controller = Reno::default();
-                controller.set_mss(socket_opts.max_payload_size);
+                controller.set_mss(socket_opts.max_outgoing_payload_size);
                 controller
             },
             parent_span,
@@ -1812,7 +1812,7 @@ mod tests {
     async fn test_sends_up_to_remote_window_only_multi_msg() {
         setup_test_logging();
         let mut t = make_test_vsock();
-        t.vsock.socket_opts.max_payload_size = 2;
+        t.vsock.socket_opts.max_outgoing_payload_size = 2;
 
         assert_eq!(t.vsock.last_remote_window, 0);
 
@@ -1913,7 +1913,7 @@ mod tests {
     async fn test_fast_retransmit() {
         setup_test_logging();
         let mut t = make_test_vsock();
-        t.vsock.socket_opts.max_payload_size = 5;
+        t.vsock.socket_opts.max_outgoing_payload_size = 5;
 
         // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
         t.vsock.rtte.force_timeout(Duration::from_secs(10));
@@ -2310,7 +2310,7 @@ mod tests {
         // Enable Nagle (should be on by default, but let's be explicit)
         t.vsock.socket_opts.nagle = true;
         // Set a large max payload size to ensure we're testing Nagle, not fragmentation
-        t.vsock.socket_opts.max_payload_size = 1024;
+        t.vsock.socket_opts.max_outgoing_payload_size = 1024;
 
         // Allow sending by setting window size
         t.send_msg(
