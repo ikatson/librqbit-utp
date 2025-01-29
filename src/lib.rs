@@ -1,20 +1,19 @@
-// "error: error running utp stream event loop: rx channel closed" - detect if it's ok
+// TODO: flow control
+// - it's crucial to bound the amount of data the remote is allowed to send us
 //
-// TODO: congestion control
+// TODO: packet pool is inefficient as:
+// - the packet sizes vary greatly
+// - detecting MTU might work only for outgoing hosts, but not for incoming hosts
+//
+// TODO: memory management. Think about a data structure that will let the UDP incoming packet
+// get written straight out to use Rx buffer.
+
+// TODO: LEDBAT congestion control
 //
 // TODO: extensions
 // - selective ACKs
-// - remote close reasons (qBittorrent sends those)
-//
-// TODO: proper closure
-// - when client dropped, send all data in TX, then send FIN
-// - poll_close and/or poll_shutdown impl
-//
-// TODO: tests (e.g. nagle etc)
 //
 // TODO: built-in connection timeouts?
-//
-// TODO: detect MTU at least through this crate https://github.com/mozilla/mtu/
 
 mod assembled_rx;
 mod congestion;

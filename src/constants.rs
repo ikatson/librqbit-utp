@@ -7,7 +7,11 @@ pub const IPV4_HEADER: usize = 20;
 pub const MIN_UDP_HEADER: usize = 8;
 pub const UTP_HEADER_SIZE: usize = 20;
 
-pub const DEFAULT_MTU: usize = 1280;
+// DEFAULT_MTU is very conservative (to support VPNs / tunneling etc).
+// It's used if auto-detection doesn't work.
+pub const DEFAULT_CONSERVATIVE_OUTGOING_MTU: usize = 1280;
+// This is used to calculate the packet pool sizes.
+pub const DEFAULT_INCOMING_MTU: usize = 1520;
 
 // Delayed ACK timer
 pub const ACK_DELAY: Duration = Duration::from_millis(10);

@@ -1,6 +1,6 @@
 use std::{
     collections::{hash_map::Entry, HashMap, VecDeque},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -10,7 +10,10 @@ use std::{
 };
 
 use crate::{
-    constants::{DEFAULT_MTU, IPV4_HEADER, MIN_UDP_HEADER, UTP_HEADER_SIZE},
+    constants::{
+        DEFAULT_CONSERVATIVE_OUTGOING_MTU, DEFAULT_INCOMING_MTU, IPV4_HEADER, MIN_UDP_HEADER,
+        UTP_HEADER_SIZE,
+    },
     message::UtpMessage,
     packet_pool::{Packet, PacketPool},
     raw::{Type, UtpHeader},
@@ -36,6 +39,10 @@ pub struct SocketOpts {
     // The MTU to base calculations on.
     pub mtu: Option<usize>,
 
+    // If MTU is not provided, this address will be used to detect MTU
+    // once.
+    pub mtu_autodetect_host: Option<IpAddr>,
+
     // How much memory to pre-allocate for incoming packet pool.
     pub packet_pool_max_memory: Option<usize>,
 
@@ -51,25 +58,58 @@ pub struct SocketOpts {
 
 impl SocketOpts {
     fn validate(&self) -> anyhow::Result<ValidatedSocketOpts> {
-        // DEFAULT_MTU is very conservative (to support VPNs / tunneling etc),
-        // would be great to auto-detect it.
-        let mtu = self.mtu.unwrap_or(DEFAULT_MTU);
-
-        // TODO: split into incoming and outgoing.
-
-        let max_packet_size = mtu
-            .checked_sub(IPV4_HEADER)
-            .context("MTU too low")?
-            .checked_sub(MIN_UDP_HEADER)
-            .context("MTU too low")?;
-        let max_payload_size = max_packet_size
-            .checked_sub(UTP_HEADER_SIZE)
-            .context("MTU too low")?;
-        if max_payload_size == 0 {
-            bail!("MTU too low");
+        #[derive(Clone, Copy)]
+        struct MtuCalc {
+            max_packet_size: usize,
+            max_payload_size: usize,
         }
+
+        fn calc(mtu: usize) -> anyhow::Result<MtuCalc> {
+            let max_packet_size = mtu
+                .checked_sub(IPV4_HEADER)
+                .context("MTU too low")?
+                .checked_sub(MIN_UDP_HEADER)
+                .context("MTU too low")?;
+            let max_payload_size = max_packet_size
+                .checked_sub(UTP_HEADER_SIZE)
+                .context("MTU too low")?;
+
+            if max_payload_size == 0 {
+                bail!("MTU too low");
+            }
+            Ok(MtuCalc {
+                max_packet_size,
+                max_payload_size,
+            })
+        }
+
+        let (incoming, outgoing) = match self.mtu {
+            Some(mtu) => {
+                let v = calc(mtu)?;
+                (v, v)
+            }
+            None => {
+                let autodetect_host = self
+                    .mtu_autodetect_host
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+                match ::mtu::interface_and_mtu(autodetect_host) {
+                    Ok((iface, mtu)) => {
+                        trace!(?autodetect_host, iface, mtu, "autodetected MTU");
+                        let v = calc(mtu)?;
+                        (v, v)
+                    }
+                    Err(e) => {
+                        debug!(?autodetect_host, "error detecting MTU: {:#}", e);
+                        let incoming = calc(DEFAULT_INCOMING_MTU).unwrap();
+                        let outgoing = calc(DEFAULT_CONSERVATIVE_OUTGOING_MTU).unwrap();
+                        (incoming, outgoing)
+                    }
+                }
+            }
+        };
+
         let packet_pool_max_packets =
-            self.packet_pool_max_memory.unwrap_or(32 * 1024 * 1024) / max_packet_size;
+            self.packet_pool_max_memory.unwrap_or(32 * 1024 * 1024) / incoming.max_packet_size;
         if packet_pool_max_packets == 0 {
             bail!("invalid configuration: packet_pool_max_memory / max_packet_size = 0");
         }
@@ -84,9 +124,8 @@ impl SocketOpts {
         }
 
         Ok(ValidatedSocketOpts {
-            max_incoming_packet_size: max_packet_size,
-            max_outgoing_payload_size: max_payload_size,
-            max_incoming_payload_size: max_payload_size,
+            max_incoming_packet_size: incoming.max_packet_size,
+            max_outgoing_payload_size: outgoing.max_payload_size,
             packet_pool_max_packets,
             virtual_socket_tx_packets,
             virtual_socket_tx_bytes,
@@ -95,12 +134,10 @@ impl SocketOpts {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct ValidatedSocketOpts {
     pub max_incoming_packet_size: usize,
-
     pub max_outgoing_payload_size: usize,
-    pub max_incoming_payload_size: usize,
 
     pub packet_pool_max_packets: usize,
 
