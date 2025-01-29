@@ -132,6 +132,7 @@ impl UtpHeader {
             let ext_len = *buffer.get(1)? as usize;
 
             let ext_data = buffer.get(2..2 + ext_len)?;
+            trace!(ext, ext_len, "extension in packet");
             match (ext, ext_len) {
                 (EXT_CLOSE_REASON, 4) => {
                     header.extensions.get_or_insert_default().close_reason =
