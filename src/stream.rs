@@ -311,7 +311,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn rx_window(&self) -> u32 {
-        (self.user_rx_sender.capacity() * self.socket_opts.max_user_rx_buffered_packets) as u32
+        (self.user_rx_sender.capacity() * self.socket_opts.max_incoming_packet_size) as u32
     }
 
     // Returns true if UDP socket is full
