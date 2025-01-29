@@ -665,7 +665,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(())
     }
 
-    #[tracing::instrument(name="msg", skip_all, fields(
+    #[tracing::instrument(level = "trace", name="msg", skip_all, fields(
         seq_nr=%msg.header.seq_nr,
         ack_nr=%msg.header.ack_nr,
         len=msg.payload().len(),

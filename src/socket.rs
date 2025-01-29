@@ -28,7 +28,7 @@ use tokio::sync::{
     mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
-use tracing::{debug, error_span, trace, warn};
+use tracing::{debug, error_span, trace, trace_span, warn};
 
 type ConnectionId = SeqNr;
 
@@ -377,7 +377,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     // This would only block if the socket is full. It will block the dispatcher but it's a resonable tradeoff.
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(level = "trace", skip(self))]
     async fn on_control(&mut self, msg: ControlRequest) -> anyhow::Result<()> {
         match msg {
             ControlRequest::ConnectRequest(addr, token, sender) => {
@@ -434,7 +434,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         Ok(())
     }
 
-    #[tracing::instrument(skip_all, fields(addr, seq_nr=?msg.header.seq_nr, ack_nr=?msg.header.ack_nr))]
+    #[tracing::instrument(level = "trace", skip_all, fields(addr, seq_nr=?msg.header.seq_nr, ack_nr=?msg.header.ack_nr))]
     fn on_maybe_connect_ack(&mut self, addr: SocketAddr, msg: UtpMessage) -> anyhow::Result<()> {
         let mut occ = match self.connecting.entry(addr) {
             Entry::Occupied(occ) => occ,
@@ -528,7 +528,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
 
-    #[tracing::instrument(name = "on_recv", skip_all, fields(from=?addr))]
+    #[tracing::instrument(level = "trace", name = "on_recv", skip_all, fields(from=?addr))]
     fn on_recv(&mut self, addr: SocketAddr, packet: Packet, len: usize) -> anyhow::Result<()> {
         trace!("received");
 
@@ -540,7 +540,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             }
         };
 
-        let span = error_span!(
+        let span = trace_span!(
             "msg",
             conn_id=?message.header.connection_id,
             type=?message.header.get_type(),
@@ -679,7 +679,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         &self.opts
     }
 
-    #[tracing::instrument(name="utp_socket:accept", skip(self), fields(local=?self.local_addr))]
+    #[tracing::instrument(level = "debug", name="utp_socket:accept", skip(self), fields(local=?self.local_addr))]
     pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream> {
         let (tx, rx) = oneshot::channel();
         self.accept_requests
@@ -691,7 +691,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         Ok(stream)
     }
 
-    #[tracing::instrument(name="utp_socket:connect", skip(self), fields(local=?self.local_addr))]
+    #[tracing::instrument(level = "debug", name="utp_socket:connect", skip(self), fields(local=?self.local_addr))]
     pub async fn connect(self: &Arc<Self>, remote: SocketAddr) -> anyhow::Result<UtpStream> {
         let (tx, rx) = oneshot::channel();
         let token = NEXT_CONNECT_TOKEN.fetch_add(1, Ordering::Relaxed);
