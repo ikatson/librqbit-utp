@@ -10,6 +10,7 @@ use std::{
 };
 
 use crate::{
+    congestion::CongestionController,
     constants::{
         DEFAULT_CONSERVATIVE_OUTGOING_MTU, DEFAULT_INCOMING_MTU, IPV4_HEADER, MIN_UDP_HEADER,
         UTP_HEADER_SIZE,
@@ -36,6 +37,36 @@ type Key = (SocketAddr, ConnectionId);
 
 const DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK: usize = 1024 * 1024;
 
+#[derive(Default, Clone, Copy)]
+pub enum CongestionControllerKind {
+    Reno,
+    #[default]
+    Cubic,
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct CongestionConfig {
+    pub kind: CongestionControllerKind,
+    pub tracing: bool,
+}
+
+impl CongestionConfig {
+    pub(crate) fn create(&self, now: Instant) -> Box<dyn CongestionController> {
+        use crate::congestion::cubic::Cubic;
+        use crate::congestion::reno::Reno;
+        use crate::congestion::tracing::TracingController;
+
+        match (self.kind, self.tracing) {
+            (CongestionControllerKind::Reno, true) => Box::new(TracingController::new(Reno::new())),
+            (CongestionControllerKind::Reno, false) => Box::new(Reno::new()),
+            (CongestionControllerKind::Cubic, true) => {
+                Box::new(TracingController::new(Cubic::new(now)))
+            }
+            (CongestionControllerKind::Cubic, false) => Box::new(Cubic::new(now)),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct SocketOpts {
     // The MTU to base calculations on.
@@ -60,6 +91,8 @@ pub struct SocketOpts {
 
     // Disable Nagle's algorithm (buffering outgoing packets)
     pub disable_nagle: bool,
+
+    pub congestion: CongestionConfig,
 }
 
 impl SocketOpts {
@@ -139,6 +172,7 @@ impl SocketOpts {
             max_rx_out_of_order_packets,
             virtual_socket_tx_bytes,
             nagle: !self.disable_nagle,
+            congestion: self.congestion,
         })
     }
 }
@@ -154,6 +188,8 @@ pub(crate) struct ValidatedSocketOpts {
     pub virtual_socket_tx_bytes: usize,
 
     pub nagle: bool,
+
+    pub congestion: CongestionConfig,
 }
 
 pub(crate) struct StreamRequester {

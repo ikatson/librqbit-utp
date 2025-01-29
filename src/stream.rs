@@ -19,7 +19,7 @@ use tracing::{debug, error_span, trace, warn};
 
 use crate::{
     assembled_rx::AssembledRx,
-    congestion::{cubic::Cubic, tracing::TracingController, CongestionController},
+    congestion::CongestionController,
     constants::{ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, UTP_HEADER_SIZE},
     message::UtpMessage,
     raw::{Type, UtpHeader},
@@ -1356,17 +1356,7 @@ impl UtpStream {
                 tmp_buf: vec![0u8; socket.opts().max_incoming_packet_size],
                 transport_pending: false,
             },
-            congestion_controller: {
-                // let mut controller = Reno::default();
-                // controller.set_mss(socket_opts.max_outgoing_payload_size);
-
-                let mut controller = Cubic::new(now);
-                controller.set_mss(socket_opts.max_outgoing_payload_size);
-
-                let controller = TracingController::new(controller);
-
-                Box::new(controller)
-            },
+            congestion_controller: socket_opts.congestion.create(now),
             parent_span,
             _drop_guard: DropGuardSendBeforeDeath::new(
                 ControlRequest::Shutdown {
