@@ -5,12 +5,14 @@
 // - test: drop all outstanding accepts() and connects()
 
 // TODO: flow control
-// - it's crucial to bound the amount of data the remote is allowed to send us.
-// - for librqbit, it should be ok, but for a general library definitely not
-// - TEST it. Ensure the user gets all neded messages even if it was blocked for a while.
+// - test it
+//   - ensure the user gets all neded messages even if it was blocked for a while
+// - test: ensure the user gets a fin
 //
-// TODO: Initial SYN - keep resending it with increasing delay. This would require refactoring SYN
+// TODO: Initial SYN - keep resending it with increasing delay. This would probably require refactoring SYN
 // into the VirtualSocket state machine (like smoltcp), cause otherwise it'll get nasty.
+// Although we could just send it in a loop with connect() like every second or so no problem;
+// With jitter though! Not to flood all at the same time.
 //
 // TODO: remove smoltcp dependency. copy-paste assembler and wring buffer or write our own.
 //
