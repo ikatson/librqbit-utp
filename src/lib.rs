@@ -1,3 +1,9 @@
+// TODO: uTP socket death
+// if main socket dies
+// - scream about it
+// - test: error all subsequent accept() and connect() attempts
+// - test: drop all outstanding accepts() and connects()
+
 // TODO: flow control
 // - it's crucial to bound the amount of data the remote is allowed to send us.
 // - for librqbit, it should be ok, but for a general library definitely not
