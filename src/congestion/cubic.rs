@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use crate::rtte::RttEstimator;
 
-use super::Controller;
+use super::CongestionController;
 
 // Constants for the Cubic congestion control algorithm.
 // See RFC 8312.
@@ -34,7 +34,7 @@ impl Cubic {
     }
 }
 
-impl Controller for Cubic {
+impl CongestionController for Cubic {
     fn window(&self) -> usize {
         self.cwnd
     }

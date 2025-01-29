@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use crate::rtte::RttEstimator;
 
-use super::Controller;
+use super::CongestionController;
 
 #[derive(Debug)]
 pub struct Reno {
@@ -29,7 +29,7 @@ impl Reno {
     }
 }
 
-impl Controller for Reno {
+impl CongestionController for Reno {
     fn window(&self) -> usize {
         self.cwnd
     }

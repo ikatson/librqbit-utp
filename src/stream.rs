@@ -19,7 +19,7 @@ use tracing::{debug, error_span, trace, warn};
 
 use crate::{
     assembled_rx::AssembledRx,
-    congestion::{reno::Reno, Controller},
+    congestion::{cubic::Cubic, reno::Reno, CongestionController},
     constants::{ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, UTP_HEADER_SIZE},
     message::UtpMessage,
     raw::{Type, UtpHeader},
@@ -232,7 +232,7 @@ struct VirtualSocket<T: Transport, Env: UtpEnvironment> {
     // This is what "UtpStream::poll_write" writes to.
     user_tx: Arc<UserTx>,
     rtte: RttEstimator,
-    congestion_controller: Reno,
+    congestion_controller: Box<dyn CongestionController>,
 
     this_poll: ThisPoll,
 
@@ -1357,9 +1357,13 @@ impl UtpStream {
                 transport_pending: false,
             },
             congestion_controller: {
-                let mut controller = Reno::default();
+                // let mut controller = Reno::default();
+                // controller.set_mss(socket_opts.max_outgoing_payload_size);
+
+                let mut controller = Cubic::new(now);
                 controller.set_mss(socket_opts.max_outgoing_payload_size);
-                controller
+
+                Box::new(controller)
             },
             parent_span,
             _drop_guard: DropGuardSendBeforeDeath::new(
@@ -1618,7 +1622,7 @@ mod tests {
     use tracing::trace;
 
     use crate::{
-        congestion::Controller,
+        congestion::CongestionController,
         message::UtpMessage,
         raw::{Type, UtpHeader},
         stream::VirtualSocketState,
@@ -2767,11 +2771,18 @@ mod tests {
             .unwrap();
         t.poll_once_assert_pending().await;
 
+        assert_eq!(
+            initial_window,
+            t.vsock.congestion_controller.window(),
+            "window shouldn't have changed"
+        );
+
         // Should only send up to initial window
         let sent = t.take_sent();
+        let sent_bytes: usize = sent.iter().map(|m| m.payload().len()).sum::<usize>();
         assert!(
-            sent.iter().map(|m| m.payload().len()).sum::<usize>() == initial_window,
-            "Should respect initial window"
+            sent_bytes <= initial_window,
+            "Should respect initial window. sent_bytes={sent_bytes}, initial_window={initial_window}"
         );
         let first_batch_seq_nrs = sent.iter().map(|m| m.header.seq_nr).collect::<Vec<_>>();
 

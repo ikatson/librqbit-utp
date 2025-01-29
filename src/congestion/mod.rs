@@ -1,4 +1,4 @@
-mod cubic;
+pub mod cubic;
 pub mod reno;
 
 use std::time::Instant;
@@ -6,7 +6,7 @@ use std::time::Instant;
 use crate::rtte::RttEstimator;
 
 #[allow(unused_variables)]
-pub trait Controller {
+pub trait CongestionController: Send + Sync {
     /// Returns the number of bytes that can be sent.
     fn window(&self) -> usize;
 
