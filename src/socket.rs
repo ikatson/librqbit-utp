@@ -746,7 +746,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
                 bail!("error sending to UDP socket: {e:#}");
             }
             Poll::Pending => {
-                warn!("UDP socket full, could not send packet");
+                debug!("UDP socket full, could not send packet");
                 return Ok(true);
             }
         }
