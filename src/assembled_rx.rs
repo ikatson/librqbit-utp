@@ -1,7 +1,9 @@
+use anyhow::Context;
 use smoltcp::storage::{Assembler, RingBuffer};
-use tracing::trace;
+use tokio::sync::mpsc;
+use tracing::{debug, trace};
 
-use crate::message::UtpMessage;
+use crate::{message::UtpMessage, stream::UserRxMessage};
 
 pub struct AssembledRx {
     assembler: Assembler,
@@ -36,44 +38,64 @@ impl AssembledRx {
         &self.assembler
     }
 
+    // anyhow error on fatal
+    // otherwise either len or message back TODO: a different enum for this
     pub fn add_remove(
         &mut self,
         msg: UtpMessage,
         offset: usize,
-
-        // TODO: when bounding user queues, this should be able to return errors
-        mut f: impl FnMut(UtpMessage),
-    ) -> std::result::Result<usize, UtpMessage> {
+        user_rx: &mpsc::Sender<UserRxMessage>,
+    ) -> anyhow::Result<std::result::Result<usize, UtpMessage>> {
         let slot = self.rx.get_unallocated(offset, 1);
         if slot.is_empty() {
             trace!(?msg, offset, "empty assembler buffer slot");
-            return Err(msg);
+            return Ok(Err(msg));
         }
+
+        let asm_before = self.assembler.clone();
 
         let removed = match self.assembler.add_then_remove_front(offset, 1) {
             Ok(count) => count,
             Err(_) => {
                 trace!(?self.assembler, offset, ?msg.header.seq_nr, "too many holes");
-                return Err(msg);
+                return Ok(Err(msg));
             }
+        };
+
+        let rxcap = user_rx.capacity();
+        if rxcap < removed {
+            debug!(
+                current = rxcap,
+                required = removed,
+                "user rx doesn't have enough capacity"
+            );
+            self.assembler = asm_before;
+            return Ok(Err(msg));
+        }
+
+        let send = |msg| -> anyhow::Result<()> {
+            user_rx
+                .try_send(UserRxMessage::UtpMessage(msg))
+                .context("user rx must have had capacity but it doesnt. cant recover from this")
         };
 
         if removed > 0 {
             // The first message is guaranteed to be there. We don't need to write it
-            f(msg);
+            // user_rx. (msg);
+            send(msg)?;
 
             self.rx.enqueue_unallocated(removed);
             self.rx.dequeue_one().unwrap();
 
             for _ in 1..removed {
                 let msg = self.rx.dequeue_one().unwrap();
-                f(std::mem::take(msg));
+                send(std::mem::take(msg))?;
             }
-            Ok(removed)
+            Ok(Ok(removed))
         } else {
             // Store the out of order message for future.
             slot[0] = msg;
-            Ok(removed)
+            Ok(Ok(removed))
         }
     }
 }

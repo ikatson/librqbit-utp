@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use smoltcp::storage::RingBuffer;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
+    sync::mpsc::{self, channel, Receiver, UnboundedReceiver},
     time::Sleep,
 };
 use tracing::{debug, error_span, trace, warn};
@@ -169,7 +169,7 @@ impl VirtualSocketState {
     }
 }
 
-enum UserRxMessage {
+pub(crate) enum UserRxMessage {
     UtpMessage(UtpMessage),
     Error(String),
     Eof,
@@ -220,7 +220,9 @@ struct VirtualSocket<T: Transport, Env: UtpEnvironment> {
 
     // The user sides's queue with packets fully processed and ready to consume.
     // This is what "UtpStream::poll_read" reads from.
-    user_rx_sender: UnboundedSender<UserRxMessage>,
+    user_rx_sender: mpsc::Sender<UserRxMessage>,
+    // The permit to send the last EOF and not block the dispatcher.
+    user_rx_sender_last_eof_permit: Option<mpsc::OwnedPermit<UserRxMessage>>,
 
     // Last received ACK for fast retransmit
     local_rx_last_ack: Option<SeqNr>,
@@ -616,6 +618,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(())
     }
 
+    fn try_send_last_message_to_user_rx(&mut self, msg: UserRxMessage) {
+        if let Some(permit) = self.user_rx_sender_last_eof_permit.take() {
+            permit.send(msg);
+        } else {
+            let _ = self.user_rx_sender.try_send(msg);
+        }
+    }
+
     fn just_before_death(&mut self, error: Option<&anyhow::Error>) {
         if let Some(err) = error {
             trace!("just_before_death: {err:#}");
@@ -623,7 +633,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             trace!("just_before_death: no error");
         }
 
-        let _ = self.user_rx_sender.send(
+        self.try_send_last_message_to_user_rx(
             error
                 .map(|e| UserRxMessage::Error(format!("{e:#}")))
                 .unwrap_or(UserRxMessage::Eof),
@@ -757,9 +767,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                 let assembler_was_empty = self.assembler.is_empty();
 
-                match self.assembler.add_remove(msg, offset as usize, |msg| {
-                    let _ = self.user_rx_sender.send(UserRxMessage::UtpMessage(msg));
-                }) {
+                match self
+                    .assembler
+                    .add_remove(msg, offset as usize, &self.user_rx_sender)
+                    .context("fatal error in assember")?
+                {
                     Ok(count) => {
                         if count > 0 {
                             trace!(count, "dequeued messages to user rx");
@@ -774,6 +786,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         if let Some(remote_fin) = self.state.remote_fin() {
                             if remote_fin - self.last_consumed_remote_seq_nr == 1 {
                                 self.last_consumed_remote_seq_nr += 1;
+                                self.try_send_last_message_to_user_rx(UserRxMessage::Eof);
                             }
                         }
                     }
@@ -871,10 +884,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 // This will (re)send FINACK
                 if msg.header.seq_nr - self.last_consumed_remote_seq_nr == 1 {
                     self.last_consumed_remote_seq_nr += 1;
+                    self.try_send_last_message_to_user_rx(UserRxMessage::Eof);
                 }
-
-                // self.send_control_packet(cx, socket, ack)?;
-                let _ = self.user_rx_sender.send(UserRxMessage::Eof);
                 Ok(())
             }
             Type::ST_SYN => {
@@ -965,7 +976,7 @@ impl<T: Transport, E: UtpEnvironment> Drop for VirtualSocket<T, E> {
 }
 
 pub struct UtpStreamReadHalf {
-    rx: UnboundedReceiver<UserRxMessage>,
+    rx: Receiver<UserRxMessage>,
     current: Option<UtpMessage>,
     offset: usize,
 }
@@ -1269,7 +1280,10 @@ impl UtpStream {
             parent_span,
         } = args;
 
-        let (user_rx_sender, user_rx_receiver) = unbounded_channel();
+        let (user_rx_sender, user_rx_receiver) =
+            channel(socket.opts().max_user_rx_buffered_packets);
+        // this unwrap is fine as max_user_rx_buffered_packets was validated as part of UtpSocket
+        let user_rx_sender_last_eof_permit = user_rx_sender.clone().try_reserve_owned().unwrap();
         let user_tx = Arc::new(UserTx {
             locked: Mutex::new(WakeableRingBuffer {
                 buffer: RingBuffer::new(vec![0u8; socket.opts().virtual_socket_tx_bytes]),
@@ -1324,6 +1338,7 @@ impl UtpStream {
             rx,
             tx: Tx::new(),
             user_rx_sender,
+            user_rx_sender_last_eof_permit: Some(user_rx_sender_last_eof_permit),
             local_rx_last_ack: None,
             local_rx_dup_acks: 0,
             user_tx,

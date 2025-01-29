@@ -34,6 +34,8 @@ type ConnectionId = SeqNr;
 
 type Key = (SocketAddr, ConnectionId);
 
+const DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK: usize = 1024 * 1024;
+
 #[derive(Default)]
 pub struct SocketOpts {
     // The MTU to base calculations on.
@@ -46,7 +48,11 @@ pub struct SocketOpts {
     // How much memory to pre-allocate for incoming packet pool.
     pub packet_pool_max_memory: Option<usize>,
 
-    // How many packets to track in the RX window.
+    // For flow control, if the user isn't reading, when to start dropping packets.
+    // This is an approximate number in bytes.
+    pub rx_bufsize_approx: Option<usize>,
+
+    // How many out-of-order packets to track in the RX window.
     pub tx_packets: Option<usize>,
 
     // How many bytes to allocate for each virtual socket's TX.
@@ -108,10 +114,13 @@ impl SocketOpts {
             }
         };
 
-        let packet_pool_max_packets =
-            self.packet_pool_max_memory.unwrap_or(32 * 1024 * 1024) / incoming.max_packet_size;
-        if packet_pool_max_packets == 0 {
-            bail!("invalid configuration: packet_pool_max_memory / max_packet_size = 0");
+        let max_user_rx_buffered_packets = self
+            .rx_bufsize_approx
+            .unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK)
+            / incoming.max_packet_size;
+
+        if max_user_rx_buffered_packets == 0 {
+            bail!("max_user_rx_buffered_packets = 0. Increase rx_bufsize_approx, or decrease MTU")
         }
 
         let virtual_socket_tx_packets = self.tx_packets.unwrap_or(64);
@@ -126,6 +135,7 @@ impl SocketOpts {
         Ok(ValidatedSocketOpts {
             max_incoming_packet_size: incoming.max_packet_size,
             max_outgoing_payload_size: outgoing.max_payload_size,
+            max_user_rx_buffered_packets,
             virtual_socket_tx_packets,
             virtual_socket_tx_bytes,
             nagle: !self.disable_nagle,
@@ -137,6 +147,8 @@ impl SocketOpts {
 pub(crate) struct ValidatedSocketOpts {
     pub max_incoming_packet_size: usize,
     pub max_outgoing_payload_size: usize,
+
+    pub max_user_rx_buffered_packets: usize,
 
     pub virtual_socket_tx_packets: usize,
     pub virtual_socket_tx_bytes: usize,
