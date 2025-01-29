@@ -2829,6 +2829,7 @@ mod tests {
 
         // Window should be reduced
         let window_after_loss = t.vsock.congestion_controller.window();
+        trace!(window_after_loss);
         assert!(
             window_after_loss < intermediate_window,
             "Window should decrease after loss: intermediate_window={intermediate_window} window_after_loss={window_after_loss}"
