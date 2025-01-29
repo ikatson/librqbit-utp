@@ -336,7 +336,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 let control = control_request.unwrap();
                 // If this blocks it should be short lived enough?;
                 // TODO: do smth about this
-                self.on_control(control).await?;
+                self.on_control(control).await;
             },
             recv = recv_from(&self.packet_pool, &self.socket.transport) => {
                 let (addr, packet, len) = recv.context("error receiving")?;
@@ -378,7 +378,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
     // This would only block if the socket is full. It will block the dispatcher but it's a resonable tradeoff.
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn on_control(&mut self, msg: ControlRequest) -> anyhow::Result<()> {
+    async fn on_control(&mut self, msg: ControlRequest) {
         match msg {
             ControlRequest::ConnectRequest(addr, token, sender) => {
                 let conn_id = self.get_next_free_conn_id(addr);
@@ -395,11 +395,22 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 };
                 let mut buf = [0u8; UTP_HEADER_SIZE];
                 header.serialize(&mut buf).unwrap();
-                self.socket
-                    .transport
-                    .send_to(&buf, addr)
-                    .await
-                    .context("can't send")?;
+                match self.socket.transport.send_to(&buf, addr).await {
+                    Ok(len) if len == buf.len() => {}
+                    Ok(len) => {
+                        warn!(
+                            len,
+                            expected_len = buf.len(),
+                            ?addr,
+                            "did not send full length, dropping"
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        debug!(?addr, "error sending, dropping connect(): {e:#}");
+                        return;
+                    }
+                }
                 let c = Connecting {
                     token,
                     seq_nr: header.seq_nr,
@@ -431,7 +442,6 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 self.streams.remove(&(remote, conn_id_2));
             }
         }
-        Ok(())
     }
 
     #[tracing::instrument(level = "trace", skip_all, fields(addr, seq_nr=?msg.header.seq_nr, ack_nr=?msg.header.ack_nr))]
