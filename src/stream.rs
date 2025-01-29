@@ -51,14 +51,14 @@ enum VirtualSocketState {
     FinWait2,
 
     // We received a FIN, but we may still send data.
-    CloseWait,
+    CloseWait { remote_fin: SeqNr },
 
     // We and remote sent FINs, but none were ACKed
-    Closing { our_fin: SeqNr },
+    Closing { our_fin: SeqNr, remote_fin: SeqNr },
 
     // Both sides closed, we are waiting for final ACK.
     // After this we just kill the socket.
-    LastAck { our_fin: SeqNr },
+    LastAck { our_fin: SeqNr, remote_fin: SeqNr },
 }
 
 impl VirtualSocketState {
@@ -67,18 +67,23 @@ impl VirtualSocketState {
     }
 
     fn transition_to_fin_sent(&mut self, our_fin: SeqNr) -> bool {
-        match self {
+        match *self {
             VirtualSocketState::Established => *self = VirtualSocketState::FinWait1 { our_fin },
-            VirtualSocketState::CloseWait => *self = VirtualSocketState::LastAck { our_fin },
+            VirtualSocketState::CloseWait { remote_fin } => {
+                *self = VirtualSocketState::LastAck {
+                    our_fin,
+                    remote_fin,
+                }
+            }
             _ => return false,
         };
         true
     }
 
     // True if we are not sending any more data.
-    fn is_fin_or_later(&self) -> bool {
+    fn is_local_fin_or_later(&self) -> bool {
         match self {
-            VirtualSocketState::Established | VirtualSocketState::CloseWait => false,
+            VirtualSocketState::Established | VirtualSocketState::CloseWait { .. } => false,
             VirtualSocketState::Finished
             | VirtualSocketState::FinWait1 { .. }
             | VirtualSocketState::FinWait2
@@ -87,16 +92,28 @@ impl VirtualSocketState {
         }
     }
 
+    fn remote_fin(&self) -> Option<SeqNr> {
+        match *self {
+            VirtualSocketState::Established
+            | VirtualSocketState::Finished
+            | VirtualSocketState::FinWait1 { .. }
+            | VirtualSocketState::FinWait2 => None,
+            VirtualSocketState::CloseWait { remote_fin }
+            | VirtualSocketState::Closing { remote_fin, .. }
+            | VirtualSocketState::LastAck { remote_fin, .. } => Some(remote_fin),
+        }
+    }
+
     fn our_fin_if_unacked(&self) -> Option<SeqNr> {
         match *self {
             VirtualSocketState::FinWait1 { our_fin }
-            | VirtualSocketState::Closing { our_fin }
-            | VirtualSocketState::LastAck { our_fin } => Some(our_fin),
+            | VirtualSocketState::Closing { our_fin, .. }
+            | VirtualSocketState::LastAck { our_fin, .. } => Some(our_fin),
             _ => None,
         }
     }
 
-    fn on_incoming_packet(&mut self, is_fin: bool, remote_ack_nr: SeqNr) {
+    fn on_incoming_packet(&mut self, remote_fin_seq_nr: Option<SeqNr>, remote_ack_nr: SeqNr) {
         // To decrease combinations, first process remote_ack_nr, then process "is_fin"
 
         // Maybe ACK our fin
@@ -106,7 +123,7 @@ impl VirtualSocketState {
                     *self = VirtualSocketState::FinWait2;
                 }
             }
-            VirtualSocketState::Closing { our_fin } => {
+            VirtualSocketState::Closing { our_fin, .. } => {
                 // For simplicity, we don't need to wait until the last side receives our FIN.
                 // This would be smth like TimeWait, but it's not worth it.
                 if remote_ack_nr == our_fin {
@@ -114,7 +131,7 @@ impl VirtualSocketState {
                     return;
                 }
             }
-            VirtualSocketState::LastAck { our_fin } => {
+            VirtualSocketState::LastAck { our_fin, .. } => {
                 if our_fin == remote_ack_nr {
                     *self = VirtualSocketState::Finished;
                     return;
@@ -123,23 +140,27 @@ impl VirtualSocketState {
             _ => {}
         }
 
-        if !is_fin {
-            return;
-        }
+        let remote_fin = match remote_fin_seq_nr {
+            Some(n) => n,
+            None => return,
+        };
 
         // Process remote FIN.
         match *self {
             VirtualSocketState::Established => {
-                *self = VirtualSocketState::CloseWait;
+                *self = VirtualSocketState::CloseWait { remote_fin };
             }
             VirtualSocketState::Finished => {}
             VirtualSocketState::FinWait1 { our_fin } => {
-                *self = VirtualSocketState::Closing { our_fin };
+                *self = VirtualSocketState::Closing {
+                    our_fin,
+                    remote_fin,
+                };
             }
             VirtualSocketState::FinWait2 { .. } => {
                 *self = VirtualSocketState::Finished;
             }
-            VirtualSocketState::CloseWait
+            VirtualSocketState::CloseWait { .. }
             | VirtualSocketState::Closing { .. }
             | VirtualSocketState::LastAck { .. } => {
                 // fin retransmission, ignore
@@ -664,7 +685,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             |s| s.state,
             |s| {
                 s.state.on_incoming_packet(
-                    matches!(msg.header.get_type(), Type::ST_FIN),
+                    if matches!(msg.header.get_type(), Type::ST_FIN) {
+                        Some(msg.header.seq_nr)
+                    } else {
+                        None
+                    },
                     msg.header.ack_nr,
                 )
             },
@@ -743,6 +768,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         }
 
                         self.last_consumed_remote_seq_nr += count as u16;
+
+                        // If we got remote FIN, increase the last consumed sequence number, so that
+                        // we (re)send the final ACK.
+                        if let Some(remote_fin) = self.state.remote_fin() {
+                            if remote_fin - self.last_consumed_remote_seq_nr == 1 {
+                                self.last_consumed_remote_seq_nr += 1;
+                            }
+                        }
                     }
                     Err(_) => {
                         trace!("cannot reassemble message, dropping");
@@ -835,9 +868,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
             Type::ST_RESET => bail!("ST_RESET received"),
             Type::ST_FIN => {
-                // acknowledge the remote FIN.
-                // let mut ack = self.outgoing_header();
-                // ack.ack_nr = msg.header.seq_nr;
+                // This will (re)send FINACK
+                if msg.header.seq_nr - self.last_consumed_remote_seq_nr == 1 {
+                    self.last_consumed_remote_seq_nr += 1;
+                }
 
                 // self.send_control_packet(cx, socket, ack)?;
                 let _ = self.user_rx_sender.send(UserRxMessage::Eof);
@@ -1123,7 +1157,7 @@ pub struct StreamArgs {
 
     next_seq_nr: SeqNr,
     last_sent_seq_nr: SeqNr,
-    last_consumed_ack_nr: SeqNr,
+    last_consumed_remote_seq_nr: SeqNr,
     last_sent_ack_nr: SeqNr,
 
     syn_sent_ts: Option<Instant>,
@@ -1155,7 +1189,7 @@ impl StreamArgs {
             // On connect, the client sends a number that represents the next ST_DATA number.
             // Pretend that we saw the non-existing previous one.
             last_sent_ack_nr: remote_ack.seq_nr - 1,
-            last_consumed_ack_nr: remote_ack.seq_nr - 1,
+            last_consumed_remote_seq_nr: remote_ack.seq_nr - 1,
 
             // For RTTE
             syn_sent_ts: Some(syn_sent_ts),
@@ -1176,7 +1210,7 @@ impl StreamArgs {
 
             next_seq_nr,
             // The connecting client will send the next ST_DATA packet with seq_nr + 1.
-            last_consumed_ack_nr: remote_syn.seq_nr,
+            last_consumed_remote_seq_nr: remote_syn.seq_nr,
             last_sent_seq_nr: next_seq_nr - 1,
             last_sent_ack_nr: remote_syn.seq_nr,
 
@@ -1226,7 +1260,7 @@ impl UtpStream {
             last_remote_timestamp,
             next_seq_nr,
             last_sent_seq_nr,
-            last_consumed_ack_nr,
+            last_consumed_remote_seq_nr,
             last_sent_ack_nr,
             syn_sent_ts,
             ack_received_ts,
@@ -1285,7 +1319,7 @@ impl UtpStream {
             last_remote_window: remote_window,
             next_seq_nr,
             last_sent_seq_nr,
-            last_consumed_remote_seq_nr: last_consumed_ack_nr,
+            last_consumed_remote_seq_nr,
             last_sent_ack_nr,
             rx,
             tx: Tx::new(),
@@ -1518,7 +1552,7 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
                 return Poll::Ready(Ok(()));
             }
 
-            if this.user_rx_sender.is_closed() && this.state.is_fin_or_later() {
+            if this.user_rx_sender.is_closed() && this.state.is_local_fin_or_later() {
                 trace!(current_state=?this.state, "both halves are dead, no reason to continue");
                 this.just_before_death(None);
                 return Poll::Ready(Ok(()));
@@ -2903,7 +2937,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_finack_not_sent_until_all_data_sent() {
+    async fn test_finack_not_sent_until_all_data_consumed() {
         setup_test_logging();
         let mut t = make_test_vsock();
         t.vsock.socket_opts.max_outgoing_payload_size = 5;
@@ -2911,76 +2945,38 @@ mod tests {
         // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
         t.vsock.rtte.force_timeout(Duration::from_secs(10));
 
-        // Allow sending by setting window size
-        t.send_msg(
-            UtpHeader {
-                htype: Type::ST_STATE,
-                seq_nr: 0.into(),
-                ack_nr: t.vsock.last_sent_seq_nr,
-                wnd_size: 1024,
-                ..Default::default()
-            },
-            "",
-        );
-
-        // Write enough data to generate multiple packets
-        t.stream
-            .as_mut()
-            .unwrap()
-            .write_all(b"helloworld")
-            .await
-            .unwrap();
-        t.poll_once_assert_pending().await;
-
-        // Should have sent the data
-        let sent = t.take_sent();
-        assert!(sent.len() == 2, "Should have sent 2 packets");
-        assert_eq!(sent[0].payload(), b"hello");
-        assert_eq!(sent[1].payload(), b"world");
-        assert_eq!(t.vsock.tx.total_len_packets(), 2);
-
-        let first_seq_nr = sent[0].header.seq_nr;
-
-        // ACK only first, then send FIN and ensure FIN is not acked until the data is sent.
+        // Send an out of order message
         let mut header = UtpHeader {
-            htype: Type::ST_STATE,
-            seq_nr: 0.into(),
-            ack_nr: first_seq_nr,
+            htype: Type::ST_DATA,
+            seq_nr: 2.into(),
+            ack_nr: t.vsock.last_sent_seq_nr,
             wnd_size: 1024,
             ..Default::default()
         };
-        t.send_msg(header, "");
-        t.poll_once_assert_pending().await;
-        assert_eq!(t.take_sent().len(), 0);
-        assert_eq!(t.vsock.tx.total_len_packets(), 1);
 
-        // Now send the FIN
-        header.set_type(Type::ST_FIN);
-        header.seq_nr += 1;
-        t.send_msg(header, "");
+        header.seq_nr = 2.into();
+        t.send_msg(header, "world");
         t.poll_once_assert_pending().await;
-        assert_eq!(
-            t.take_sent().len(),
-            0,
-            "the FIN should not be acked until all our queue gets ACKed send all the data"
-        );
-        assert_eq!(t.vsock.tx.total_len_packets(), 1);
-
-        // Ensure nothing gets sent until we ack the second header.
-        header.set_type(Type::ST_STATE);
-        header.ack_nr += 1;
-        t.send_msg(header, "");
-        t.poll_once_assert_pending().await;
-        assert_eq!(
-            t.vsock.tx.total_len_packets(),
-            0,
-            "TX queue should have cleared"
-        );
+        assert!(!t.vsock.assembler.is_empty());
         let sent = t.take_sent();
-        assert_eq!(
-            sent.len(),
-            1,
-            "should have sent an ACK for the FIN seq, but sent={sent:?}"
-        );
+        assert_eq!(sent.len(), 1, "immediate ACK should have been sent");
+        assert_eq!(sent[0].header.ack_nr, 0.into());
+
+        // remote sends FIN
+        header.set_type(Type::ST_FIN);
+        header.seq_nr = 3.into();
+        t.send_msg(header, "");
+        t.poll_once_assert_pending().await;
+        assert!(!t.vsock.assembler.is_empty());
+        assert_eq!(t.take_sent().len(), 0, "nothing gets sent for out of order");
+
+        // send in-order. This should ACK the FIN
+        header.set_type(Type::ST_DATA);
+        header.seq_nr = 1.into();
+        t.send_msg(header, "");
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "we should sent FIN ACK");
+        assert_eq!(sent[0].header.ack_nr, 3.into());
     }
 }
