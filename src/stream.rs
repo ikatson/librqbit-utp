@@ -737,8 +737,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .set_remote_window(msg.header.wnd_size as usize);
 
         self.rtte.on_ack(self.this_poll.now, msg.header.ack_nr);
-        self.congestion_controller
-            .on_ack(self.this_poll.now, removed_bytes, &self.rtte);
+        if removed_bytes > 0 {
+            self.congestion_controller
+                .on_ack(self.this_poll.now, removed_bytes, &self.rtte);
+        }
 
         let ack_all = msg.header.ack_nr == self.last_sent_ack_nr;
         if !self.timers.kind.is_retransmit() || ack_all {
@@ -2753,6 +2755,7 @@ mod tests {
             initial_window < remote_wnd as usize,
             "{initial_window} >= {remote_wnd}, should be less"
         );
+        trace!(initial_window, remote_wnd);
 
         // Write a lot of data to test windowing
         let big_data = vec![0u8; 64 * 1024];
@@ -2770,7 +2773,7 @@ mod tests {
             sent.iter().map(|m| m.payload().len()).sum::<usize>() == initial_window,
             "Should respect initial window"
         );
-        let first_batch_seq_nrs: Vec<_> = sent.iter().map(|m| m.header.seq_nr).collect();
+        let first_batch_seq_nrs = sent.iter().map(|m| m.header.seq_nr).collect::<Vec<_>>();
 
         // ACK all packets - window should increase
         for seq_nr in &first_batch_seq_nrs {
@@ -2788,6 +2791,7 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         let intermediate_window = t.vsock.congestion_controller.window();
+        trace!(intermediate_window);
 
         assert!(
             intermediate_window > initial_window,
@@ -2801,7 +2805,7 @@ mod tests {
         );
 
         // Now simulate packet loss via duplicate ACKs
-        let lost_seq_nr = sent[0].header.seq_nr;
+        let lost_seq_nr = *first_batch_seq_nrs.last().unwrap();
         for _ in 0..4 {
             t.send_msg(
                 UtpHeader {
@@ -2827,7 +2831,7 @@ mod tests {
         let window_after_loss = t.vsock.congestion_controller.window();
         assert!(
             window_after_loss < intermediate_window,
-            "Window should decrease after loss"
+            "Window should decrease after loss: intermediate_window={intermediate_window} window_after_loss={window_after_loss}"
         );
 
         // Simulate timeout by advancing time
