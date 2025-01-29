@@ -661,7 +661,13 @@ pub type UtpSocketUdp = UtpSocket<tokio::net::UdpSocket, DefaultUtpEnvironment>;
 
 impl UtpSocketUdp {
     pub async fn new_udp(bind_addr: SocketAddr) -> anyhow::Result<Arc<Self>> {
-        let opts = SocketOpts::default();
+        Self::new_udp_with_opts(bind_addr, Default::default()).await
+    }
+
+    pub async fn new_udp_with_opts(
+        bind_addr: SocketAddr,
+        opts: SocketOpts,
+    ) -> anyhow::Result<Arc<Self>> {
         let sock = tokio::net::UdpSocket::bind(bind_addr)
             .await
             .context("error binding")?;
