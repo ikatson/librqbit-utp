@@ -679,6 +679,10 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         &self.opts
     }
 
+    pub fn bind_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
     #[tracing::instrument(level = "debug", name="utp_socket:accept", skip(self), fields(local=?self.local_addr))]
     pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream> {
         let (tx, rx) = oneshot::channel();

@@ -1,5 +1,9 @@
 // TODO: flow control
-// - it's crucial to bound the amount of data the remote is allowed to send us
+// - it's crucial to bound the amount of data the remote is allowed to send us.
+// - for librqbit, it should be ok, but for a general library definitely not
+//
+// TODO: Initial SYN - keep resending it with increasing delay. This would require refactoring SYN
+// into the VirtualSocket state machine (like smoltcp), cause otherwise it'll get nasty.
 //
 // TODO: packet pool is inefficient as:
 // - the packet sizes vary greatly
