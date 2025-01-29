@@ -6,7 +6,7 @@ use std::{
         Arc,
     },
     task::Poll,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use crate::{
@@ -15,7 +15,7 @@ use crate::{
         UTP_HEADER_SIZE,
     },
     message::UtpMessage,
-    packet_pool::{Packet, PacketPool},
+    packet_pool::Packet,
     raw::{Type, UtpHeader},
     seq_nr::SeqNr,
     stream::StreamArgs,
@@ -126,7 +126,6 @@ impl SocketOpts {
         Ok(ValidatedSocketOpts {
             max_incoming_packet_size: incoming.max_packet_size,
             max_outgoing_payload_size: outgoing.max_payload_size,
-            packet_pool_max_packets,
             virtual_socket_tx_packets,
             virtual_socket_tx_bytes,
             nagle: !self.disable_nagle,
@@ -138,8 +137,6 @@ impl SocketOpts {
 pub(crate) struct ValidatedSocketOpts {
     pub max_incoming_packet_size: usize,
     pub max_outgoing_payload_size: usize,
-
-    pub packet_pool_max_packets: usize,
 
     pub virtual_socket_tx_packets: usize,
     pub virtual_socket_tx_bytes: usize,
@@ -292,7 +289,6 @@ impl AcceptQueue {
 }
 
 pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
-    packet_pool: Arc<PacketPool>,
     env: E,
     socket: Arc<UtpSocket<T, E>>,
 
@@ -305,30 +301,16 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     next_connection_id: SeqNr,
 }
 
-async fn recv_from(
-    pool: &PacketPool,
-    transport: &impl Transport,
-) -> anyhow::Result<(SocketAddr, Packet, usize)> {
-    let start = Instant::now();
-    const LOG_DURATION: Duration = Duration::from_millis(100);
-    let mut packet = pool.get().await;
-    let elapsed = start.elapsed();
-    if elapsed > LOG_DURATION {
-        warn!(?elapsed, "packet pool took too long to give a packet");
-    }
-    let buf = packet.get_mut();
-    let (size, addr) = transport.recv_from(buf).await.context("error receiving")?;
-    Ok((addr, packet, size))
-}
-
 impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     pub(crate) async fn run_forever(mut self) -> anyhow::Result<()> {
+        let mut read_buf = [0u8; 16384];
+
         loop {
-            self.run_once().await?;
+            self.run_once(&mut read_buf).await?;
         }
     }
 
-    async fn run_once(&mut self) -> anyhow::Result<()> {
+    async fn run_once(&mut self, read_buf: &mut [u8]) -> anyhow::Result<()> {
         // This should get us into a state where either there's no SYNs or no accepts available.
         self.cleanup_accept_queue()?;
 
@@ -344,8 +326,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 // TODO: do smth about this
                 self.on_control(control).await;
             },
-            recv = recv_from(&self.packet_pool, &self.socket.transport) => {
-                let (addr, packet, len) = recv.context("error receiving")?;
+            recv = self.socket.transport.recv_from(read_buf) => {
+                let (len, addr) = recv.context("error receiving")?;
+                let packet = Packet::new(&read_buf[..len]);
                 self.on_recv(addr, packet, len)?;
             }
         }
@@ -671,10 +654,6 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         });
 
         let dispatcher = Dispatcher {
-            packet_pool: PacketPool::new(
-                opts.packet_pool_max_packets,
-                opts.max_incoming_packet_size,
-            ),
             streams: Default::default(),
             connecting: Default::default(),
             next_connection_id: env.random_u16().into(),

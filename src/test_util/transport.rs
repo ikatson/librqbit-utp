@@ -161,7 +161,7 @@ impl RememberingTransport {
         sent.into_iter()
             .map(|(_, msg)| {
                 let len = msg.len();
-                let packet = Packet::new_test(msg);
+                let packet = Packet::new(&msg);
                 UtpMessage::deserialize(packet, len).unwrap()
             })
             .collect()

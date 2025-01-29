@@ -25,7 +25,7 @@ impl std::fmt::Debug for UtpMessage {
 impl UtpMessage {
     #[cfg(test)]
     pub fn new_test(header: UtpHeader, payload: &[u8]) -> anyhow::Result<Self> {
-        let packet = Packet::new_test(payload.to_vec());
+        let packet = Packet::new(payload);
         Ok(UtpMessage {
             header,
             payload_start: 0,
