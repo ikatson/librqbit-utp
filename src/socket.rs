@@ -488,7 +488,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
     #[tracing::instrument(name = "on_recv", skip_all, fields(from=?addr))]
     fn on_recv(&mut self, addr: SocketAddr, packet: Packet, len: usize) -> anyhow::Result<()> {
-        trace!("received");
+        trace!(len, "received");
 
         let message = match UtpMessage::deserialize(packet, len) {
             Some(msg) => msg,

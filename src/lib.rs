@@ -32,6 +32,7 @@ mod stream_tx;
 mod test_util;
 mod traits;
 mod utils;
+mod write_canary_file;
 
 pub use socket::{UtpSocket, UtpSocketUdp};
 pub use stream::{UtpStream, UtpStreamUdp};

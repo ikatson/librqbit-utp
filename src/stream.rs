@@ -994,7 +994,31 @@ impl AsyncRead for UtpStreamReadHalf {
             }
 
             let msg = match this.rx.poll_recv(cx) {
-                Poll::Ready(Some(UserRxMessage::UtpMessage(msg))) => msg,
+                Poll::Ready(Some(UserRxMessage::UtpMessage(msg))) => {
+                    let mut w = std::io::BufWriter::new(
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("/tmp/debugdata")
+                            .unwrap(),
+                    );
+                    use std::io::Write;
+                    writeln!(
+                        &mut w,
+                        "{:#?}, payload_len={}",
+                        msg.header,
+                        msg.payload().len()
+                    )
+                    .unwrap();
+                    for chunk in msg.payload().chunks(50) {
+                        for byte in chunk {
+                            write!(&mut w, "{:02x} ", *byte).unwrap();
+                        }
+                        writeln!(&mut w, "").unwrap();
+                    }
+
+                    msg
+                }
                 Poll::Ready(Some(UserRxMessage::Error(msg))) => {
                     return Poll::Ready(Err(std::io::Error::other(msg)))
                 }
@@ -1525,7 +1549,7 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
 
             match this.next_poll_send_to_at() {
                 PollAt::Now => {
-                    trace!("need to repoll");
+                    trace!(?this.timers.kind, ?this.timers.ack_delay_timer, this.ack_to_transmit=?this.ack_to_transmit(), "need to repoll");
                     continue;
                 }
                 PollAt::Time(instant) => {
