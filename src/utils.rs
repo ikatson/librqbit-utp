@@ -1,7 +1,6 @@
-use std::{cmp::Ordering, future::Future, task::Waker};
+use std::{cmp::Ordering, collections::VecDeque, future::Future, task::Waker};
 
 use anyhow::bail;
-use smoltcp::storage::RingBuffer;
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
 use tracing::{trace, Instrument};
 
@@ -53,11 +52,12 @@ pub fn seq_nr_offset(new: u16, old: u16, wrap_tolerance: u16) -> isize {
     }
 }
 
-pub fn fill_buffer_from_rb(
+fn fill_buffer_from_slices(
     out_buf: &mut [u8],
-    rb: &RingBuffer<'static, u8>,
     offset: usize,
     len: usize,
+    first: &[u8],
+    second: &[u8],
 ) -> anyhow::Result<()> {
     if out_buf.len() < len {
         bail!(
@@ -67,27 +67,44 @@ pub fn fill_buffer_from_rb(
         )
     }
 
+    let mut offset = offset;
     let mut out_buf = out_buf;
-    let mut current_offset = offset;
     let mut remaining = len;
 
-    while remaining > 0 {
-        let chunk = rb.get_allocated(current_offset, remaining);
-        if chunk.is_empty() {
-            bail!(
-                "not enough data in ring buffer. rb.len={} requested_offset={} requested_len={}",
-                rb.len(),
-                offset,
-                len
-            );
+    for mut chunk in [first, second] {
+        // Advance until offset is found
+        if offset > 0 {
+            if chunk.len() < offset {
+                offset -= chunk.len();
+                continue;
+            } else {
+                chunk = &chunk[offset..];
+                offset = 0;
+            }
         }
-        out_buf[..chunk.len()].copy_from_slice(chunk);
-        out_buf = &mut out_buf[chunk.len()..];
-        remaining -= chunk.len();
-        current_offset += chunk.len()
+
+        assert_eq!(offset, 0);
+        let advance = remaining.min(chunk.len());
+        out_buf[..advance].copy_from_slice(&chunk[..advance]);
+        out_buf = &mut out_buf[advance..];
+        remaining -= advance;
+    }
+
+    if remaining > 0 {
+        bail!("not enough data in ring buffer");
     }
 
     Ok(())
+}
+
+pub fn fill_buffer_from_rb(
+    out_buf: &mut [u8],
+    rb: &VecDeque<u8>,
+    offset: usize,
+    len: usize,
+) -> anyhow::Result<()> {
+    let (first, second) = rb.as_slices();
+    fill_buffer_from_slices(out_buf, offset, len, first, second)
 }
 
 pub(crate) struct DropGuardSendBeforeDeath<Msg> {
@@ -140,6 +157,7 @@ pub fn log_before_and_after_if_changed<
 
 #[cfg(test)]
 mod tests {
+    use super::fill_buffer_from_slices;
 
     #[test]
     fn test_seq_nr_offset() {
@@ -169,5 +187,76 @@ mod tests {
             seq_nr_offset(u16::MAX, 1024, 1024),
             u16::MAX as isize - 1024
         );
+    }
+
+    #[test]
+    fn test_fill_buffer_from_rb() {
+        const E: u8 = 255u8;
+        let mut buf = [E; 10];
+
+        fill_buffer_from_slices(&mut buf, 0, 0, &[], &[]).unwrap();
+        assert_eq!(buf, [E; 10]);
+
+        assert!(fill_buffer_from_slices(&mut buf, 0, 1, &[], &[]).is_err());
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 0, 1, &[1, 2, 3], &[4, 5, 6]).is_ok());
+        assert_eq!(buf, [1, E, E, E, E, E, E, E, E, E]);
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 0, 3, &[1, 2, 3], &[4, 5, 6]).is_ok());
+        assert_eq!(buf, [1, 2, 3, E, E, E, E, E, E, E]);
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 0, 4, &[1, 2, 3], &[4, 5, 6]).is_ok());
+        assert_eq!(buf, [1, 2, 3, 4, E, E, E, E, E, E]);
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 0, 4, &[1, 2, 3], &[4, 5, 6]).is_ok());
+        assert_eq!(buf, [1, 2, 3, 4, E, E, E, E, E, E]);
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 1, 3, &[1, 2, 3], &[4, 5, 6]).is_ok());
+        assert_eq!(buf, [2, 3, 4, E, E, E, E, E, E, E]);
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 1, 4, &[1, 2, 3], &[4, 5, 6]).is_ok());
+        assert_eq!(buf, [2, 3, 4, 5, E, E, E, E, E, E]);
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 1, 5, &[1, 2, 3], &[4, 5, 6]).is_ok());
+        assert_eq!(buf, [2, 3, 4, 5, 6, E, E, E, E, E]);
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 1, 6, &[1, 2, 3], &[4, 5, 6]).is_err());
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 3, 0, &[1, 2, 3], &[4, 5, 6]).is_ok());
+        assert_eq!(buf, [E, E, E, E, E, E, E, E, E, E]);
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 3, 1, &[1, 2, 3], &[4, 5, 6]).is_ok());
+        assert_eq!(buf, [4, E, E, E, E, E, E, E, E, E]);
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 3, 3, &[1, 2, 3], &[4, 5, 6]).is_ok());
+        assert_eq!(buf, [4, 5, 6, E, E, E, E, E, E, E]);
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 5, 1, &[1, 2, 3], &[4, 5, 6]).is_ok());
+        assert_eq!(buf, [6, E, E, E, E, E, E, E, E, E]);
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 5, 2, &[1, 2, 3], &[4, 5, 6]).is_err());
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 5, 2, &[1, 2, 3], &[4, 5, 6]).is_err());
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 6, 0, &[1, 2, 3], &[4, 5, 6]).is_ok());
+        assert_eq!(buf, [E, E, E, E, E, E, E, E, E, E]);
+
+        buf = [E; 10];
+        assert!(fill_buffer_from_slices(&mut buf, 6, 1, &[1, 2, 3], &[4, 5, 6]).is_err());
     }
 }

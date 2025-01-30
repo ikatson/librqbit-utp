@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     future::Future,
     net::SocketAddr,
     pin::Pin,
@@ -9,7 +10,6 @@ use std::{
 
 use anyhow::{bail, Context};
 use parking_lot::Mutex;
-use smoltcp::storage::RingBuffer;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc::{self, channel, Receiver, UnboundedReceiver},
@@ -719,8 +719,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let (removed_headers, removed_bytes) = self.tx.remove_up_to_ack(msg.header.ack_nr);
         if removed_headers > 0 {
             let mut g = self.user_tx.locked.lock();
-            let was_full = g.buffer.is_full();
-            g.buffer.dequeue_allocated(removed_bytes);
+            let was_full = g.is_full();
+            g.truncate_front(removed_bytes);
             if was_full {
                 if let Some(w) = g.buffer_no_longer_full.take() {
                     w.wake();
@@ -957,7 +957,8 @@ struct WakeableRingBuffer {
     // When the writer shuts down, or both reader and writer die, the stream is closed.
     closed: bool,
 
-    buffer: RingBuffer<'static, u8>,
+    capacity: usize,
+    buffer: VecDeque<u8>,
 
     // This is woken up by dispatcher when the buffer has space if it didn't have it previously.
     buffer_no_longer_full: Option<Waker>,
@@ -968,6 +969,22 @@ struct WakeableRingBuffer {
 }
 
 impl WakeableRingBuffer {
+    fn truncate_front(&mut self, count: usize) {
+        drop(self.buffer.drain(..count))
+    }
+
+    fn enqueue_slice(&mut self, bytes: &[u8]) -> usize {
+        // I really hope that gets optimized away
+        let len = (self.capacity - self.buffer.len()).min(bytes.len());
+        let it = bytes.iter().copied().take(len);
+        self.buffer.extend(it);
+        len
+    }
+
+    fn is_full(&self) -> bool {
+        self.buffer.len() == self.capacity
+    }
+
     // This will send FIN (if not yet).
     fn mark_stream_dead(&mut self) {
         self.dead = true;
@@ -1093,9 +1110,9 @@ impl AsyncWrite for UtpStreamWriteHalf {
             )));
         }
 
-        let count = g.buffer.enqueue_slice(buf);
+        let count = g.enqueue_slice(buf);
         if count == 0 {
-            assert!(g.buffer.is_full());
+            assert!(g.is_full());
             update_optional_waker(&mut g.buffer_no_longer_full, cx);
             return Poll::Pending;
         }
@@ -1311,7 +1328,8 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
         let user_rx_sender_last_eof_permit = user_rx_sender.clone().try_reserve_owned().unwrap();
         let user_tx = Arc::new(UserTx {
             locked: Mutex::new(WakeableRingBuffer {
-                buffer: RingBuffer::new(vec![0u8; socket.opts().virtual_socket_tx_bytes.get()]),
+                buffer: VecDeque::new(),
+                capacity: socket.opts().virtual_socket_tx_bytes.get(),
                 buffer_no_longer_full: None,
                 buffer_has_data: None,
                 buffer_flushed: None,
