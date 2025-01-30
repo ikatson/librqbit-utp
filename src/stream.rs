@@ -312,7 +312,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn rx_window(&self) -> u32 {
-        (self.user_rx_sender.capacity() * self.socket_opts.max_incoming_packet_size) as u32
+        (self.user_rx_sender.capacity() * self.socket_opts.max_incoming_packet_size.get()) as u32
     }
 
     // Returns true if UDP socket is full
@@ -595,6 +595,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             let max_payload_size = self
                 .socket_opts
                 .max_outgoing_payload_size
+                .get()
                 .min(remote_window_remaining);
             let payload_size = max_payload_size.min(remaining);
 
@@ -783,7 +784,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         if count > 0 {
                             trace!(count, "dequeued messages to user rx");
                         } else {
-                            trace!(asm = %self.assembler.debug_string(false), "out of order");
+                            trace!(asm = %self.assembler.debug_string(cfg!(test)), "out of order");
                         }
 
                         self.last_consumed_remote_seq_nr += count as u16;
@@ -1301,12 +1302,12 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
         } = args;
 
         let (user_rx_sender, user_rx_receiver) =
-            channel(socket.opts().max_user_rx_buffered_packets);
+            channel(socket.opts().max_user_rx_buffered_packets.get());
         // this unwrap is fine as max_user_rx_buffered_packets was validated as part of UtpSocket
         let user_rx_sender_last_eof_permit = user_rx_sender.clone().try_reserve_owned().unwrap();
         let user_tx = Arc::new(UserTx {
             locked: Mutex::new(WakeableRingBuffer {
-                buffer: RingBuffer::new(vec![0u8; socket.opts().virtual_socket_tx_bytes]),
+                buffer: RingBuffer::new(vec![0u8; socket.opts().virtual_socket_tx_bytes.get()]),
                 buffer_no_longer_full: None,
                 buffer_has_data: None,
                 buffer_flushed: None,
@@ -1369,7 +1370,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             },
             this_poll: ThisPoll {
                 now,
-                tmp_buf: vec![0u8; socket.opts().max_incoming_packet_size],
+                tmp_buf: vec![0u8; socket.opts().max_incoming_packet_size.get()],
                 transport_pending: false,
             },
             congestion_controller: socket_opts.congestion.create(now),
@@ -1626,7 +1627,9 @@ pub(crate) enum PollAt {
 
 #[cfg(test)]
 mod tests {
-    use std::{future::poll_fn, pin::Pin, sync::Arc, task::Poll, time::Duration};
+    use std::{
+        future::poll_fn, num::NonZeroUsize, pin::Pin, sync::Arc, task::Poll, time::Duration,
+    };
 
     use futures::FutureExt;
     use tokio::{
@@ -1864,7 +1867,7 @@ mod tests {
     async fn test_sends_up_to_remote_window_only_multi_msg() {
         setup_test_logging();
         let mut t = make_test_vsock(Default::default());
-        t.vsock.socket_opts.max_outgoing_payload_size = 2;
+        t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(2).unwrap();
 
         assert_eq!(t.vsock.last_remote_window, 0);
 
@@ -1965,7 +1968,7 @@ mod tests {
     async fn test_fast_retransmit() {
         setup_test_logging();
         let mut t = make_test_vsock(Default::default());
-        t.vsock.socket_opts.max_outgoing_payload_size = 5;
+        t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(5).unwrap();
 
         // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
         t.vsock.rtte.force_timeout(Duration::from_secs(10));
@@ -2362,7 +2365,7 @@ mod tests {
         // Enable Nagle (should be on by default, but let's be explicit)
         t.vsock.socket_opts.nagle = true;
         // Set a large max payload size to ensure we're testing Nagle, not fragmentation
-        t.vsock.socket_opts.max_outgoing_payload_size = 1024;
+        t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(1024).unwrap();
 
         // Allow sending by setting window size
         t.send_msg(
@@ -2884,7 +2887,7 @@ mod tests {
     async fn test_duplicate_ack_only_on_st_state() {
         setup_test_logging();
         let mut t = make_test_vsock(Default::default());
-        t.vsock.socket_opts.max_outgoing_payload_size = 5;
+        t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(5).unwrap();
 
         // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
         t.vsock.rtte.force_timeout(Duration::from_secs(10));
@@ -2989,7 +2992,7 @@ mod tests {
     async fn test_finack_not_sent_until_all_data_consumed() {
         setup_test_logging();
         let mut t = make_test_vsock(Default::default());
-        t.vsock.socket_opts.max_outgoing_payload_size = 5;
+        t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(5).unwrap();
 
         // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
         t.vsock.rtte.force_timeout(Duration::from_secs(10));
@@ -3059,7 +3062,7 @@ mod tests {
         // Send packets out of order to fill assembly queue
         t.send_data(3, "third"); // Out of order
         t.send_data(4, "fourth"); // Out of order
-        t.send_data(5, "fifth"); // Should be dropped - assembly queue full
+        t.send_data(6, "sixth"); // Should be dropped - assembly queue full
 
         t.poll_once_assert_pending().await;
 

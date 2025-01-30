@@ -15,10 +15,14 @@ pub struct UtpMessage {
 
 impl std::fmt::Debug for UtpMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UtpMessage")
-            .field("header", &self.header)
-            .field("payload_size", &self.payload().len())
-            .finish_non_exhaustive()
+        write!(
+            f,
+            "{:?}:seq_nr={}:ack_nr={}:payload={}",
+            self.header.get_type(),
+            self.header.seq_nr,
+            self.header.ack_nr,
+            self.payload().len()
+        )
     }
 }
 

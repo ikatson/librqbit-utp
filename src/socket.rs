@@ -1,6 +1,7 @@
 use std::{
     collections::{hash_map::Entry, HashMap, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::NonZeroUsize,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -100,23 +101,26 @@ impl SocketOpts {
     fn validate(&self) -> anyhow::Result<ValidatedSocketOpts> {
         #[derive(Clone, Copy)]
         struct MtuCalc {
-            max_packet_size: usize,
-            max_payload_size: usize,
+            max_packet_size: NonZeroUsize,
+            max_payload_size: NonZeroUsize,
         }
 
         fn calc(mtu: usize) -> anyhow::Result<MtuCalc> {
-            let max_packet_size = mtu
-                .checked_sub(IPV4_HEADER)
-                .context("MTU too low")?
-                .checked_sub(MIN_UDP_HEADER)
-                .context("MTU too low")?;
-            let max_payload_size = max_packet_size
-                .checked_sub(UTP_HEADER_SIZE)
-                .context("MTU too low")?;
+            let max_packet_size = NonZeroUsize::new(
+                mtu.checked_sub(IPV4_HEADER)
+                    .context("MTU too low")?
+                    .checked_sub(MIN_UDP_HEADER)
+                    .context("MTU too low")?,
+            )
+            .context("max_packet_size == 0")?;
+            let max_payload_size = NonZeroUsize::new(
+                max_packet_size
+                    .get()
+                    .checked_sub(UTP_HEADER_SIZE)
+                    .context("MTU too low")?,
+            )
+            .context("MTU too low")?;
 
-            if max_payload_size == 0 {
-                bail!("MTU too low");
-            }
             Ok(MtuCalc {
                 max_packet_size,
                 max_payload_size,
@@ -148,23 +152,19 @@ impl SocketOpts {
             }
         };
 
-        let max_user_rx_buffered_packets = self
-            .rx_bufsize_approx
-            .unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK)
-            / incoming.max_payload_size;
+        let max_user_rx_buffered_packets = NonZeroUsize::new(
+            self.rx_bufsize_approx
+                .unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK)
+                / incoming.max_payload_size,
+        )
+        .context("max_user_rx_buffered_packets = 0. Increase rx_bufsize_approx, or decrease MTU")?;
 
-        if max_user_rx_buffered_packets == 0 {
-            bail!("max_user_rx_buffered_packets = 0. Increase rx_bufsize_approx, or decrease MTU")
-        }
+        let max_rx_out_of_order_packets =
+            NonZeroUsize::new(self.max_rx_out_of_order_packets.unwrap_or(64))
+                .context("invalid configuration: virtual_socket_tx_packets = 0")?;
 
-        let max_rx_out_of_order_packets = self.max_rx_out_of_order_packets.unwrap_or(64);
-        if max_rx_out_of_order_packets == 0 {
-            bail!("invalid configuration: virtual_socket_tx_packets = 0");
-        }
-        let virtual_socket_tx_bytes = self.tx_bytes.unwrap_or(1024 * 1024);
-        if virtual_socket_tx_bytes == 0 {
-            bail!("invalid configuration: virtual_socket_tx_bytes = 0")
-        }
+        let virtual_socket_tx_bytes = NonZeroUsize::new(self.tx_bytes.unwrap_or(1024 * 1024))
+            .context("invalid configuration: virtual_socket_tx_bytes = 0")?;
 
         Ok(ValidatedSocketOpts {
             max_incoming_packet_size: incoming.max_packet_size,
@@ -178,15 +178,15 @@ impl SocketOpts {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub(crate) struct ValidatedSocketOpts {
-    pub max_incoming_packet_size: usize,
-    pub max_outgoing_payload_size: usize,
+    pub max_incoming_packet_size: NonZeroUsize,
+    pub max_outgoing_payload_size: NonZeroUsize,
 
-    pub max_user_rx_buffered_packets: usize,
+    pub max_user_rx_buffered_packets: NonZeroUsize,
 
-    pub max_rx_out_of_order_packets: usize,
-    pub virtual_socket_tx_bytes: usize,
+    pub max_rx_out_of_order_packets: NonZeroUsize,
+    pub virtual_socket_tx_bytes: NonZeroUsize,
 
     pub nagle: bool,
 

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, num::NonZeroUsize};
 
 use anyhow::Context;
 use smoltcp::storage::Assembler;
@@ -22,13 +22,13 @@ pub enum AssemblerAddRemoveResult {
 }
 
 impl AssembledRx {
-    pub fn new(tx_buf_len: usize) -> Self {
+    pub fn new(tx_buf_len: NonZeroUsize) -> Self {
         Self {
             assembler: Assembler::new(),
-            queue: VecDeque::from(vec![Default::default(); tx_buf_len]),
+            queue: VecDeque::from(vec![Default::default(); tx_buf_len.get() - 1]),
             len: 0,
             len_bytes: 0,
-            capacity: tx_buf_len,
+            capacity: tx_buf_len.get(),
         }
     }
 
@@ -57,20 +57,7 @@ impl AssembledRx {
                     return Ok(());
                 }
 
-                write!(f, ", queue=")?;
-
-                for (idx, item) in self.asm.queue.iter().enumerate() {
-                    if idx > 0 {
-                        write!(f, ", ")?;
-                    }
-                    write!(
-                        f,
-                        "{{type={:?}:seq_nr={}:payload={}}}",
-                        item.header.get_type(),
-                        item.header.seq_nr,
-                        item.payload().len()
-                    )?;
-                }
+                write!(f, ", queue={:?}", self.asm.queue)?;
                 Ok(())
             }
         }
@@ -94,6 +81,11 @@ impl AssembledRx {
     ) -> anyhow::Result<AssemblerAddRemoveResult> {
         if self.is_full() {
             trace!(offset, "assembler buffer full");
+            return Ok(AssemblerAddRemoveResult::Unavailable(msg));
+        }
+
+        if offset > self.queue.len() {
+            trace!(offset, "message is past assembler's window");
             return Ok(AssemblerAddRemoveResult::Unavailable(msg));
         }
 
@@ -141,6 +133,7 @@ impl AssembledRx {
         } else {
             self.len_bytes += msg.payload().len();
             self.len += 1;
+            // If we got here, offset is > 0.
             *self.queue.get_mut(offset - 1).unwrap() = msg;
             Ok(AssemblerAddRemoveResult::SentToUserRx(removed))
         }
@@ -149,6 +142,8 @@ impl AssembledRx {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use tokio::sync::mpsc::channel;
     use tracing::trace;
 
@@ -173,7 +168,7 @@ mod tests {
     #[test]
     fn test_asm_add_one_in_order() {
         let (tx, _rx) = channel(1);
-        let mut asm = AssembledRx::new(2);
+        let mut asm = AssembledRx::new(NonZeroUsize::new(2).unwrap());
         assert_eq!(
             asm.add_remove(msg(0, b""), 0, &tx).unwrap(),
             AssemblerAddRemoveResult::SentToUserRx(1)
@@ -183,7 +178,7 @@ mod tests {
     #[test]
     fn test_asm_add_one_out_of_order() {
         let (tx, _rx) = channel(1);
-        let mut asm = AssembledRx::new(2);
+        let mut asm = AssembledRx::new(NonZeroUsize::new(2).unwrap());
         assert_eq!(
             asm.add_remove(msg(0, b""), 1, &tx).unwrap(),
             AssemblerAddRemoveResult::SentToUserRx(0)
@@ -193,7 +188,7 @@ mod tests {
     #[test]
     fn test_asm_channel_full_asm_empty() {
         let (tx, _rx) = channel(1);
-        let mut asm = AssembledRx::new(2);
+        let mut asm = AssembledRx::new(NonZeroUsize::new(2).unwrap());
         let msg = msg(0, b"");
         // fill the channel
         tx.try_send(crate::stream::UserRxMessage::UtpMessage(msg.clone()))
@@ -208,7 +203,7 @@ mod tests {
     #[test]
     fn test_asm_channel_full_asm_not_empty() {
         let (tx, _rx) = channel(1);
-        let mut asm = AssembledRx::new(2);
+        let mut asm = AssembledRx::new(NonZeroUsize::new(2).unwrap());
         let msg = msg(0, b"");
         // fill the channel
         tx.try_send(crate::stream::UserRxMessage::UtpMessage(msg.clone()))
@@ -235,7 +230,7 @@ mod tests {
         setup_test_logging();
 
         let (tx, mut rx) = channel(3);
-        let mut asm = AssembledRx::new(3);
+        let mut asm = AssembledRx::new(NonZeroUsize::new(3).unwrap());
 
         let msg_0 = msg(0, b"hello");
         let msg_1 = msg(1, b"world");
@@ -271,7 +266,7 @@ mod tests {
         setup_test_logging();
 
         let (tx, mut rx) = channel(3);
-        let mut asm = AssembledRx::new(3);
+        let mut asm = AssembledRx::new(NonZeroUsize::new(3).unwrap());
 
         let msg_0 = msg(0, b"hello");
         let msg_1 = msg(1, b"world");
@@ -300,5 +295,31 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap(), UserRxMessage::UtpMessage(msg_0));
         assert_eq!(rx.try_recv().unwrap(), UserRxMessage::UtpMessage(msg_1));
         assert_eq!(rx.try_recv().unwrap(), UserRxMessage::UtpMessage(msg_2));
+    }
+
+    #[test]
+    fn test_asm_write_out_of_bounds() {
+        setup_test_logging();
+
+        let (tx, _rx) = channel(3);
+        let mut asm = AssembledRx::new(NonZeroUsize::new(3).unwrap());
+
+        let msg_2 = msg(2, b"test");
+        let msg_3 = msg(3, b"test");
+
+        assert_eq!(
+            asm.add_remove(msg_2.clone(), 2, &tx).unwrap(),
+            AssemblerAddRemoveResult::SentToUserRx(0)
+        );
+        trace!(asm=%asm.debug_string(true));
+        assert_eq!(asm.len(), 1);
+
+        // A message that is out of bounds of the assembler should be dropped.
+        assert_eq!(
+            asm.add_remove(msg_3.clone(), 3, &tx).unwrap(),
+            AssemblerAddRemoveResult::Unavailable(msg_3)
+        );
+        trace!(asm=%asm.debug_string(true));
+        assert_eq!(asm.len(), 1);
     }
 }
