@@ -27,17 +27,15 @@
 mod congestion;
 mod constants;
 mod message;
-mod out_of_order_rx;
 pub mod raw;
 mod rtte;
 mod seq_nr;
-mod socket;
-mod stream_dispatch;
-mod stream_tx;
-
 mod smoltcp_assembler;
+mod socket;
 mod stream;
+mod stream_dispatch;
 mod stream_rx;
+mod stream_tx;
 #[cfg(test)]
 mod test_util;
 mod traits;
@@ -46,3 +44,5 @@ mod utils;
 pub use socket::{CongestionConfig, CongestionControllerKind, SocketOpts, UtpSocket, UtpSocketUdp};
 pub use stream::{UtpStream, UtpStreamUdp};
 pub use traits::Transport;
+
+type Payload = Vec<u8>;

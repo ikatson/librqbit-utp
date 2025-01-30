@@ -1,11 +1,14 @@
 use tracing::debug;
 
-use crate::raw::{Type, UtpHeader};
+use crate::{
+    raw::{Type, UtpHeader},
+    Payload,
+};
 
 #[derive(Default, Clone, PartialEq, Eq)]
 pub struct UtpMessage {
     pub header: UtpHeader,
-    data: Vec<u8>,
+    pub data: Payload,
 }
 
 impl std::fmt::Debug for UtpMessage {
@@ -28,6 +31,15 @@ impl UtpMessage {
             header,
             data: payload.to_owned(),
         }
+    }
+
+    pub fn consume(self) -> (UtpHeader, Payload) {
+        (self.header, self.data)
+    }
+
+    #[cfg(test)]
+    pub fn into_payload(self) -> Payload {
+        self.data
     }
 
     pub fn deserialize(buf: &[u8]) -> Option<Self> {

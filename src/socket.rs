@@ -78,8 +78,7 @@ pub struct SocketOpts {
     pub mtu_autodetect_host: Option<IpAddr>,
 
     // For flow control, if the user isn't reading, when to start dropping packets.
-    // This is an approximate number in bytes.
-    pub rx_bufsize_approx: Option<usize>,
+    pub rx_bufsize: Option<usize>,
 
     // How many out-of-order packets to track in the RX window.
     pub max_rx_out_of_order_packets: Option<usize>,
@@ -148,12 +147,9 @@ impl SocketOpts {
             }
         };
 
-        let max_user_rx_buffered_packets = NonZeroUsize::new(
-            self.rx_bufsize_approx
-                .unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK)
-                / incoming.max_payload_size,
-        )
-        .context("max_user_rx_buffered_packets = 0. Increase rx_bufsize_approx, or decrease MTU")?;
+        let max_user_rx_buffered_bytes =
+            NonZeroUsize::new(self.rx_bufsize.unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK))
+                .context("max_user_rx_buffered_bytes = 0. Increase rx_bufsize")?;
 
         let max_rx_out_of_order_packets =
             NonZeroUsize::new(self.max_rx_out_of_order_packets.unwrap_or(64))
@@ -165,7 +161,7 @@ impl SocketOpts {
         Ok(ValidatedSocketOpts {
             max_incoming_packet_size: incoming.max_packet_size,
             max_outgoing_payload_size: outgoing.max_payload_size,
-            max_user_rx_buffered_packets,
+            max_user_rx_buffered_bytes,
             max_rx_out_of_order_packets,
             virtual_socket_tx_bytes,
             nagle: !self.disable_nagle,
@@ -178,8 +174,7 @@ impl SocketOpts {
 pub(crate) struct ValidatedSocketOpts {
     pub max_incoming_packet_size: NonZeroUsize,
     pub max_outgoing_payload_size: NonZeroUsize,
-
-    pub max_user_rx_buffered_packets: NonZeroUsize,
+    pub max_user_rx_buffered_bytes: NonZeroUsize,
 
     pub max_rx_out_of_order_packets: NonZeroUsize,
     pub virtual_socket_tx_bytes: NonZeroUsize,

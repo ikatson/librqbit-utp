@@ -8,30 +8,27 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use tokio::{
-    sync::mpsc::{self, channel, UnboundedReceiver},
-    time::Sleep,
-};
+use parking_lot::Mutex;
+use tokio::{sync::mpsc::UnboundedReceiver, time::Sleep};
 use tracing::{debug, error_span, trace, warn};
 
 use crate::{
     congestion::CongestionController,
     constants::{ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, UTP_HEADER_SIZE},
     message::UtpMessage,
-    out_of_order_rx::{AssemblerAddRemoveResult, OutOfOrderQueue},
     raw::{Type, UtpHeader},
     rtte::RttEstimator,
     seq_nr::SeqNr,
     socket::{ControlRequest, ValidatedSocketOpts},
     stream::UtpStream,
-    stream_rx::UtpStreamReadHalf,
+    stream_rx::{AssemblerAddRemoveResult, UserRx, UserRxLocked, UtpStreamReadHalf},
     stream_tx::{FragmentedTx, UserTx, UtpStreamWriteHalf},
     traits::{Transport, UtpEnvironment},
     utils::{
         log_before_and_after_if_changed, spawn_print_error, update_optional_waker,
         DropGuardSendBeforeDeath,
     },
-    UtpSocket,
+    Payload, UtpSocket,
 };
 
 // This contains more states than Rust could model with its enums, but I'm keeping
@@ -170,9 +167,18 @@ impl VirtualSocketState {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum UserRxMessage {
-    UtpMessage(UtpMessage),
+    Payload(Payload),
     Error(String),
     Eof,
+}
+
+impl UserRxMessage {
+    pub fn len_bytes(&self) -> usize {
+        match &self {
+            UserRxMessage::Payload(buf) => buf.len(),
+            _ => 0,
+        }
+    }
 }
 
 // An equivalent of a TCP socket for uTP.
@@ -183,8 +189,6 @@ struct VirtualSocket<T, Env> {
     socket_opts: ValidatedSocketOpts,
 
     remote: SocketAddr,
-
-    assembler: OutOfOrderQueue,
     conn_id_send: SeqNr,
 
     // Triggers delay-based operations
@@ -218,11 +222,7 @@ struct VirtualSocket<T, Env> {
     // Unacked fragments. Ready to send or retransmit.
     tx: FragmentedTx,
 
-    // The user sides's queue with packets fully processed and ready to consume.
-    // This is what "UtpStream::poll_read" reads from.
-    user_rx_sender: mpsc::Sender<UserRxMessage>,
-    // The permit to send the last EOF and not block the dispatcher.
-    user_rx_sender_last_eof_permit: Option<mpsc::OwnedPermit<UserRxMessage>>,
+    user_rx: UserRx,
 
     // Last received ACK for fast retransmit
     local_rx_last_ack: Option<SeqNr>,
@@ -311,9 +311,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn rx_window(&self) -> u32 {
-        let cap = (self.user_rx_sender.capacity() * self.socket_opts.max_incoming_packet_size.get())
-            as u32;
-        cap.saturating_sub(self.assembler.len_bytes() as u32)
+        self.user_rx.window() as u32
     }
 
     // Returns true if UDP socket is full
@@ -492,7 +490,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<bool> {
         let mut header = self.outgoing_header();
-        header.extensions.selective_ack = self.assembler.selective_ack();
+        header.extensions.selective_ack = self.user_rx.selective_ack();
         self.send_control_packet(cx, socket, header)
     }
 
@@ -628,11 +626,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn try_send_last_message_to_user_rx(&mut self, msg: UserRxMessage) {
-        if let Some(permit) = self.user_rx_sender_last_eof_permit.take() {
-            permit.send(msg);
-        } else {
-            let _ = self.user_rx_sender.try_send(msg);
-        }
+        self.user_rx.enqueue_last_message(msg);
     }
 
     fn just_before_death(&mut self, error: Option<&anyhow::Error>) {
@@ -776,18 +770,18 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     "adding ST_DATA message to assember"
                 );
 
-                let assembler_was_empty = self.assembler.is_empty();
+                let assembler_was_empty = self.user_rx.assembler_empty();
 
                 match self
-                    .assembler
-                    .add_remove(msg, offset as usize, &self.user_rx_sender)
+                    .user_rx
+                    .add_remove(msg, offset as usize)
                     .context("fatal error in assember")?
                 {
-                    AssemblerAddRemoveResult::SentToUserRx(count) => {
+                    AssemblerAddRemoveResult::ConsumedSequenceNumbers(count) => {
                         if count > 0 {
                             trace!(count, "dequeued messages to user rx");
                         } else {
-                            trace!(asm = %self.assembler.debug_string(cfg!(test)), "out of order");
+                            trace!("out of order");
                         }
 
                         self.last_consumed_remote_seq_nr += count as u16;
@@ -831,12 +825,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 // Per RFC 5681, we should send an immediate ACK when either:
                 //  1) an out-of-order segment is received, or
                 //  2) a segment arrives that fills in all or part of a gap in sequence space.
-                if !self.assembler.is_empty()
+                if !self.user_rx.assembler_empty()
                     || !assembler_was_empty
                     || self.immediate_ack_to_transmit()
                 {
                     trace!(
-                        assembler_not_empty = !self.assembler.is_empty(),
+                        assembler_not_empty = !self.user_rx.assembler_empty(),
                         assembler_was_empty,
                         immediate_ack_to_transmit = self.immediate_ack_to_transmit(),
                         "sending immediate ACK"
@@ -947,6 +941,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         // We wait for the earliest of our timers to fire.
         self.timers.kind.poll_at().min(delayed_ack_poll_at)
+    }
+
+    fn user_rx_is_closed(&self) -> bool {
+        todo!()
     }
 }
 
@@ -1081,14 +1079,16 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             parent_span,
         } = args;
 
-        let (user_rx_sender, user_rx_receiver) =
-            channel(socket.opts().max_user_rx_buffered_packets.get());
-        // this unwrap is fine as max_user_rx_buffered_packets was validated as part of UtpSocket
-        let user_rx_sender_last_eof_permit = user_rx_sender.clone().try_reserve_owned().unwrap();
+        let user_rx_locked = Arc::new(Mutex::new(UserRxLocked::new(
+            socket.opts().max_user_rx_buffered_bytes.get(),
+        )));
+        let user_rx = UserRx::new(
+            user_rx_locked.clone(),
+            socket.opts().max_rx_out_of_order_packets,
+        );
+        let read_half = UtpStreamReadHalf::new(user_rx_locked);
+
         let user_tx = UserTx::new(socket.opts().virtual_socket_tx_bytes);
-
-        let read_half = UtpStreamReadHalf::new(user_rx_receiver);
-
         let write_half = UtpStreamWriteHalf::new(user_tx.clone());
 
         let env = socket.env.copy();
@@ -1103,7 +1103,6 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             socket_created: socket.created,
             socket_opts: *socket_opts,
             remote,
-            assembler: OutOfOrderQueue::new(socket_opts.max_rx_out_of_order_packets),
             conn_id_send,
             timers: Timers {
                 kind: TimerKind::new(),
@@ -1120,8 +1119,6 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_sent_ack_nr,
             rx,
             tx: FragmentedTx::new(),
-            user_rx_sender,
-            user_rx_sender_last_eof_permit: Some(user_rx_sender_last_eof_permit),
             local_rx_last_ack: None,
             local_rx_dup_acks: 0,
             user_tx,
@@ -1144,6 +1141,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 ControlRequest::Shutdown((remote, conn_id_recv)),
                 &socket.control_requests,
             ),
+            user_rx,
         };
 
         let first_packet = if !is_outgoing {
@@ -1336,7 +1334,7 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
                 return Poll::Ready(Ok(()));
             }
 
-            if this.user_rx_sender.is_closed() && this.state.is_local_fin_or_later() {
+            if this.user_rx_is_closed() && this.state.is_local_fin_or_later() {
                 trace!(current_state=?this.state, "both halves are dead, no reason to continue");
                 this.just_before_death(None);
                 return Poll::Ready(Ok(()));
@@ -2758,7 +2756,7 @@ mod tests {
         header.seq_nr = 2.into();
         t.send_msg(header, "world");
         t.poll_once_assert_pending().await;
-        assert!(!t.vsock.assembler.is_empty());
+        assert!(!t.vsock.user_rx.assembler_empty());
         let sent = t.take_sent();
         assert_eq!(sent.len(), 1, "immediate ACK should have been sent");
         assert_eq!(sent[0].header.ack_nr, 0.into());
@@ -2768,7 +2766,7 @@ mod tests {
         header.seq_nr = 3.into();
         t.send_msg(header, "");
         t.poll_once_assert_pending().await;
-        assert!(!t.vsock.assembler.is_empty());
+        assert!(!t.vsock.user_rx.assembler_empty());
         assert_eq!(t.take_sent().len(), 0, "nothing gets sent for out of order");
 
         // send in-order. This should ACK the FIN
@@ -2788,7 +2786,7 @@ mod tests {
         // Configure socket with small buffers to test flow control
         let opts = SocketOpts {
             mtu: Some(5 + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
-            rx_bufsize_approx: Some(25), // Small receive buffer (~5 packets of size 5)
+            rx_bufsize: Some(25), // Small receive buffer (~5 packets of size 5)
             max_rx_out_of_order_packets: Some(5), // Small assembly queue
             ..Default::default()
         };
@@ -2816,7 +2814,7 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Only two packets should be in assembly queue
-        assert_eq!(t.vsock.assembler.len(), 2);
+        assert_eq!(t.vsock.user_rx.assembler_packets(), 2);
 
         // Send in-order packet to trigger processing
         t.send_data(1, "first");
