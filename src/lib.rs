@@ -37,6 +37,7 @@ mod stream;
 mod stream_tx;
 
 mod smoltcp_assembler;
+mod stream_rx;
 #[cfg(test)]
 mod test_util;
 mod traits;

@@ -10,7 +10,7 @@ use std::{
 use anyhow::{bail, Context};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::mpsc::{self, channel, Receiver, UnboundedReceiver},
+    sync::mpsc::{self, channel, UnboundedReceiver},
     time::Sleep,
 };
 use tracing::{debug, error_span, trace, warn};
@@ -24,6 +24,7 @@ use crate::{
     rtte::RttEstimator,
     seq_nr::SeqNr,
     socket::{ControlRequest, ValidatedSocketOpts},
+    stream_rx::UtpStreamReadHalf,
     stream_tx::{FragmentedTx, UserTx, UtpStreamWriteHalf},
     traits::{Transport, UtpEnvironment},
     utils::{
@@ -955,71 +956,6 @@ impl<T, E> Drop for VirtualSocket<T, E> {
     }
 }
 
-pub struct UtpStreamReadHalf {
-    rx: Receiver<UserRxMessage>,
-    current: Option<UtpMessage>,
-    offset: usize,
-}
-
-impl AsyncRead for UtpStreamReadHalf {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-
-        let mut written = false;
-
-        while buf.remaining() > 0 {
-            // If there was a previous message we haven't read till the end, do it.
-            if let Some(current) = this.current.as_ref() {
-                let payload = &current.payload()[this.offset..];
-                if payload.is_empty() {
-                    return Poll::Ready(Err(std::io::Error::other(
-                        "bug in UtpStreamReadHalf: payload is empty",
-                    )));
-                }
-
-                let len = buf.remaining().min(payload.len());
-
-                trace!(
-                    seq_nr = ?current.header.seq_nr,
-                    offset = this.offset,
-                    len,
-                    payload_len = current.payload().len(),
-                    "reading from UtpMessage to user"
-                );
-
-                buf.put_slice(&payload[..len]);
-                written = true;
-                this.offset += len;
-                if this.offset == current.payload().len() {
-                    this.offset = 0;
-                    this.current = None;
-                }
-            }
-
-            match this.rx.poll_recv(cx) {
-                Poll::Ready(Some(UserRxMessage::UtpMessage(msg))) => this.current = Some(msg),
-                Poll::Ready(Some(UserRxMessage::Error(msg))) => {
-                    return Poll::Ready(Err(std::io::Error::other(msg)))
-                }
-                Poll::Ready(Some(UserRxMessage::Eof)) => return Poll::Ready(Ok(())),
-
-                Poll::Ready(None) => return Poll::Ready(Err(std::io::Error::other("socket died"))),
-                Poll::Pending => break,
-            };
-        }
-
-        if written {
-            return Poll::Ready(Ok(()));
-        }
-
-        Poll::Pending
-    }
-}
-
 pub type UtpStreamUdp = UtpStream;
 
 pub struct UtpStream {
@@ -1192,11 +1128,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
         let user_rx_sender_last_eof_permit = user_rx_sender.clone().try_reserve_owned().unwrap();
         let user_tx = UserTx::new(socket.opts().virtual_socket_tx_bytes);
 
-        let read_half = UtpStreamReadHalf {
-            rx: user_rx_receiver,
-            current: None,
-            offset: 0,
-        };
+        let read_half = UtpStreamReadHalf::new(user_rx_receiver);
 
         let write_half = UtpStreamWriteHalf::new(user_tx.clone());
 
