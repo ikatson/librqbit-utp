@@ -77,9 +77,6 @@ pub struct SocketOpts {
     // once.
     pub mtu_autodetect_host: Option<IpAddr>,
 
-    // How much memory to pre-allocate for incoming packet pool.
-    pub packet_pool_max_memory: Option<usize>,
-
     // For flow control, if the user isn't reading, when to start dropping packets.
     // This is an approximate number in bytes.
     pub rx_bufsize_approx: Option<usize>,
