@@ -238,7 +238,7 @@ struct VirtualSocket<T, Env> {
 
     env: Env,
 
-    drop_guard: DropGuardSendBeforeDeath<ControlRequest<T, Env>>,
+    drop_guard: DropGuardSendBeforeDeath<ControlRequest>,
     parent_span: Option<tracing::Span>,
 }
 
