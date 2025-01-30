@@ -18,7 +18,7 @@ use tokio::{
 use tracing::{debug, error_span, trace, warn};
 
 use crate::{
-    assembled_rx::AssembledRx,
+    assembled_rx::{AssembledRx, AssemblerAddRemoveResult},
     congestion::CongestionController,
     constants::{ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, UTP_HEADER_SIZE},
     message::UtpMessage,
@@ -169,6 +169,7 @@ impl VirtualSocketState {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum UserRxMessage {
     UtpMessage(UtpMessage),
     Error(String),
@@ -778,7 +779,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     .add_remove(msg, offset as usize, &self.user_rx_sender)
                     .context("fatal error in assember")?
                 {
-                    Ok(count) => {
+                    AssemblerAddRemoveResult::SentToUserRx(count) => {
                         if count > 0 {
                             trace!(count, "dequeued messages to user rx");
                         } else {
@@ -796,8 +797,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                             }
                         }
                     }
-                    Err(_) => {
-                        trace!("cannot reassemble message, dropping");
+                    AssemblerAddRemoveResult::Unavailable(_) => {
+                        trace!("cannot reassemble message, ignoring it");
                     }
                 }
 
@@ -1017,17 +1018,19 @@ impl AsyncRead for UtpStreamReadHalf {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if buf.remaining() == 0 {
-            return Poll::Ready(Err(std::io::Error::other("empty buffer")));
-        }
 
-        loop {
+        while buf.remaining() > 0 {
             // If there was a previous message we haven't read till the end, do it.
             if let Some(current) = this.current.as_ref() {
                 let payload = &current.payload()[this.offset..];
+                if payload.is_empty() {
+                    return Poll::Ready(Err(std::io::Error::other(
+                        "bug in UtpStreamReadHalf: payload is empty",
+                    )));
+                }
+
                 let len = buf.remaining().min(payload.len());
 
-                assert!(len > 0);
                 trace!(
                     seq_nr = ?current.header.seq_nr,
                     offset = this.offset,
@@ -1042,7 +1045,6 @@ impl AsyncRead for UtpStreamReadHalf {
                     this.offset = 0;
                     this.current = None;
                 }
-                return Poll::Ready(Ok(()));
             }
 
             let msg = match this.rx.poll_recv(cx) {
@@ -1058,6 +1060,8 @@ impl AsyncRead for UtpStreamReadHalf {
 
             this.current = Some(msg);
         }
+
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -1620,6 +1624,7 @@ mod tests {
     use std::{future::poll_fn, pin::Pin, sync::Arc, task::Poll, time::Duration};
 
     use futures::FutureExt;
+    use smoltcp::wire::UDP_HEADER_LEN;
     use tokio::{
         io::{AsyncRead, AsyncWrite, AsyncWriteExt},
         sync::mpsc::{unbounded_channel, UnboundedSender},
@@ -1627,6 +1632,7 @@ mod tests {
     use tracing::trace;
 
     use crate::{
+        constants::{IPV4_HEADER, MIN_UDP_HEADER, UTP_HEADER_SIZE},
         message::UtpMessage,
         raw::{Type, UtpHeader},
         stream::VirtualSocketState,
@@ -1640,7 +1646,7 @@ mod tests {
     use super::{StreamArgs, UtpStream, UtpStreamStarter, VirtualSocket};
 
     fn make_msg(header: UtpHeader, payload: &str) -> UtpMessage {
-        UtpMessage::new_test(header, payload.as_bytes()).unwrap()
+        UtpMessage::new_test(header, payload.as_bytes())
     }
 
     struct TestVsock {
@@ -1655,6 +1661,13 @@ mod tests {
     impl TestVsock {
         fn send_msg(&mut self, header: UtpHeader, payload: &str) {
             self.tx.send(make_msg(header, payload)).unwrap()
+        }
+
+        fn send_data(&mut self, seq_nr: u16, payload: &str) {
+            let mut header = self.vsock.outgoing_header();
+            header.set_type(Type::ST_DATA);
+            header.seq_nr = seq_nr.into();
+            self.send_msg(header, payload);
         }
 
         fn take_sent(&self) -> Vec<UtpMessage> {
@@ -2584,13 +2597,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_flow_control() {
-        // TODO: write this.
-        //
-        // We now have only assembler for flow control, but not actual reader consuming data.
-    }
-
-    #[tokio::test]
     async fn test_sender_flow_control() {
         setup_test_logging();
         let mut t = make_test_vsock(Default::default());
@@ -3017,5 +3023,76 @@ mod tests {
         let sent = t.take_sent();
         assert_eq!(sent.len(), 1, "we should sent FIN ACK");
         assert_eq!(sent[0].header.ack_nr, 3.into());
+    }
+
+    #[tokio::test]
+    async fn test_flow_control() {
+        setup_test_logging();
+
+        // Configure socket with small buffers to test flow control
+        let opts = SocketOpts {
+            mtu: Some(5 + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
+            rx_bufsize_approx: Some(25), // Small receive buffer (~5 packets of size 5)
+            max_rx_out_of_order_packets: Some(5), // Small assembly queue
+            ..Default::default()
+        };
+
+        let mut t = make_test_vsock(opts);
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Test assembly queue limit first
+        // Send packets out of order to fill assembly queue
+        t.send_data(3, "third"); // Out of order
+        t.send_data(4, "fourth"); // Out of order
+        t.send_data(5, "fifth"); // Should be dropped - assembly queue full
+
+        t.poll_once_assert_pending().await;
+
+        // Only two packets should be in assembly queue
+        assert_eq!(t.vsock.assembler.len(), 2);
+
+        // Send in-order packet to trigger processing
+        t.send_data(1, "first");
+        t.poll_once_assert_pending().await;
+
+        // Read available data
+        let read = t.read_all_available().await.unwrap();
+        assert_eq!(&read, b"first"); // Only first packet should be read
+
+        // Now test user rx channel limit
+        // Send several packets that exceed the rx buffer size
+        for i in 6..15 {
+            t.send_data(i, "data!");
+            t.poll_once_assert_pending().await;
+        }
+
+        // Read available data - should only get packets that fit in rx buffer
+        let read = t.read_all_available().await.unwrap();
+        assert!(read.len() < 50); // Should be limited by rx_bufsize_approx
+
+        // Verify window size advertised matches available buffer space
+        let sent = t.take_sent();
+        assert!(!sent.is_empty());
+        let window = sent.last().unwrap().header.wnd_size;
+        assert!(window < 1024); // Window should be reduced
+
+        // Send more data - should be dropped due to full rx buffer
+        t.send_data(15, "dropped");
+        t.poll_once_assert_pending().await;
+
+        // Verify data was dropped
+        let read = String::from_utf8(t.read_all_available().await.unwrap()).unwrap();
+        assert!(!read.contains("dropped"));
     }
 }

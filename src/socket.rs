@@ -151,7 +151,7 @@ impl SocketOpts {
         let max_user_rx_buffered_packets = self
             .rx_bufsize_approx
             .unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK)
-            / incoming.max_packet_size;
+            / incoming.max_payload_size;
 
         if max_user_rx_buffered_packets == 0 {
             bail!("max_user_rx_buffered_packets = 0. Increase rx_bufsize_approx, or decrease MTU")

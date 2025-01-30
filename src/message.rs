@@ -5,7 +5,7 @@ use crate::{
     raw::{Type, UtpHeader},
 };
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, PartialEq, Eq)]
 pub struct UtpMessage {
     pub header: UtpHeader,
     payload_start: usize,
@@ -24,14 +24,14 @@ impl std::fmt::Debug for UtpMessage {
 
 impl UtpMessage {
     #[cfg(test)]
-    pub fn new_test(header: UtpHeader, payload: &[u8]) -> anyhow::Result<Self> {
+    pub fn new_test(header: UtpHeader, payload: &[u8]) -> Self {
         let packet = Packet::new(payload);
-        Ok(UtpMessage {
+        UtpMessage {
             header,
             payload_start: 0,
             size: payload.len(),
             data: packet,
-        })
+        }
     }
 
     pub fn deserialize(packet: Packet, size: usize) -> Option<Self> {
