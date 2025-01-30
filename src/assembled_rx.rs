@@ -11,6 +11,7 @@ pub struct AssembledRx {
     assembler: Assembler,
     queue: VecDeque<UtpMessage>,
     len: usize,
+    len_bytes: usize,
     capacity: usize,
 }
 
@@ -26,6 +27,7 @@ impl AssembledRx {
             assembler: Assembler::new(),
             queue: VecDeque::from(vec![Default::default(); tx_buf_len]),
             len: 0,
+            len_bytes: 0,
             capacity: tx_buf_len,
         }
     }
@@ -129,16 +131,17 @@ impl AssembledRx {
 
             for _ in 1..removed {
                 let msg = self.queue.pop_front().unwrap();
+                self.len_bytes -= msg.payload().len();
+                self.len -= 1;
                 self.queue.push_back(Default::default());
                 send(msg)?;
             }
 
-            self.len -= removed - 1;
-
             Ok(AssemblerAddRemoveResult::SentToUserRx(removed))
         } else {
-            *self.queue.get_mut(offset - 1).unwrap() = msg;
+            self.len_bytes += msg.payload().len();
             self.len += 1;
+            *self.queue.get_mut(offset - 1).unwrap() = msg;
             Ok(AssemblerAddRemoveResult::SentToUserRx(removed))
         }
     }
