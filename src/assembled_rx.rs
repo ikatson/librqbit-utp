@@ -1,7 +1,7 @@
 use std::{collections::VecDeque, num::NonZeroUsize};
 
+use crate::smoltcp_assembler::Assembler;
 use anyhow::Context;
-use smoltcp::storage::Assembler;
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 

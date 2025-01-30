@@ -42,6 +42,7 @@ mod stream_tx;
 mod test_util;
 mod traits;
 mod utils;
+mod smoltcp_assembler;
 
 pub use socket::{CongestionConfig, CongestionControllerKind, SocketOpts, UtpSocket, UtpSocketUdp};
 pub use stream::{UtpStream, UtpStreamUdp};

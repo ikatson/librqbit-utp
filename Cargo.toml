@@ -4,13 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# A minimal set of features for smoltcp to compile.
-smoltcp = { version = "0.12.0", default-features = false, features = [
-    "std",
-    "medium-ethernet",
-    "proto-ipv4",
-    "socket-raw",
-] }
 tokio = { version = "1", features = ["net", "sync", "time", "io-util", "rt"] }
 anyhow = "1.0.95"
 rand = "0.8.5"

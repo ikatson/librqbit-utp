@@ -1,6 +1,6 @@
 use bitvec::{order::Lsb0, BitArr};
 
-use smoltcp::storage::Assembler;
+use crate::smoltcp_assembler::Assembler;
 
 type SelectiveAckData = BitArr!(for 64, in u8, Lsb0);
 
@@ -31,7 +31,7 @@ impl SelectiveAck {
 
 #[cfg(test)]
 mod tests {
-    use smoltcp::storage::Assembler;
+    use crate::smoltcp_assembler::Assembler;
 
     use crate::raw::selective_ack::SelectiveAck;
 
