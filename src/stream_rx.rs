@@ -159,7 +159,7 @@ impl UserRx {
 
     pub fn window(&self) -> usize {
         let w = self.locked.lock().window();
-        w.saturating_sub(self.out_of_order_queue.len_bytes())
+        w.saturating_sub(self.out_of_order_queue.stored_bytes())
     }
 
     pub fn flush(&mut self) -> anyhow::Result<usize> {
@@ -180,7 +180,7 @@ impl UserRx {
     }
 
     pub fn assembler_packets(&self) -> usize {
-        self.out_of_order_queue.len()
+        self.out_of_order_queue.stored_packets()
     }
 
     pub fn add_remove(
@@ -198,7 +198,7 @@ impl UserRx {
     }
 }
 
-struct OutOfOrderQueue {
+pub struct OutOfOrderQueue {
     out_of_order_queue: VecDeque<Payload>,
     filled_front: usize,
     len: usize,
@@ -223,12 +223,8 @@ impl OutOfOrderQueue {
         }
     }
 
-    pub fn len_bytes(&self) -> usize {
-        self.len_bytes
-    }
-
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.filled_front == self.len
     }
 
     pub fn is_full(&self) -> bool {
@@ -239,8 +235,12 @@ impl OutOfOrderQueue {
         self.filled_front
     }
 
-    pub fn len(&self) -> usize {
+    pub fn stored_packets(&self) -> usize {
         self.len
+    }
+
+    pub fn stored_bytes(&self) -> usize {
+        self.len_bytes
     }
 
     pub fn debug_string(&self, with_data: bool) -> impl std::fmt::Display + '_ {
@@ -250,7 +250,12 @@ impl OutOfOrderQueue {
         }
         impl std::fmt::Display for D<'_> {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "len={}, len_bytes={}", self.q.len(), self.q.len_bytes(),)?;
+                write!(
+                    f,
+                    "len={}, len_bytes={}",
+                    self.q.stored_packets(),
+                    self.q.stored_bytes(),
+                )?;
 
                 if !self.with_data {
                     return Ok(());
@@ -264,8 +269,21 @@ impl OutOfOrderQueue {
     }
 
     pub fn selective_ack(&self) -> Option<SelectiveAck> {
-        // TODO
-        None
+        if self.is_empty() {
+            return None;
+        }
+
+        let start = self.filled_front + 1;
+        if start >= self.out_of_order_queue.len() {
+            return None;
+        }
+        let unacked = self
+            .out_of_order_queue
+            .range(start..)
+            .enumerate()
+            .filter_map(|(idx, data)| if data.is_empty() { None } else { Some(idx) });
+
+        SelectiveAck::new(unacked)
     }
 
     fn flush(&mut self, user_rx: &mut UserRxLocked) -> anyhow::Result<usize> {
@@ -295,7 +313,7 @@ impl OutOfOrderQueue {
         Ok(total_bytes)
     }
 
-    fn add_remove(
+    pub fn add_remove(
         &mut self,
         msg: UtpMessage,
         offset: usize,
@@ -390,8 +408,8 @@ mod tests {
             asm.add_remove(msg(0, b"a"), 0).unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
         );
-        assert_eq!(asm.len(), 1);
-        assert_eq!(asm.len_bytes(), 1);
+        assert_eq!(asm.stored_packets(), 1);
+        assert_eq!(asm.stored_bytes(), 1);
         assert_eq!(asm.filled_front(), 1);
     }
 
@@ -402,8 +420,8 @@ mod tests {
             asm.add_remove(msg(100, b"a"), 1).unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
         );
-        assert_eq!(asm.len(), 1);
-        assert_eq!(asm.len_bytes(), 1);
+        assert_eq!(asm.stored_packets(), 1);
+        assert_eq!(asm.stored_bytes(), 1);
         assert_eq!(asm.filled_front(), 0);
     }
 
@@ -436,8 +454,8 @@ mod tests {
             user_rx.add_remove(msg.clone(), 0).unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
         );
-        assert_eq!(user_rx.out_of_order_queue.len(), 1);
-        assert_eq!(user_rx.out_of_order_queue.len_bytes(), 1);
+        assert_eq!(user_rx.out_of_order_queue.stored_packets(), 1);
+        assert_eq!(user_rx.out_of_order_queue.stored_bytes(), 1);
         assert_eq!(user_rx.out_of_order_queue.filled_front(), 1);
     }
 
@@ -458,16 +476,16 @@ mod tests {
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
         );
 
-        assert_eq!(user_rx.out_of_order_queue.len(), 1);
-        assert_eq!(user_rx.out_of_order_queue.len_bytes(), 1);
+        assert_eq!(user_rx.out_of_order_queue.stored_packets(), 1);
+        assert_eq!(user_rx.out_of_order_queue.stored_bytes(), 1);
         assert_eq!(user_rx.out_of_order_queue.filled_front(), 0);
 
         assert_eq!(
             user_rx.add_remove(msg.clone(), 0).unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(2)
         );
-        assert_eq!(user_rx.out_of_order_queue.len(), 2);
-        assert_eq!(user_rx.out_of_order_queue.len_bytes(), 2);
+        assert_eq!(user_rx.out_of_order_queue.stored_packets(), 2);
+        assert_eq!(user_rx.out_of_order_queue.stored_bytes(), 2);
         assert_eq!(user_rx.out_of_order_queue.filled_front(), 2);
     }
 
@@ -486,7 +504,7 @@ mod tests {
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
         );
         trace!(asm=%asm.out_of_order_queue.debug_string(true));
-        assert_eq!(asm.out_of_order_queue.len(), 1);
+        assert_eq!(asm.out_of_order_queue.stored_packets(), 1);
 
         assert_eq!(
             asm.add_remove(msg_2.clone(), 2).unwrap(),
@@ -499,7 +517,7 @@ mod tests {
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(3)
         );
         trace!(asm=%asm.out_of_order_queue.debug_string(true));
-        assert_eq!(asm.out_of_order_queue.len(), 0);
+        assert_eq!(asm.out_of_order_queue.stored_packets(), 0);
 
         assert_eq!(
             asm.locked.lock().queue.pop_front().unwrap(),
@@ -529,7 +547,7 @@ mod tests {
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
         );
         trace!(asm=%asm.out_of_order_queue.debug_string(true));
-        assert_eq!(asm.out_of_order_queue.len(), 0);
+        assert_eq!(asm.out_of_order_queue.stored_packets(), 0);
 
         assert_eq!(
             asm.add_remove(msg_1.clone(), 0).unwrap(),
@@ -542,7 +560,7 @@ mod tests {
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
         );
         trace!(asm=%asm.out_of_order_queue.debug_string(true));
-        assert_eq!(asm.out_of_order_queue.len(), 0);
+        assert_eq!(asm.out_of_order_queue.stored_packets(), 0);
 
         assert_eq!(
             asm.locked.lock().queue.pop_front().unwrap(),
@@ -572,7 +590,7 @@ mod tests {
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
         );
         trace!(asm=%asm.debug_string(true));
-        assert_eq!(asm.len(), 1);
+        assert_eq!(asm.stored_packets(), 1);
 
         // A message that is out of bounds of the assembler should be dropped.
         assert_eq!(
@@ -580,6 +598,6 @@ mod tests {
             AssemblerAddRemoveResult::Unavailable(msg_3)
         );
         trace!(asm=%asm.debug_string(true));
-        assert_eq!(asm.len(), 1);
+        assert_eq!(asm.stored_packets(), 1);
     }
 }
