@@ -616,7 +616,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             header.set_type(Type::ST_DATA);
             header.seq_nr = self.next_seq_nr;
 
-            self.tx.enqueue(header, payload_size);
+            if !self.tx.enqueue(header, payload_size) {
+                bail!("bug, tx full, but we checked for it above")
+            }
             remaining -= payload_size;
             remote_window_remaining -= payload_size;
             trace!(bytes = payload_size, "fragmented");
