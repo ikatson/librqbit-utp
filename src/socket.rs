@@ -87,7 +87,7 @@ pub struct SocketOpts {
     // How many bytes to allocate for each virtual socket's TX.
     pub tx_bytes: Option<usize>,
 
-    // Disable Nagle's algorithm (buffering outgoing packets)
+    // Disable Nagle's algorithm
     pub disable_nagle: bool,
 
     pub congestion: CongestionConfig,
