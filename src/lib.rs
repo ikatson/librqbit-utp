@@ -33,10 +33,11 @@ pub mod raw;
 mod rtte;
 mod seq_nr;
 mod socket;
-mod stream;
+mod stream_dispatch;
 mod stream_tx;
 
 mod smoltcp_assembler;
+mod stream;
 mod stream_rx;
 #[cfg(test)]
 mod test_util;

@@ -5,7 +5,9 @@ use anyhow::Context;
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
-use crate::{message::UtpMessage, raw::selective_ack::SelectiveAck, stream::UserRxMessage};
+use crate::{
+    message::UtpMessage, raw::selective_ack::SelectiveAck, stream_dispatch::UserRxMessage,
+};
 
 pub struct AssembledRx {
     assembler: Assembler,
@@ -150,8 +152,8 @@ mod tests {
     use tracing::trace;
 
     use crate::{
-        assembled_rx::AssemblerAddRemoveResult, message::UtpMessage, stream::UserRxMessage,
-        test_util::setup_test_logging,
+        assembled_rx::AssemblerAddRemoveResult, message::UtpMessage,
+        stream_dispatch::UserRxMessage, test_util::setup_test_logging,
     };
 
     use super::AssembledRx;
@@ -193,8 +195,10 @@ mod tests {
         let mut asm = AssembledRx::new(NonZeroUsize::new(2).unwrap());
         let msg = msg(0, b"");
         // fill the channel
-        tx.try_send(crate::stream::UserRxMessage::UtpMessage(msg.clone()))
-            .unwrap();
+        tx.try_send(crate::stream_dispatch::UserRxMessage::UtpMessage(
+            msg.clone(),
+        ))
+        .unwrap();
         assert_eq!(
             asm.add_remove(msg.clone(), 0, &tx).unwrap(),
             AssemblerAddRemoveResult::Unavailable(msg)
@@ -208,8 +212,10 @@ mod tests {
         let mut asm = AssembledRx::new(NonZeroUsize::new(2).unwrap());
         let msg = msg(0, b"");
         // fill the channel
-        tx.try_send(crate::stream::UserRxMessage::UtpMessage(msg.clone()))
-            .unwrap();
+        tx.try_send(crate::stream_dispatch::UserRxMessage::UtpMessage(
+            msg.clone(),
+        ))
+        .unwrap();
 
         assert_eq!(
             asm.add_remove(msg.clone(), 1, &tx).unwrap(),

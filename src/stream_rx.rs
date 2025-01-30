@@ -3,7 +3,7 @@ use std::{pin::Pin, task::Poll};
 use tokio::{io::AsyncRead, sync::mpsc::Receiver};
 use tracing::trace;
 
-use crate::{message::UtpMessage, stream::UserRxMessage};
+use crate::{message::UtpMessage, stream_dispatch::UserRxMessage};
 
 pub struct UtpStreamReadHalf {
     rx: Receiver<UserRxMessage>,

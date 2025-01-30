@@ -10,6 +10,7 @@ use std::{
     time::Instant,
 };
 
+use crate::UtpStream;
 use crate::{
     congestion::CongestionController,
     constants::{
@@ -20,10 +21,9 @@ use crate::{
     packet_pool::Packet,
     raw::{Type, UtpHeader},
     seq_nr::SeqNr,
-    stream::{StreamArgs, UtpStreamStarter},
+    stream_dispatch::{StreamArgs, UtpStreamStarter},
     traits::{DefaultUtpEnvironment, Transport, UtpEnvironment},
     utils::{spawn_print_error, DropGuardSendBeforeDeath},
-    UtpStream,
 };
 use anyhow::{bail, Context};
 use tokio::sync::{
