@@ -9,7 +9,7 @@ use crate::{message::UtpMessage, raw::selective_ack::SelectiveAck, stream::UserR
 
 pub struct AssembledRx {
     assembler: Assembler,
-    queue: VecDeque<UtpMessage>,
+    out_of_order_queue: VecDeque<UtpMessage>,
     len: usize,
     len_bytes: usize,
     capacity: usize,
@@ -25,7 +25,7 @@ impl AssembledRx {
     pub fn new(tx_buf_len: NonZeroUsize) -> Self {
         Self {
             assembler: Assembler::new(),
-            queue: VecDeque::from(vec![Default::default(); tx_buf_len.get() - 1]),
+            out_of_order_queue: VecDeque::from(vec![Default::default(); tx_buf_len.get() - 1]),
             len: 0,
             len_bytes: 0,
             capacity: tx_buf_len.get(),
@@ -61,7 +61,7 @@ impl AssembledRx {
                     return Ok(());
                 }
 
-                write!(f, ", queue={:?}", self.asm.queue)?;
+                write!(f, ", queue={:?}", self.asm.out_of_order_queue)?;
                 Ok(())
             }
         }
@@ -75,8 +75,6 @@ impl AssembledRx {
         SelectiveAck::new(&self.assembler)
     }
 
-    // anyhow error on fatal
-    // otherwise either len or message back TODO: a different enum for this
     pub fn add_remove(
         &mut self,
         msg: UtpMessage,
@@ -88,7 +86,7 @@ impl AssembledRx {
             return Ok(AssemblerAddRemoveResult::Unavailable(msg));
         }
 
-        if offset > self.queue.len() {
+        if offset > self.out_of_order_queue.len() {
             trace!(offset, "message is past assembler's window");
             return Ok(AssemblerAddRemoveResult::Unavailable(msg));
         }
@@ -126,10 +124,10 @@ impl AssembledRx {
             send(msg)?;
 
             for _ in 1..removed {
-                let msg = self.queue.pop_front().unwrap();
+                let msg = self.out_of_order_queue.pop_front().unwrap();
                 self.len_bytes -= msg.payload().len();
                 self.len -= 1;
-                self.queue.push_back(Default::default());
+                self.out_of_order_queue.push_back(Default::default());
                 send(msg)?;
             }
 
@@ -138,7 +136,7 @@ impl AssembledRx {
             self.len_bytes += msg.payload().len();
             self.len += 1;
             // If we got here, offset is > 0.
-            *self.queue.get_mut(offset - 1).unwrap() = msg;
+            *self.out_of_order_queue.get_mut(offset - 1).unwrap() = msg;
             Ok(AssemblerAddRemoveResult::SentToUserRx(removed))
         }
     }
