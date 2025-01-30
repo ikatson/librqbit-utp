@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Weak},
-    task::{ready, Poll},
+    task::Poll,
     time::{Duration, Instant},
 };
 
@@ -24,7 +24,7 @@ use crate::{
     rtte::RttEstimator,
     seq_nr::SeqNr,
     socket::{ControlRequest, ValidatedSocketOpts},
-    stream_tx::{FragmentedTx, UserTx},
+    stream_tx::{FragmentedTx, UserTx, UtpStreamWriteHalf},
     traits::{Transport, UtpEnvironment},
     utils::{
         log_before_and_after_if_changed, spawn_print_error, update_optional_waker,
@@ -555,7 +555,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if g.buffer().is_empty() {
             update_optional_waker(&mut g.buffer_has_data, cx);
 
-            if g.closed {
+            if g.is_closed() {
                 let changed = log_before_and_after_if_changed(
                     "state",
                     &mut self.state,
@@ -961,22 +961,6 @@ pub struct UtpStreamReadHalf {
     offset: usize,
 }
 
-pub struct UtpStreamWriteHalf {
-    user_tx: Arc<UserTx>,
-}
-
-impl UtpStreamWriteHalf {
-    fn close(&mut self) {
-        self.user_tx.locked.lock().close();
-    }
-}
-
-impl Drop for UtpStreamWriteHalf {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
-
 impl AsyncRead for UtpStreamReadHalf {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -1033,70 +1017,6 @@ impl AsyncRead for UtpStreamReadHalf {
         }
 
         Poll::Pending
-    }
-}
-
-impl AsyncWrite for UtpStreamWriteHalf {
-    fn poll_write(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        let mut g = self.user_tx.locked.lock();
-
-        if g.dead {
-            return Poll::Ready(Err(std::io::Error::other("socket died")));
-        }
-
-        if g.closed {
-            return Poll::Ready(Err(std::io::Error::other(
-                "shutdown was initiated, can't write",
-            )));
-        }
-
-        let count = g.enqueue_slice(buf);
-        if count == 0 {
-            assert!(g.is_full());
-            update_optional_waker(&mut g.buffer_no_longer_full, cx);
-            return Poll::Pending;
-        }
-
-        if let Some(w) = g.buffer_has_data.take() {
-            w.wake()
-        }
-
-        Poll::Ready(Ok(count))
-    }
-
-    fn poll_flush(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        let mut g = self.user_tx.locked.lock();
-
-        if g.dead {
-            return Poll::Ready(Err(std::io::Error::other("socket died")));
-        }
-
-        if g.buffer().is_empty() {
-            return Poll::Ready(Ok(()));
-        }
-
-        update_optional_waker(&mut g.buffer_flushed, cx);
-
-        Poll::Pending
-    }
-
-    fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        let flush_result = ready!(self.as_mut().poll_flush(cx));
-        if let Err(e) = flush_result {
-            return Poll::Ready(Err(e));
-        }
-        self.get_mut().close();
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -1278,9 +1198,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             offset: 0,
         };
 
-        let write_half = UtpStreamWriteHalf {
-            user_tx: user_tx.clone(),
-        };
+        let write_half = UtpStreamWriteHalf::new(user_tx.clone());
 
         let env = socket.env.copy();
         let now = env.now();

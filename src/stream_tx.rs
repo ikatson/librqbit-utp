@@ -1,9 +1,19 @@
-use std::{collections::VecDeque, num::NonZeroUsize, sync::Arc, task::Waker};
+use std::{
+    collections::VecDeque,
+    num::NonZeroUsize,
+    sync::Arc,
+    task::{ready, Poll, Waker},
+};
 
 use parking_lot::Mutex;
+use tokio::io::AsyncWrite;
 use tracing::trace;
 
-use crate::{raw::UtpHeader, seq_nr::SeqNr, utils::fill_buffer_from_rb};
+use crate::{
+    raw::UtpHeader,
+    seq_nr::SeqNr,
+    utils::{fill_buffer_from_rb, update_optional_waker},
+};
 
 type RingBufferHeader = VecDeque<(UtpHeader, usize)>;
 
@@ -11,7 +21,7 @@ pub struct UserTxLocked {
     // Set when stream dies abruptly for writer to know about it.
     pub dead: bool,
     // When the writer shuts down, or both reader and writer die, the stream is closed.
-    pub closed: bool,
+    closed: bool,
 
     capacity: usize,
     buffer: VecDeque<u8>,
@@ -20,6 +30,7 @@ pub struct UserTxLocked {
     pub buffer_no_longer_full: Option<Waker>,
     // This is woken up by dispatcher when all outstanding packets where ACKed.
     pub buffer_flushed: Option<Waker>,
+
     // This is woken by by writer when it has put smth into the buffer.
     pub buffer_has_data: Option<Waker>,
 }
@@ -27,6 +38,10 @@ pub struct UserTxLocked {
 impl UserTxLocked {
     pub fn truncate_front(&mut self, count: usize) {
         drop(self.buffer.drain(..count))
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed
     }
 
     pub fn buffer(&self) -> &VecDeque<u8> {
@@ -198,5 +213,89 @@ impl FragmentedTx {
                     payload_offset: current_offset,
                 })
             })
+    }
+}
+
+pub struct UtpStreamWriteHalf {
+    user_tx: Arc<UserTx>,
+}
+
+impl UtpStreamWriteHalf {
+    pub fn new(user_tx: Arc<UserTx>) -> Self {
+        Self { user_tx }
+    }
+
+    fn close(&mut self) {
+        self.user_tx.locked.lock().close();
+    }
+}
+
+impl Drop for UtpStreamWriteHalf {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl AsyncWrite for UtpStreamWriteHalf {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let mut g = self.user_tx.locked.lock();
+
+        if g.dead {
+            return Poll::Ready(Err(std::io::Error::other("socket died")));
+        }
+
+        if g.closed {
+            return Poll::Ready(Err(std::io::Error::other(
+                "shutdown was initiated, can't write",
+            )));
+        }
+
+        let count = g.enqueue_slice(buf);
+        if count == 0 {
+            assert!(g.is_full());
+            update_optional_waker(&mut g.buffer_no_longer_full, cx);
+            return Poll::Pending;
+        }
+
+        if let Some(w) = g.buffer_has_data.take() {
+            w.wake()
+        }
+
+        Poll::Ready(Ok(count))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let mut g = self.user_tx.locked.lock();
+
+        if g.dead {
+            return Poll::Ready(Err(std::io::Error::other("socket died")));
+        }
+
+        if g.buffer().is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+
+        update_optional_waker(&mut g.buffer_flushed, cx);
+
+        Poll::Pending
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let flush_result = ready!(self.as_mut().poll_flush(cx));
+        if let Err(e) = flush_result {
+            return Poll::Ready(Err(e));
+        }
+        self.get_mut().close();
+        Poll::Ready(Ok(()))
     }
 }
