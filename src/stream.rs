@@ -176,7 +176,7 @@ pub(crate) enum UserRxMessage {
 }
 
 // An equivalent of a TCP socket for uTP.
-struct VirtualSocket<T: Transport, Env: UtpEnvironment> {
+struct VirtualSocket<T, Env> {
     state: VirtualSocketState,
     socket: Weak<UtpSocket<T, Env>>,
     socket_created: Instant,
@@ -238,7 +238,7 @@ struct VirtualSocket<T: Transport, Env: UtpEnvironment> {
 
     env: Env,
 
-    _drop_guard: DropGuardSendBeforeDeath<ControlRequest>,
+    drop_guard: DropGuardSendBeforeDeath<ControlRequest<T, Env>>,
     parent_span: Option<tracing::Span>,
 }
 
@@ -975,7 +975,7 @@ struct UserTx {
     locked: Mutex<WakeableRingBuffer>,
 }
 
-impl<T: Transport, E: UtpEnvironment> Drop for VirtualSocket<T, E> {
+impl<T, E> Drop for VirtualSocket<T, E> {
     fn drop(&mut self) {
         self.user_tx.locked.lock().mark_stream_dead();
     }
@@ -1246,14 +1246,19 @@ impl StreamArgs {
     }
 }
 
-impl UtpStream {
-    pub(crate) fn new<T: Transport, Env: UtpEnvironment>(
-        socket: &Arc<UtpSocket<T, Env>>,
-        remote: SocketAddr,
-        rx: UnboundedReceiver<UtpMessage>,
-        args: StreamArgs,
-    ) -> Self {
-        let (stream, vsock, first_packet) = Self::new_internal(socket, remote, rx, args);
+pub(crate) struct UtpStreamStarter<T, E> {
+    stream: UtpStream,
+    vsock: VirtualSocket<T, E>,
+    first_packet: Option<UtpHeader>,
+}
+
+impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
+    pub fn start(self) -> UtpStream {
+        let Self {
+            stream,
+            vsock,
+            first_packet,
+        } = self;
 
         let span = match vsock.parent_span.clone() {
             Some(s) => error_span!(parent: s, "utp_stream", conn_id_send = ?vsock.conn_id_send),
@@ -1265,12 +1270,12 @@ impl UtpStream {
     }
 
     // Exposed for tests.
-    fn new_internal<T: Transport, Env: UtpEnvironment>(
-        socket: &Arc<UtpSocket<T, Env>>,
+    pub fn new(
+        socket: &Arc<UtpSocket<T, E>>,
         remote: SocketAddr,
         rx: UnboundedReceiver<UtpMessage>,
         args: StreamArgs,
-    ) -> (Self, VirtualSocket<T, Env>, Option<UtpHeader>) {
+    ) -> UtpStreamStarter<T, E> {
         let StreamArgs {
             conn_id_recv,
             conn_id_send,
@@ -1360,7 +1365,7 @@ impl UtpStream {
             },
             congestion_controller: socket_opts.congestion.create(now),
             parent_span,
-            _drop_guard: DropGuardSendBeforeDeath::new(
+            drop_guard: DropGuardSendBeforeDeath::new(
                 ControlRequest::Shutdown((remote, conn_id_recv)),
                 &socket.control_requests,
             ),
@@ -1375,13 +1380,23 @@ impl UtpStream {
             None
         };
 
-        let stream = Self {
+        let stream = UtpStream {
             reader: read_half,
             writer: write_half,
         };
-        (stream, vsock, first_packet)
+        UtpStreamStarter {
+            stream,
+            vsock,
+            first_packet,
+        }
     }
 
+    pub fn disarm(mut self) {
+        self.vsock.drop_guard.disarm();
+    }
+}
+
+impl UtpStream {
     // This is faster than tokio::io::split as it doesn't use a mutex
     // unlike the general one.
     pub fn split(
@@ -1622,7 +1637,7 @@ mod tests {
         UtpSocket,
     };
 
-    use super::{StreamArgs, UtpStream, VirtualSocket};
+    use super::{StreamArgs, UtpStream, UtpStreamStarter, VirtualSocket};
 
     fn make_msg(header: UtpHeader, payload: &str) -> UtpMessage {
         UtpMessage::new_test(header, payload.as_bytes()).unwrap()
@@ -1703,7 +1718,8 @@ mod tests {
 
         let args = StreamArgs::new_incoming(100.into(), &remote_syn);
 
-        let (stream, vsock, _) = UtpStream::new_internal(&socket, ADDR_2, rx, args);
+        let UtpStreamStarter { stream, vsock, .. } =
+            UtpStreamStarter::new(&socket, ADDR_2, rx, args);
 
         TestVsock {
             transport,

@@ -19,7 +19,7 @@ use crate::{
     packet_pool::Packet,
     raw::{Type, UtpHeader},
     seq_nr::SeqNr,
-    stream::StreamArgs,
+    stream::{StreamArgs, UtpStreamStarter},
     traits::{DefaultUtpEnvironment, Transport, UtpEnvironment},
     utils::{spawn_print_error, DropGuardSendBeforeDeath},
     UtpStream,
@@ -193,13 +193,13 @@ pub(crate) struct ValidatedSocketOpts {
     pub congestion: CongestionConfig,
 }
 
-pub(crate) struct StreamRequester {
+pub(crate) struct StreamRequester<T, E> {
     created_span: tracing::Span,
-    tx: oneshot::Sender<UtpStream>,
+    tx: oneshot::Sender<UtpStreamStarter<T, E>>,
 }
 
-impl StreamRequester {
-    fn new(tx: oneshot::Sender<UtpStream>) -> Self {
+impl<T, E> StreamRequester<T, E> {
+    fn new(tx: oneshot::Sender<UtpStreamStarter<T, E>>) -> Self {
         Self {
             created_span: tracing::Span::current(),
             tx,
@@ -207,14 +207,14 @@ impl StreamRequester {
     }
 }
 
-pub(crate) enum ControlRequest {
-    ConnectRequest(SocketAddr, ConnectToken, StreamRequester),
+pub(crate) enum ControlRequest<T, E> {
+    ConnectRequest(SocketAddr, ConnectToken, StreamRequester<T, E>),
     ConnectDropped(SocketAddr, ConnectToken),
 
     Shutdown(StreamRecvKey),
 }
 
-impl std::fmt::Debug for ControlRequest {
+impl<T, E> std::fmt::Debug for ControlRequest<T, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ControlRequest::ConnectRequest(socket_addr, token, _) => {
@@ -233,27 +233,35 @@ impl std::fmt::Debug for ControlRequest {
 static NEXT_CONNECT_TOKEN: AtomicU64 = AtomicU64::new(0);
 type ConnectToken = u64;
 
-struct Connecting {
+struct Connecting<T, E> {
     token: ConnectToken,
     start: Instant,
     seq_nr: SeqNr,
-    requester: StreamRequester,
+    requester: StreamRequester<T, E>,
 }
 
 const MAX_CONNECTING_PER_ADDR: usize = 4;
 
-#[derive(Default)]
-struct ConnectingPerAddr {
-    slots: [Option<Connecting>; MAX_CONNECTING_PER_ADDR],
+struct ConnectingPerAddr<T, E> {
+    slots: [Option<Connecting<T, E>>; MAX_CONNECTING_PER_ADDR],
     len: usize,
 }
 
-impl ConnectingPerAddr {
+impl<T, E> Default for ConnectingPerAddr<T, E> {
+    fn default() -> Self {
+        Self {
+            slots: [None, None, None, None],
+            len: 0,
+        }
+    }
+}
+
+impl<T, E> ConnectingPerAddr<T, E> {
     fn is_empty(&self) -> bool {
         self.len == 0
     }
 
-    fn insert(&mut self, c: Connecting) -> bool {
+    fn insert(&mut self, c: Connecting<T, E>) -> bool {
         for slot in self.slots.iter_mut() {
             if slot.is_none() {
                 *slot = Some(c);
@@ -265,7 +273,7 @@ impl ConnectingPerAddr {
     }
 
     // TODO: use connection ID instead of sequence number. Or even both.
-    fn pop(&mut self, s: SeqNr) -> Option<Connecting> {
+    fn pop(&mut self, s: SeqNr) -> Option<Connecting<T, E>> {
         for slot in self.slots.iter_mut() {
             if let Some(c) = slot {
                 if c.seq_nr == s {
@@ -277,7 +285,7 @@ impl ConnectingPerAddr {
         None
     }
 
-    fn pop_by_token(&mut self, token: ConnectToken) -> Option<Connecting> {
+    fn pop_by_token(&mut self, token: ConnectToken) -> Option<Connecting<T, E>> {
         for slot in self.slots.iter_mut() {
             if let Some(c) = slot {
                 if c.token == token {
@@ -298,26 +306,24 @@ struct Syn {
     header: UtpHeader,
 }
 
-enum MatchSynWithAccept {
+enum MatchSynWithAccept<T, E> {
     Matched,
-    SynInvalid(StreamRequester),
-
-    // TODO: rework this. If the receiver is dead ATM there's no point re-using SYN.
+    SynInvalid(StreamRequester<T, E>),
     ReceiverDead(Syn),
 }
 
-struct AcceptQueue {
+struct AcceptQueue<T, E> {
     syns: VecDeque<Syn>,
-    next_available_acceptor: Option<StreamRequester>,
-    rx: mpsc::Receiver<StreamRequester>,
+    next_available_acceptor: Option<StreamRequester<T, E>>,
+    rx: mpsc::Receiver<StreamRequester<T, E>>,
 }
 
-impl AcceptQueue {
+impl<T, E> AcceptQueue<T, E> {
     fn syn_queue_empty(&mut self) -> bool {
         self.syns.is_empty()
     }
 
-    fn try_next_acceptor(&mut self) -> Option<StreamRequester> {
+    fn try_next_acceptor(&mut self) -> Option<StreamRequester<T, E>> {
         if let Some(next) = self.next_available_acceptor.take() {
             return Some(next);
         }
@@ -337,12 +343,12 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     env: E,
     socket: Arc<UtpSocket<T, E>>,
 
-    accept_queue: AcceptQueue,
+    accept_queue: AcceptQueue<T, E>,
 
     // TODO: we need to insert here only once!
     pub(crate) streams: HashMap<StreamRecvKey, UnboundedSender<UtpMessage>>,
-    connecting: HashMap<SocketAddr, ConnectingPerAddr>,
-    control_rx: UnboundedReceiver<ControlRequest>,
+    connecting: HashMap<SocketAddr, ConnectingPerAddr<T, E>>,
+    control_rx: UnboundedReceiver<ControlRequest<T, E>>,
     next_connection_id: SeqNr,
 }
 
@@ -412,7 +418,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
     // This would only block if the socket TX is full. It will block the dispatcher but it's a resonable tradeoff.
     #[tracing::instrument(level = "trace", skip(self))]
-    async fn on_control(&mut self, msg: ControlRequest) {
+    async fn on_control(&mut self, msg: ControlRequest<T, E>) {
         match msg {
             ControlRequest::ConnectRequest(addr, token, sender) => {
                 let conn_id = self.get_next_free_conn_id(addr);
@@ -498,7 +504,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let args = StreamArgs::new_outgoing(&msg.header, conn.start, now)
             .with_parent_span(conn.requester.created_span.clone());
 
-        let stream = UtpStream::new(&self.socket, addr, rx, args);
+        let stream = UtpStreamStarter::new(&self.socket, addr, rx, args);
 
         let recv_key = (addr, msg.header.connection_id);
         if self.streams.insert(recv_key, tx).is_some() {
@@ -514,7 +520,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         Ok(())
     }
 
-    fn match_syn_with_accept(&mut self, syn: Syn, accept: StreamRequester) -> MatchSynWithAccept {
+    fn match_syn_with_accept(
+        &mut self,
+        syn: Syn,
+        accept: StreamRequester<T, E>,
+    ) -> MatchSynWithAccept<T, E> {
         let recv_key = (syn.remote, syn.header.connection_id + 1);
         if self.streams.contains_key(&recv_key) {
             // This could happen only if someone connected to us with the same connection id
@@ -528,16 +538,19 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             .with_parent_span(accept.created_span.clone());
         let (tx, rx) = unbounded_channel();
 
-        // TODO: in rare case acceptor is dead this will have a side effect of sending ACK then FIN.
-        let stream = UtpStream::new(&self.socket, syn.remote, rx, args);
+        let starter = UtpStreamStarter::new(&self.socket, syn.remote, rx, args);
 
         self.streams.insert(recv_key, tx);
-        if accept.tx.send(stream).is_ok() {
-            trace!("created stream and passed to acceptor");
-            MatchSynWithAccept::Matched
-        } else {
-            self.streams.remove(&recv_key);
-            MatchSynWithAccept::ReceiverDead(syn)
+        match accept.tx.send(starter) {
+            Ok(()) => {
+                trace!("created stream and passed to acceptor");
+                MatchSynWithAccept::Matched
+            }
+            Err(starter) => {
+                starter.disarm();
+                self.streams.remove(&recv_key);
+                MatchSynWithAccept::ReceiverDead(syn)
+            }
         }
     }
 
@@ -623,13 +636,13 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 }
 
-pub struct UtpSocket<T: Transport, E: UtpEnvironment> {
+pub struct UtpSocket<T, E> {
     // The underlying transport, usually UDP.
     pub(crate) transport: T,
     // When was the socket created. All the uTP "timestamp_microsends" are relative to it.
     pub(crate) created: Instant,
-    pub(crate) control_requests: UnboundedSender<ControlRequest>,
-    accept_requests: mpsc::Sender<StreamRequester>,
+    pub(crate) control_requests: UnboundedSender<ControlRequest<T, E>>,
+    accept_requests: mpsc::Sender<StreamRequester<T, E>>,
 
     pub(crate) env: E,
 
@@ -729,6 +742,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             .context("dispatcher dead")?;
 
         let stream = rx.await.context("dispatcher dead")?;
+        let stream = stream.start();
         trace!("accepted");
         Ok(stream)
     }
@@ -754,7 +768,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         guard.disarm();
 
         trace!("connected");
-        Ok(stream)
+        Ok(stream.start())
     }
 
     /// Returns true if saw Poll::Pending
