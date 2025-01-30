@@ -587,18 +587,6 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         payload=message.payload().len()
     ))]
     fn on_recv(&mut self, addr: SocketAddr, message: UtpMessage) -> anyhow::Result<()> {
-        let span = trace_span!(
-            "msg",
-            conn_id=?message.header.connection_id,
-            type=?message.header.get_type(),
-            seq_nr=?message.header.seq_nr,
-            ack_nr=?message.header.ack_nr,
-            payload=message.payload().len()
-        );
-        let _span = span.entered();
-
-        trace!("parsed");
-
         let key = (addr, message.header.connection_id);
 
         if let Some(tx) = self.streams.get(&key) {
