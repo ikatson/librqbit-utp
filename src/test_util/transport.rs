@@ -1,16 +1,16 @@
 use std::{
     collections::HashMap,
     future::{poll_fn, Future},
-    net::SocketAddr,
+    net::{Ipv4Addr, SocketAddr},
     sync::Arc,
     task::Poll,
 };
 
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tracing::{error_span, trace, Instrument};
+use tracing::{error_span, Instrument};
 
-use crate::{message::UtpMessage, packet_pool::Packet, raw::UtpHeader, Transport};
+use crate::{message::UtpMessage, packet_pool::Packet, SocketOpts, Transport};
 
 use super::{env::MockUtpEnvironment, MockDispatcher, MockUtpSocket};
 
@@ -37,9 +37,12 @@ impl MockInterface {
         let transport = MockUtpTransport::new(bind_addr, rx, self.clone());
         let env = self.env.clone();
 
-        let socket =
-            MockUtpSocket::new_with_opts_and_dispatcher(transport, env, Default::default())
-                .unwrap();
+        let opts = SocketOpts {
+            mtu_autodetect_host: Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            ..Default::default()
+        };
+
+        let socket = MockUtpSocket::new_with_opts_and_dispatcher(transport, env, opts).unwrap();
 
         if self.sockets.lock().insert(bind_addr, tx).is_some() {
             panic!("socket with {} already existed", bind_addr)
@@ -91,10 +94,6 @@ impl MockUtpTransport {
 
     #[tracing::instrument(name = "MockUtpTransport::send", skip(self, buf), fields(?target))]
     pub fn send(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
-        let (header, len) = UtpHeader::deserialize(buf).unwrap();
-        trace!(?header, payload_size = buf.len() - len, "sending");
-        let len = buf.len();
-
         match self.inner.interface.sockets.lock().get(&target) {
             Some(tx) => match tx.send((self.bind_addr, buf.to_owned())) {
                 Ok(_) => {}
@@ -103,7 +102,7 @@ impl MockUtpTransport {
             None => return Err(std::io::Error::other(format!("no route to {target}"))),
         };
 
-        Ok(len)
+        Ok(buf.len())
     }
 }
 

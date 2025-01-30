@@ -33,7 +33,8 @@ use tracing::{debug, error_span, trace, trace_span, warn};
 
 type ConnectionId = SeqNr;
 
-type Key = (SocketAddr, ConnectionId);
+// When we get incoming packets this connection id is used to pick the stream.
+type StreamRecvKey = (SocketAddr, ConnectionId);
 
 const DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK: usize = 1024 * 1024;
 
@@ -210,11 +211,7 @@ pub(crate) enum ControlRequest {
     ConnectRequest(SocketAddr, ConnectToken, StreamRequester),
     ConnectDropped(SocketAddr, ConnectToken),
 
-    Shutdown {
-        remote: SocketAddr,
-        conn_id_1: SeqNr,
-        conn_id_2: SeqNr,
-    },
+    Shutdown(StreamRecvKey),
 }
 
 impl std::fmt::Debug for ControlRequest {
@@ -226,12 +223,8 @@ impl std::fmt::Debug for ControlRequest {
             ControlRequest::ConnectDropped(socket_addr, token) => {
                 write!(f, "ConnectDropped({socket_addr}, {token})")
             }
-            ControlRequest::Shutdown {
-                remote,
-                conn_id_1,
-                conn_id_2,
-            } => {
-                write!(f, "Shutdown({remote}, {conn_id_1}, {conn_id_2})")
+            ControlRequest::Shutdown(key) => {
+                write!(f, "Shutdown({key:?})")
             }
         }
     }
@@ -270,6 +263,8 @@ impl ConnectingPerAddr {
         }
         false
     }
+
+    // TODO: use connection ID instead of sequence number. Or even both.
     fn pop(&mut self, s: SeqNr) -> Option<Connecting> {
         for slot in self.slots.iter_mut() {
             if let Some(c) = slot {
@@ -306,6 +301,8 @@ struct Syn {
 enum MatchSynWithAccept {
     Matched,
     SynInvalid(StreamRequester),
+
+    // TODO: rework this. If the receiver is dead ATM there's no point re-using SYN.
     ReceiverDead(Syn),
 }
 
@@ -343,7 +340,7 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     accept_queue: AcceptQueue,
 
     // TODO: we need to insert here only once!
-    pub(crate) streams: HashMap<Key, UnboundedSender<UtpMessage>>,
+    pub(crate) streams: HashMap<StreamRecvKey, UnboundedSender<UtpMessage>>,
     connecting: HashMap<SocketAddr, ConnectingPerAddr>,
     control_rx: UnboundedReceiver<ControlRequest>,
     next_connection_id: SeqNr,
@@ -413,7 +410,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         self.next_connection_id
     }
 
-    // This would only block if the socket is full. It will block the dispatcher but it's a resonable tradeoff.
+    // This would only block if the socket TX is full. It will block the dispatcher but it's a resonable tradeoff.
     #[tracing::instrument(level = "trace", skip(self))]
     async fn on_control(&mut self, msg: ControlRequest) {
         match msg {
@@ -470,13 +467,8 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     Entry::Vacant(_) => {}
                 };
             }
-            ControlRequest::Shutdown {
-                remote,
-                conn_id_1,
-                conn_id_2,
-            } => {
-                self.streams.remove(&(remote, conn_id_1));
-                self.streams.remove(&(remote, conn_id_2));
+            ControlRequest::Shutdown(key) => {
+                self.streams.remove(&key);
             }
         }
     }
@@ -507,45 +499,44 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             .with_parent_span(conn.requester.created_span.clone());
 
         let stream = UtpStream::new(&self.socket, addr, rx, args);
-        let key1 = (addr, msg.header.connection_id);
-        let key2 = (addr, msg.header.connection_id + 1);
 
-        if self.streams.contains_key(&key1) || self.streams.contains_key(&key2) {
-            warn!("clashing sequence numbers, dropping");
-            // TODO: send RST or FIN
-            return Ok(());
+        let recv_key = (addr, msg.header.connection_id);
+        if self.streams.insert(recv_key, tx).is_some() {
+            warn!(key=?recv_key, "bug: a stream already existed with key. It should have been checked beforehand.");
         }
-
         if conn.requester.tx.send(stream).is_ok() {
-            trace!("created stream and passed to connector");
-            self.streams.insert(key1, tx.clone());
-            self.streams.insert(key2, tx);
+            trace!(?recv_key, "created stream and passed to connector");
         } else {
-            debug!("connecting receiver is dead. dropping");
+            debug!(?recv_key, "connecting receiver is dead. dropping");
+            self.streams.remove(&recv_key);
         }
 
         Ok(())
     }
 
     fn match_syn_with_accept(&mut self, syn: Syn, accept: StreamRequester) -> MatchSynWithAccept {
-        let key1 = (syn.remote, syn.header.connection_id);
-        let key2 = (syn.remote, syn.header.connection_id + 1);
-        if self.streams.contains_key(&key1) || self.streams.contains_key(&key2) {
-            trace!("invalid SYN, it clashes, dropping");
+        let recv_key = (syn.remote, syn.header.connection_id + 1);
+        if self.streams.contains_key(&recv_key) {
+            // This could happen only if someone connected to us with the same connection id
+            // we used to connect to them ourselves. This must be so impossibly rare that this message is
+            // "warn".
+            warn!(?recv_key, "SYN clashes with an existing stream, dropping");
             return MatchSynWithAccept::SynInvalid(accept);
         }
 
         let args = StreamArgs::new_incoming(self.env.random_u16().into(), &syn.header)
             .with_parent_span(accept.created_span.clone());
         let (tx, rx) = unbounded_channel();
+
+        // TODO: in rare case acceptor is dead this will have a side effect of sending ACK then FIN.
         let stream = UtpStream::new(&self.socket, syn.remote, rx, args);
 
+        self.streams.insert(recv_key, tx);
         if accept.tx.send(stream).is_ok() {
             trace!("created stream and passed to acceptor");
-            self.streams.insert(key1, tx.clone());
-            self.streams.insert(key2, tx);
             MatchSynWithAccept::Matched
         } else {
+            self.streams.remove(&recv_key);
             MatchSynWithAccept::ReceiverDead(syn)
         }
     }
@@ -568,8 +559,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         match self.accept_queue.try_cache_syn(syn) {
             true => Ok(()),
             false => {
-                warn!("dropping SYN, no more space to cache them and no acceptors available");
-                // TODO: send anything?
+                trace!("dropping SYN, no more space to cache them and no acceptors available");
                 Ok(())
             }
         }
@@ -739,6 +729,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             .context("dispatcher dead")?;
 
         let stream = rx.await.context("dispatcher dead")?;
+        trace!("accepted");
         Ok(stream)
     }
 
@@ -762,6 +753,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let stream = rx.await.context("dispatcher dead")?;
         guard.disarm();
 
+        trace!("connected");
         Ok(stream)
     }
 
@@ -796,7 +788,10 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::{
+        net::{Ipv4Addr, SocketAddr},
+        time::Duration,
+    };
 
     use anyhow::{bail, Context};
     use tokio::{
@@ -848,7 +843,12 @@ mod tests {
         }
         .instrument(error_span!("accept"));
 
-        try_join!(connect, accept)?;
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            async move { try_join!(connect, accept) },
+        )
+        .await
+        .context("timeout")??;
         Ok(())
     }
 }

@@ -3,6 +3,8 @@
 // - scream about it
 // - test: error all subsequent accept() and connect() attempts
 // - test: drop all outstanding accepts() and connects()
+//
+// TODO: only keep one stream for recv, don't store two of them
 
 // TODO: flow control
 // - test it
@@ -19,7 +21,7 @@
 // TODO: LEDBAT congestion control
 //
 // TODO: extensions
-// - selective ACKs
+// - selective ACKs on sending side
 //
 // TODO: memory management. Think about a data structure that will let the UDP incoming packet
 // get written straight out to use Rx buffer.//

@@ -1361,11 +1361,7 @@ impl UtpStream {
             congestion_controller: socket_opts.congestion.create(now),
             parent_span,
             _drop_guard: DropGuardSendBeforeDeath::new(
-                ControlRequest::Shutdown {
-                    remote,
-                    conn_id_1: conn_id_send,
-                    conn_id_2: conn_id_recv,
-                },
+                ControlRequest::Shutdown((remote, conn_id_recv)),
                 &socket.control_requests,
             ),
         };

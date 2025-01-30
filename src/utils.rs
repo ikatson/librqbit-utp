@@ -102,6 +102,7 @@ impl<Msg> DropGuardSendBeforeDeath<Msg> {
             tx: tx.downgrade(),
         }
     }
+
     pub fn disarm(&mut self) {
         self.msg = None;
     }
