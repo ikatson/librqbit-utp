@@ -58,6 +58,7 @@ impl AsyncRead for UtpStreamReadHalf {
 
             match g.queue.pop_front() {
                 Some(UserRxMessage::Payload(payload)) => {
+                    g.queue_len_bytes -= payload.len();
                     g.current = Some(BeingRead { payload, offset: 0 })
                 }
                 Some(UserRxMessage::Error(msg)) => {
@@ -129,16 +130,17 @@ impl UserRxLocked {
 
     // Returns back the message if there's no space.
     #[must_use]
-    pub fn enqueue(&mut self, msg: UserRxMessage) -> Option<UserRxMessage> {
+    pub fn enqueue(&mut self, msg: UserRxMessage) -> Result<(), UserRxMessage> {
         let len = msg.len_bytes();
-        if len < self.window() {
-            return Some(msg);
+        if len > self.window() {
+            return Err(msg);
         }
         self.queue.push_back(msg);
+        self.queue_len_bytes += len;
         if let Some(waker) = self.queue_has_data.take() {
             waker.wake();
         }
-        None
+        Ok(())
     }
 }
 
@@ -161,7 +163,7 @@ impl UserRx {
     }
 
     pub fn flush(&mut self) -> anyhow::Result<usize> {
-        self.out_of_order_queue.flush(&mut *self.locked.lock())
+        self.out_of_order_queue.flush(&mut self.locked.lock())
     }
 
     pub fn enqueue_last_message(&self, msg: UserRxMessage) {
@@ -188,7 +190,7 @@ impl UserRx {
     ) -> anyhow::Result<AssemblerAddRemoveResult> {
         match self.out_of_order_queue.add_remove(msg, offset)? {
             res @ AssemblerAddRemoveResult::ConsumedSequenceNumbers(..) => {
-                self.flush();
+                self.flush()?;
                 Ok(res)
             }
             res => Ok(res),
@@ -233,6 +235,10 @@ impl OutOfOrderQueue {
         self.len == self.capacity
     }
 
+    pub fn filled_front(&self) -> usize {
+        self.filled_front
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -265,7 +271,8 @@ impl OutOfOrderQueue {
     fn flush(&mut self, user_rx: &mut UserRxLocked) -> anyhow::Result<usize> {
         // Flush as many items as possible from the beginning of out of order queue to the user RX
         let mut total_bytes = 0;
-        while self.filled_front > 0 && self.out_of_order_queue[0].len() > user_rx.window() {
+        let mut total_packets = 0;
+        while self.filled_front > 0 && self.out_of_order_queue[0].len() <= user_rx.window() {
             let msg = self
                 .out_of_order_queue
                 .pop_front()
@@ -274,11 +281,17 @@ impl OutOfOrderQueue {
             self.len -= 1;
             self.len_bytes -= msg.len();
             self.out_of_order_queue.push_back(Default::default());
-            total_bytes += 1;
-            user_rx
-                .enqueue(UserRxMessage::Payload(msg))
-                .context("bug: should have enqueued")?;
+            total_bytes += msg.len();
+            total_packets += 1;
+            if user_rx.enqueue(UserRxMessage::Payload(msg)).is_err() {
+                bail!("bug: should have enqueued")
+            };
         }
+        trace!(
+            packets = total_packets,
+            bytes = total_bytes,
+            "flushed from out-of-order user RX"
+        );
         Ok(total_bytes)
     }
 
@@ -294,7 +307,7 @@ impl OutOfOrderQueue {
 
         let effective_offset = offset + self.filled_front;
 
-        if effective_offset > self.out_of_order_queue.len() {
+        if effective_offset >= self.out_of_order_queue.len() {
             trace!(
                 offset,
                 self.filled_front,
@@ -339,8 +352,9 @@ impl OutOfOrderQueue {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
+    use std::{num::NonZeroUsize, sync::Arc};
 
+    use parking_lot::Mutex;
     use tokio::sync::mpsc::channel;
     use tracing::trace;
 
@@ -350,6 +364,8 @@ mod tests {
         stream_rx::{AssemblerAddRemoveResult, OutOfOrderQueue},
         test_util::setup_test_logging,
     };
+
+    use super::{UserRx, UserRxLocked};
 
     fn msg(seq_nr: u16, payload: &[u8]) -> UtpMessage {
         UtpMessage::new_test(
@@ -362,74 +378,104 @@ mod tests {
         )
     }
 
+    fn user_rx(capacity_bytes: usize, out_of_order_max_packets: usize) -> UserRx {
+        let locked = Arc::new(Mutex::new(UserRxLocked::new(capacity_bytes)));
+        UserRx::new(locked, NonZeroUsize::new(out_of_order_max_packets).unwrap())
+    }
+
     #[test]
     fn test_asm_add_one_in_order() {
         let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(2).unwrap());
         assert_eq!(
-            asm.add_remove(msg(0, b""), 0).unwrap(),
+            asm.add_remove(msg(0, b"a"), 0).unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
         );
+        assert_eq!(asm.len(), 1);
+        assert_eq!(asm.len_bytes(), 1);
+        assert_eq!(asm.filled_front(), 1);
     }
 
     #[test]
     fn test_asm_add_one_out_of_order() {
         let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(2).unwrap());
         assert_eq!(
-            asm.add_remove(msg(0, b""), 1).unwrap(),
+            asm.add_remove(msg(100, b"a"), 1).unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
         );
+        assert_eq!(asm.len(), 1);
+        assert_eq!(asm.len_bytes(), 1);
+        assert_eq!(asm.filled_front(), 0);
     }
 
     #[test]
     fn test_asm_channel_full_asm_empty() {
-        let (tx, _rx) = channel(1);
-        let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(2).unwrap());
-        let msg = msg(0, b"");
-        // fill the channel
-        tx.try_send(crate::stream_dispatch::UserRxMessage::UtpMessage(
-            msg.clone(),
-        ))
-        .unwrap();
+        setup_test_logging();
+        let mut user_rx = user_rx(1, 2);
+        let msg = msg(0, b"a");
+
+        {
+            let rx = user_rx.locked.lock();
+            trace!(
+                rx.capacity_bytes,
+                rx.queue_len_bytes,
+                len = rx.len(),
+                win = rx.window()
+            )
+        }
+
+        // fill RX
+        user_rx
+            .locked
+            .lock()
+            .enqueue(UserRxMessage::Payload(b"a".to_vec()))
+            .unwrap();
+
+        assert!(user_rx.locked.lock().is_full());
+
         assert_eq!(
-            asm.add_remove(msg.clone(), 0, &tx).unwrap(),
-            AssemblerAddRemoveResult::Unavailable(msg)
+            user_rx.add_remove(msg.clone(), 0).unwrap(),
+            AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
         );
-        assert!(asm.assembler.is_empty());
+        assert_eq!(user_rx.out_of_order_queue.len(), 1);
+        assert_eq!(user_rx.out_of_order_queue.len_bytes(), 1);
+        assert_eq!(user_rx.out_of_order_queue.filled_front(), 1);
     }
 
     #[test]
     fn test_asm_channel_full_asm_not_empty() {
-        let (tx, _rx) = channel(1);
-        let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(2).unwrap());
-        let msg = msg(0, b"");
-        // fill the channel
-        tx.try_send(crate::stream_dispatch::UserRxMessage::UtpMessage(
-            msg.clone(),
-        ))
-        .unwrap();
+        let mut user_rx = user_rx(1, 2);
+        let msg = msg(0, b"a");
+
+        // fill RX
+        user_rx
+            .locked
+            .lock()
+            .enqueue(UserRxMessage::Payload(b"a".to_vec()))
+            .unwrap();
 
         assert_eq!(
-            asm.add_remove(msg.clone(), 1, &tx).unwrap(),
+            user_rx.add_remove(msg.clone(), 1).unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
         );
-        assert_eq!(asm.len(), 1);
+
+        assert_eq!(user_rx.out_of_order_queue.len(), 1);
+        assert_eq!(user_rx.out_of_order_queue.len_bytes(), 1);
+        assert_eq!(user_rx.out_of_order_queue.filled_front(), 0);
 
         assert_eq!(
-            asm.add_remove(msg.clone(), 0, &tx).unwrap(),
-            AssemblerAddRemoveResult::Unavailable(msg)
+            user_rx.add_remove(msg.clone(), 0).unwrap(),
+            AssemblerAddRemoveResult::ConsumedSequenceNumbers(2)
         );
-
-        // TODO: we now drop the message in this case. Better would be to behave differently.
-        // Fill in the buffer, send ACKs etc.
-        assert_eq!(asm.len(), 1);
+        assert_eq!(user_rx.out_of_order_queue.len(), 2);
+        assert_eq!(user_rx.out_of_order_queue.len_bytes(), 2);
+        assert_eq!(user_rx.out_of_order_queue.filled_front(), 2);
     }
 
     #[test]
     fn test_asm_out_of_order() {
         setup_test_logging();
 
-        let (tx, mut rx) = channel(3);
-        let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(3).unwrap());
+        let mut asm = user_rx(100, 3);
 
         let msg_0 = msg(0, b"hello");
         let msg_1 = msg(1, b"world");
@@ -439,32 +485,32 @@ mod tests {
             asm.add_remove(msg_1.clone(), 1).unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
         );
-        trace!(asm=%asm.debug_string(true));
-        assert_eq!(asm.len(), 1);
+        trace!(asm=%asm.out_of_order_queue.debug_string(true));
+        assert_eq!(asm.out_of_order_queue.len(), 1);
 
         assert_eq!(
             asm.add_remove(msg_2.clone(), 2).unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
         );
-        trace!(asm=%asm.debug_string(true));
+        trace!(asm=%asm.out_of_order_queue.debug_string(true));
 
         assert_eq!(
             asm.add_remove(msg_0.clone(), 0).unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(3)
         );
-        trace!(asm=%asm.debug_string(true));
-        assert_eq!(asm.len(), 0);
+        trace!(asm=%asm.out_of_order_queue.debug_string(true));
+        assert_eq!(asm.out_of_order_queue.len(), 0);
 
         assert_eq!(
-            rx.try_recv().unwrap(),
+            asm.locked.lock().queue.pop_front().unwrap(),
             UserRxMessage::Payload(msg_0.into_payload())
         );
         assert_eq!(
-            rx.try_recv().unwrap(),
+            asm.locked.lock().queue.pop_front().unwrap(),
             UserRxMessage::Payload(msg_1.into_payload())
         );
         assert_eq!(
-            rx.try_recv().unwrap(),
+            asm.locked.lock().queue.pop_front().unwrap(),
             UserRxMessage::Payload(msg_2.into_payload())
         );
     }
@@ -472,7 +518,7 @@ mod tests {
     #[test]
     fn test_asm_inorder() {
         setup_test_logging();
-        let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(3).unwrap());
+        let mut asm = user_rx(100, 3);
 
         let msg_0 = msg(0, b"hello");
         let msg_1 = msg(1, b"world");
@@ -482,32 +528,32 @@ mod tests {
             asm.add_remove(msg_0.clone(), 0).unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
         );
-        trace!(asm=%asm.debug_string(true));
-        assert_eq!(asm.len(), 0);
+        trace!(asm=%asm.out_of_order_queue.debug_string(true));
+        assert_eq!(asm.out_of_order_queue.len(), 0);
 
         assert_eq!(
             asm.add_remove(msg_1.clone(), 0).unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
         );
-        trace!(asm=%asm.debug_string(true));
+        trace!(asm=%asm.out_of_order_queue.debug_string(true));
 
         assert_eq!(
             asm.add_remove(msg_2.clone(), 0).unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
         );
-        trace!(asm=%asm.debug_string(true));
-        assert_eq!(asm.len(), 0);
+        trace!(asm=%asm.out_of_order_queue.debug_string(true));
+        assert_eq!(asm.out_of_order_queue.len(), 0);
 
         assert_eq!(
-            rx.try_recv().unwrap(),
+            asm.locked.lock().queue.pop_front().unwrap(),
             UserRxMessage::Payload(msg_0.into_payload())
         );
         assert_eq!(
-            rx.try_recv().unwrap(),
+            asm.locked.lock().queue.pop_front().unwrap(),
             UserRxMessage::Payload(msg_1.into_payload())
         );
         assert_eq!(
-            rx.try_recv().unwrap(),
+            asm.locked.lock().queue.pop_front().unwrap(),
             UserRxMessage::Payload(msg_2.into_payload())
         );
     }
