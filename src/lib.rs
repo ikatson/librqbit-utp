@@ -3,8 +3,6 @@
 // - scream about it
 // - test: error all subsequent accept() and connect() attempts
 // - test: drop all outstanding accepts() and connects()
-//
-// TODO: only keep one stream for recv, don't store two of them
 
 // TODO: flow control
 // - test it
