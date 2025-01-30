@@ -9,9 +9,9 @@ use crate::{
     message::UtpMessage, raw::selective_ack::SelectiveAck, stream_dispatch::UserRxMessage,
 };
 
-pub struct AssembledRx {
+pub struct OutOfOrderQueue {
     assembler: Assembler,
-    out_of_order_queue: VecDeque<UtpMessage>,
+    queue: VecDeque<UtpMessage>,
     len: usize,
     len_bytes: usize,
     capacity: usize,
@@ -23,11 +23,11 @@ pub enum AssemblerAddRemoveResult {
     Unavailable(UtpMessage),
 }
 
-impl AssembledRx {
+impl OutOfOrderQueue {
     pub fn new(tx_buf_len: NonZeroUsize) -> Self {
         Self {
             assembler: Assembler::new(),
-            out_of_order_queue: VecDeque::from(vec![Default::default(); tx_buf_len.get() - 1]),
+            queue: VecDeque::from(vec![Default::default(); tx_buf_len.get() - 1]),
             len: 0,
             len_bytes: 0,
             capacity: tx_buf_len.get(),
@@ -52,7 +52,7 @@ impl AssembledRx {
 
     pub fn debug_string(&self, with_queue: bool) -> impl std::fmt::Display + '_ {
         struct D<'a> {
-            asm: &'a AssembledRx,
+            asm: &'a OutOfOrderQueue,
             with_queue: bool,
         }
         impl std::fmt::Display for D<'_> {
@@ -63,7 +63,7 @@ impl AssembledRx {
                     return Ok(());
                 }
 
-                write!(f, ", queue={:?}", self.asm.out_of_order_queue)?;
+                write!(f, ", queue={:?}", self.asm.queue)?;
                 Ok(())
             }
         }
@@ -88,7 +88,7 @@ impl AssembledRx {
             return Ok(AssemblerAddRemoveResult::Unavailable(msg));
         }
 
-        if offset > self.out_of_order_queue.len() {
+        if offset > self.queue.len() {
             trace!(offset, "message is past assembler's window");
             return Ok(AssemblerAddRemoveResult::Unavailable(msg));
         }
@@ -126,10 +126,10 @@ impl AssembledRx {
             send(msg)?;
 
             for _ in 1..removed {
-                let msg = self.out_of_order_queue.pop_front().unwrap();
+                let msg = self.queue.pop_front().unwrap();
                 self.len_bytes -= msg.payload().len();
                 self.len -= 1;
-                self.out_of_order_queue.push_back(Default::default());
+                self.queue.push_back(Default::default());
                 send(msg)?;
             }
 
@@ -138,7 +138,7 @@ impl AssembledRx {
             self.len_bytes += msg.payload().len();
             self.len += 1;
             // If we got here, offset is > 0.
-            *self.out_of_order_queue.get_mut(offset - 1).unwrap() = msg;
+            *self.queue.get_mut(offset - 1).unwrap() = msg;
             Ok(AssemblerAddRemoveResult::SentToUserRx(removed))
         }
     }
@@ -156,7 +156,7 @@ mod tests {
         stream_dispatch::UserRxMessage, test_util::setup_test_logging,
     };
 
-    use super::AssembledRx;
+    use super::OutOfOrderQueue;
 
     fn msg(seq_nr: u16, payload: &[u8]) -> UtpMessage {
         UtpMessage::new_test(
@@ -172,7 +172,7 @@ mod tests {
     #[test]
     fn test_asm_add_one_in_order() {
         let (tx, _rx) = channel(1);
-        let mut asm = AssembledRx::new(NonZeroUsize::new(2).unwrap());
+        let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(2).unwrap());
         assert_eq!(
             asm.add_remove(msg(0, b""), 0, &tx).unwrap(),
             AssemblerAddRemoveResult::SentToUserRx(1)
@@ -182,7 +182,7 @@ mod tests {
     #[test]
     fn test_asm_add_one_out_of_order() {
         let (tx, _rx) = channel(1);
-        let mut asm = AssembledRx::new(NonZeroUsize::new(2).unwrap());
+        let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(2).unwrap());
         assert_eq!(
             asm.add_remove(msg(0, b""), 1, &tx).unwrap(),
             AssemblerAddRemoveResult::SentToUserRx(0)
@@ -192,7 +192,7 @@ mod tests {
     #[test]
     fn test_asm_channel_full_asm_empty() {
         let (tx, _rx) = channel(1);
-        let mut asm = AssembledRx::new(NonZeroUsize::new(2).unwrap());
+        let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(2).unwrap());
         let msg = msg(0, b"");
         // fill the channel
         tx.try_send(crate::stream_dispatch::UserRxMessage::UtpMessage(
@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn test_asm_channel_full_asm_not_empty() {
         let (tx, _rx) = channel(1);
-        let mut asm = AssembledRx::new(NonZeroUsize::new(2).unwrap());
+        let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(2).unwrap());
         let msg = msg(0, b"");
         // fill the channel
         tx.try_send(crate::stream_dispatch::UserRxMessage::UtpMessage(
@@ -238,7 +238,7 @@ mod tests {
         setup_test_logging();
 
         let (tx, mut rx) = channel(3);
-        let mut asm = AssembledRx::new(NonZeroUsize::new(3).unwrap());
+        let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(3).unwrap());
 
         let msg_0 = msg(0, b"hello");
         let msg_1 = msg(1, b"world");
@@ -274,7 +274,7 @@ mod tests {
         setup_test_logging();
 
         let (tx, mut rx) = channel(3);
-        let mut asm = AssembledRx::new(NonZeroUsize::new(3).unwrap());
+        let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(3).unwrap());
 
         let msg_0 = msg(0, b"hello");
         let msg_1 = msg(1, b"world");
@@ -310,7 +310,7 @@ mod tests {
         setup_test_logging();
 
         let (tx, _rx) = channel(3);
-        let mut asm = AssembledRx::new(NonZeroUsize::new(3).unwrap());
+        let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(3).unwrap());
 
         let msg_2 = msg(2, b"test");
         let msg_3 = msg(3, b"test");

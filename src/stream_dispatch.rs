@@ -15,7 +15,7 @@ use tokio::{
 use tracing::{debug, error_span, trace, warn};
 
 use crate::{
-    assembled_rx::{AssembledRx, AssemblerAddRemoveResult},
+    assembled_rx::{AssemblerAddRemoveResult, OutOfOrderQueue},
     congestion::CongestionController,
     constants::{ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, UTP_HEADER_SIZE},
     message::UtpMessage,
@@ -184,7 +184,7 @@ struct VirtualSocket<T, Env> {
 
     remote: SocketAddr,
 
-    assembler: AssembledRx,
+    assembler: OutOfOrderQueue,
     conn_id_send: SeqNr,
 
     // Triggers delay-based operations
@@ -1103,7 +1103,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             socket_created: socket.created,
             socket_opts: *socket_opts,
             remote,
-            assembler: AssembledRx::new(socket_opts.max_rx_out_of_order_packets),
+            assembler: OutOfOrderQueue::new(socket_opts.max_rx_out_of_order_packets),
             conn_id_send,
             timers: Timers {
                 kind: TimerKind::new(),
