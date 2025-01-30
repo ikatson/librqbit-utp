@@ -1,7 +1,7 @@
-use std::{any::Any, collections::VecDeque, fmt::write};
+use std::collections::VecDeque;
 
 use anyhow::Context;
-use smoltcp::storage::{Assembler, RingBuffer};
+use smoltcp::storage::Assembler;
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
@@ -42,12 +42,22 @@ impl AssembledRx {
         self.len
     }
 
-    pub fn debug_string(&self) -> impl std::fmt::Display + '_ {
-        struct D<'a>(&'a AssembledRx);
+    pub fn debug_string(&self, with_queue: bool) -> impl std::fmt::Display + '_ {
+        struct D<'a> {
+            asm: &'a AssembledRx,
+            with_queue: bool,
+        }
         impl std::fmt::Display for D<'_> {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "len={}, asm={}, queue=", self.0.len(), self.0.assembler)?;
-                for (idx, item) in self.0.queue.iter().enumerate() {
+                write!(f, "len={}, asm={}", self.asm.len(), self.asm.assembler)?;
+
+                if !self.with_queue {
+                    return Ok(());
+                }
+
+                write!(f, ", queue=")?;
+
+                for (idx, item) in self.asm.queue.iter().enumerate() {
                     if idx > 0 {
                         write!(f, ", ")?;
                     }
@@ -62,7 +72,10 @@ impl AssembledRx {
                 Ok(())
             }
         }
-        D(self)
+        D {
+            asm: self,
+            with_queue,
+        }
     }
 
     pub fn selective_ack(&self) -> Option<SelectiveAck> {
@@ -215,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn test_asm_payload() {
+    fn test_asm_out_of_order() {
         setup_test_logging();
 
         let (tx, mut rx) = channel(3);
@@ -229,20 +242,56 @@ mod tests {
             asm.add_remove(msg_1.clone(), 1, &tx).unwrap(),
             AssemblerAddRemoveResult::SentToUserRx(0)
         );
-        trace!(asm=%asm.debug_string());
+        trace!(asm=%asm.debug_string(true));
         assert_eq!(asm.len(), 1);
 
         assert_eq!(
             asm.add_remove(msg_2.clone(), 2, &tx).unwrap(),
             AssemblerAddRemoveResult::SentToUserRx(0)
         );
-        trace!(asm=%asm.debug_string());
+        trace!(asm=%asm.debug_string(true));
 
         assert_eq!(
             asm.add_remove(msg_0.clone(), 0, &tx).unwrap(),
             AssemblerAddRemoveResult::SentToUserRx(3)
         );
-        trace!(asm=%asm.debug_string());
+        trace!(asm=%asm.debug_string(true));
+        assert_eq!(asm.len(), 0);
+
+        assert_eq!(rx.try_recv().unwrap(), UserRxMessage::UtpMessage(msg_0));
+        assert_eq!(rx.try_recv().unwrap(), UserRxMessage::UtpMessage(msg_1));
+        assert_eq!(rx.try_recv().unwrap(), UserRxMessage::UtpMessage(msg_2));
+    }
+
+    #[test]
+    fn test_asm_inorder() {
+        setup_test_logging();
+
+        let (tx, mut rx) = channel(3);
+        let mut asm = AssembledRx::new(3);
+
+        let msg_0 = msg(0, b"hello");
+        let msg_1 = msg(1, b"world");
+        let msg_2 = msg(2, b"test");
+
+        assert_eq!(
+            asm.add_remove(msg_0.clone(), 0, &tx).unwrap(),
+            AssemblerAddRemoveResult::SentToUserRx(1)
+        );
+        trace!(asm=%asm.debug_string(true));
+        assert_eq!(asm.len(), 0);
+
+        assert_eq!(
+            asm.add_remove(msg_1.clone(), 0, &tx).unwrap(),
+            AssemblerAddRemoveResult::SentToUserRx(1)
+        );
+        trace!(asm=%asm.debug_string(true));
+
+        assert_eq!(
+            asm.add_remove(msg_2.clone(), 0, &tx).unwrap(),
+            AssemblerAddRemoveResult::SentToUserRx(1)
+        );
+        trace!(asm=%asm.debug_string(true));
         assert_eq!(asm.len(), 0);
 
         assert_eq!(rx.try_recv().unwrap(), UserRxMessage::UtpMessage(msg_0));

@@ -783,7 +783,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         if count > 0 {
                             trace!(count, "dequeued messages to user rx");
                         } else {
-                            trace!(asm = %self.assembler.debug_string(), "out of order");
+                            trace!(asm = %self.assembler.debug_string(false), "out of order");
                         }
 
                         self.last_consumed_remote_seq_nr += count as u16;
@@ -1019,6 +1019,8 @@ impl AsyncRead for UtpStreamReadHalf {
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
 
+        let mut written = false;
+
         while buf.remaining() > 0 {
             // If there was a previous message we haven't read till the end, do it.
             if let Some(current) = this.current.as_ref() {
@@ -1040,6 +1042,7 @@ impl AsyncRead for UtpStreamReadHalf {
                 );
 
                 buf.put_slice(&payload[..len]);
+                written = true;
                 this.offset += len;
                 if this.offset == current.payload().len() {
                     this.offset = 0;
@@ -1047,21 +1050,23 @@ impl AsyncRead for UtpStreamReadHalf {
                 }
             }
 
-            let msg = match this.rx.poll_recv(cx) {
-                Poll::Ready(Some(UserRxMessage::UtpMessage(msg))) => msg,
+            match this.rx.poll_recv(cx) {
+                Poll::Ready(Some(UserRxMessage::UtpMessage(msg))) => this.current = Some(msg),
                 Poll::Ready(Some(UserRxMessage::Error(msg))) => {
                     return Poll::Ready(Err(std::io::Error::other(msg)))
                 }
                 Poll::Ready(Some(UserRxMessage::Eof)) => return Poll::Ready(Ok(())),
 
                 Poll::Ready(None) => return Poll::Ready(Err(std::io::Error::other("socket died"))),
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => break,
             };
-
-            this.current = Some(msg);
         }
 
-        Poll::Ready(Ok(()))
+        if written {
+            return Poll::Ready(Ok(()));
+        }
+
+        Poll::Pending
     }
 }
 
@@ -1624,7 +1629,6 @@ mod tests {
     use std::{future::poll_fn, pin::Pin, sync::Arc, task::Poll, time::Duration};
 
     use futures::FutureExt;
-    use smoltcp::wire::UDP_HEADER_LEN;
     use tokio::{
         io::{AsyncRead, AsyncWrite, AsyncWriteExt},
         sync::mpsc::{unbounded_channel, UnboundedSender},
