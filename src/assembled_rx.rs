@@ -32,6 +32,10 @@ impl AssembledRx {
         }
     }
 
+    pub fn len_bytes(&self) -> usize {
+        self.len_bytes
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }

@@ -312,7 +312,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn rx_window(&self) -> u32 {
-        (self.user_rx_sender.capacity() * self.socket_opts.max_incoming_packet_size.get()) as u32
+        let cap = (self.user_rx_sender.capacity() * self.socket_opts.max_incoming_packet_size.get())
+            as u32;
+        cap.saturating_sub(self.assembler.len_bytes() as u32)
     }
 
     // Returns true if UDP socket is full
@@ -1407,8 +1409,6 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
 }
 
 impl UtpStream {
-    // This is faster than tokio::io::split as it doesn't use a mutex
-    // unlike the general one.
     pub fn split(
         self,
     ) -> (
