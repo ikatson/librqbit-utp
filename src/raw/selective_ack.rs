@@ -1,13 +1,10 @@
-use bitvec::{
-    order::{Lsb0, Msb0},
-    BitArr,
-};
+use bitvec::{order::Lsb0, BitArr};
 
 use smoltcp::storage::Assembler;
 
 type SelectiveAckData = BitArr!(for 64, in u8, Lsb0);
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectiveAck {
     data: SelectiveAckData,
 }
@@ -25,6 +22,10 @@ impl SelectiveAck {
             data.get_mut(start - 1..end - 1)?.fill(true);
         }
         Some(Self { data })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.data.as_raw_slice()
     }
 }
 

@@ -12,6 +12,10 @@ impl LibTorrentCloseReason {
         Self(u32::from_be_bytes(buf) as u16)
     }
 
+    pub fn as_bytes(&self) -> [u8; 4] {
+        (self.0 as u32).to_be_bytes()
+    }
+
     pub fn description(&self) -> &'static str {
         match self.0 {
             0 => "none",

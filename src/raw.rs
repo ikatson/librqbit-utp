@@ -7,6 +7,8 @@ use tracing::{debug, trace};
 
 use crate::{constants::UTP_HEADER_SIZE, seq_nr::SeqNr};
 
+const NO_NEXT_EXT: u8 = 0;
+const EXT_SELECTIVE_ACK: u8 = 1;
 const EXT_CLOSE_REASON: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -45,6 +47,7 @@ impl Type {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Extensions {
+    pub selective_ack: Option<selective_ack::SelectiveAck>,
     pub close_reason: Option<ext_close_reason::LibTorrentCloseReason>,
 }
 
@@ -57,7 +60,7 @@ pub struct UtpHeader {
     pub wnd_size: u32,                          // Window size
     pub seq_nr: SeqNr,                          // Sequence number
     pub ack_nr: SeqNr,                          // Acknowledgment number
-    pub extensions: Option<Extensions>,
+    pub extensions: Extensions,
 }
 
 impl UtpHeader {
@@ -77,17 +80,46 @@ impl UtpHeader {
             bail!("too small buffer");
         }
         const VERSION: u8 = 1;
+        const NEXT_EXT_IDX: usize = 1;
         let typever = (self.htype.to_number() << 4) | VERSION;
         buffer[0] = typever;
-        // TODO: extensions not supported yet.
-        buffer[1] = 0;
+        buffer[NEXT_EXT_IDX] = NO_NEXT_EXT; // this will be overwritten down below if extensions are present.
         buffer[2..4].copy_from_slice(&self.connection_id.to_be_bytes());
         buffer[4..8].copy_from_slice(&self.timestamp_microseconds.to_be_bytes());
         buffer[8..12].copy_from_slice(&self.timestamp_difference_microseconds.to_be_bytes());
         buffer[12..16].copy_from_slice(&self.wnd_size.to_be_bytes());
         buffer[16..18].copy_from_slice(&self.seq_nr.to_be_bytes());
         buffer[18..20].copy_from_slice(&self.ack_nr.to_be_bytes());
-        Ok(UTP_HEADER_SIZE)
+
+        let mut next_ext_pos = NEXT_EXT_IDX;
+        let mut offset = 20;
+
+        macro_rules! add_ext {
+            ($id:expr, $payload:expr) => {
+                let payload = $payload;
+                if buffer.len() >= offset + 2 + payload.len() {
+                    buffer[next_ext_pos] = $id;
+                    buffer[offset] = NO_NEXT_EXT;
+                    buffer[offset + 1] = payload.len() as u8;
+                    buffer[offset + 2..offset + 2 + payload.len()].copy_from_slice(payload);
+
+                    #[allow(unused)]
+                    {
+                        next_ext_pos = offset + 1;
+                    }
+                    offset += 2 + payload.len();
+                }
+            };
+        }
+
+        if let Some(sack) = self.extensions.selective_ack {
+            add_ext!(EXT_SELECTIVE_ACK, sack.as_bytes());
+        }
+        if let Some(close_reason) = self.extensions.close_reason {
+            add_ext!(EXT_CLOSE_REASON, &close_reason.as_bytes());
+        }
+
+        Ok(offset)
     }
 
     pub fn serialize_with_payload(
@@ -134,16 +166,24 @@ impl UtpHeader {
             let ext_len = *buffer.get(1)? as usize;
 
             let ext_data = buffer.get(2..2 + ext_len)?;
-            trace!(ext, ext_len, "extension in packet");
             match (ext, ext_len) {
+                (EXT_SELECTIVE_ACK, _) => {
+                    debug!(
+                        ext,
+                        next_ext, ext_len, "selective ACK deserializing not supported yet"
+                    );
+                }
                 (EXT_CLOSE_REASON, 4) => {
-                    header.extensions.get_or_insert_default().close_reason =
+                    header.extensions.close_reason =
                         Some(ext_close_reason::LibTorrentCloseReason::parse(
                             ext_data.try_into().unwrap(),
                         ));
                 }
                 _ => {
-                    debug!(ext, next_ext, ext_len, "unsupported extension, skipping");
+                    debug!(
+                        ext,
+                        next_ext, ext_len, "unsupported extension for serializing, skipping"
+                    );
                 }
             }
 
@@ -176,11 +216,16 @@ mod tests {
                 wnd_size: 1048576,
                 seq_nr: 54661.into(),
                 ack_nr: 54397.into(),
-                extensions: Some(crate::raw::Extensions {
-                    close_reason: Some(crate::raw::ext_close_reason::LibTorrentCloseReason(15))
-                })
+                extensions: crate::raw::Extensions {
+                    close_reason: Some(crate::raw::ext_close_reason::LibTorrentCloseReason(15)),
+                    selective_ack: None
+                }
             }
         );
         assert_eq!(len, packet.len());
+
+        let mut buf = [0u8; 1024];
+        let len = header.serialize(&mut buf).unwrap();
+        assert_eq!(&buf[..len], packet);
     }
 }
