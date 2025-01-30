@@ -28,7 +28,6 @@ mod assembled_rx;
 mod congestion;
 mod constants;
 mod message;
-mod packet_pool;
 pub mod raw;
 mod rtte;
 mod seq_nr;

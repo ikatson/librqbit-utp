@@ -1,16 +1,11 @@
 use tracing::debug;
 
-use crate::{
-    packet_pool::Packet,
-    raw::{Type, UtpHeader},
-};
+use crate::raw::{Type, UtpHeader};
 
 #[derive(Default, Clone, PartialEq, Eq)]
 pub struct UtpMessage {
     pub header: UtpHeader,
-    payload_start: usize,
-    size: usize,
-    data: Packet,
+    data: Vec<u8>,
 }
 
 impl std::fmt::Debug for UtpMessage {
@@ -29,20 +24,16 @@ impl std::fmt::Debug for UtpMessage {
 impl UtpMessage {
     #[cfg(test)]
     pub fn new_test(header: UtpHeader, payload: &[u8]) -> Self {
-        let packet = Packet::new(payload);
         UtpMessage {
             header,
-            payload_start: 0,
-            size: payload.len(),
-            data: packet,
+            data: payload.to_owned(),
         }
     }
 
-    pub fn deserialize(packet: Packet, size: usize) -> Option<Self> {
-        let mut packet = packet;
-        let (header, hsize) = UtpHeader::deserialize(packet.get_mut())?;
+    pub fn deserialize(buf: &[u8]) -> Option<Self> {
+        let (header, hsize) = UtpHeader::deserialize(buf)?;
 
-        let payload_size = size - hsize;
+        let payload_size = buf.len() - hsize;
 
         match header.get_type() {
             Type::ST_DATA => {
@@ -61,13 +52,11 @@ impl UtpMessage {
 
         Some(Self {
             header,
-            payload_start: hsize,
-            size,
-            data: packet,
+            data: buf[hsize..].to_owned(),
         })
     }
 
     pub fn payload(&self) -> &[u8] {
-        &self.data.get()[self.payload_start..self.size]
+        &self.data
     }
 }

@@ -18,7 +18,6 @@ use crate::{
         UTP_HEADER_SIZE,
     },
     message::UtpMessage,
-    packet_pool::Packet,
     raw::{Type, UtpHeader},
     seq_nr::SeqNr,
     stream_dispatch::{StreamArgs, UtpStreamStarter},
@@ -374,8 +373,14 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             },
             recv = self.socket.transport.recv_from(read_buf) => {
                 let (len, addr) = recv.context("error receiving")?;
-                let packet = Packet::new(&read_buf[..len]);
-                self.on_recv(addr, packet, len)?;
+                let message = match UtpMessage::deserialize(&read_buf[..len]) {
+                    Some(msg) => msg,
+                    None => {
+                        debug!(len, ?addr, "error desserializing and validating UTP message");
+                        return Ok(())
+                    }
+                };
+                self.on_recv(addr, message)?;
             }
         }
 
@@ -573,18 +578,15 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
 
-    #[tracing::instrument(level = "trace", name = "on_recv", skip_all, fields(from=?addr))]
-    fn on_recv(&mut self, addr: SocketAddr, packet: Packet, len: usize) -> anyhow::Result<()> {
-        trace!("received");
-
-        let message = match UtpMessage::deserialize(packet, len) {
-            Some(msg) => msg,
-            None => {
-                debug!(len, "error desserializing and validating UTP message");
-                return Ok(());
-            }
-        };
-
+    #[tracing::instrument(level = "trace", name = "on_recv", skip_all, fields(
+        from=?addr,
+        conn_id=?message.header.connection_id,
+        type=?message.header.get_type(),
+        seq_nr=?message.header.seq_nr,
+        ack_nr=?message.header.ack_nr,
+        payload=message.payload().len()
+    ))]
+    fn on_recv(&mut self, addr: SocketAddr, message: UtpMessage) -> anyhow::Result<()> {
         let span = trace_span!(
             "msg",
             conn_id=?message.header.connection_id,

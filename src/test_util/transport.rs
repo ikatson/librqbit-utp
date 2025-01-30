@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{error_span, Instrument};
 
-use crate::{message::UtpMessage, packet_pool::Packet, SocketOpts, Transport};
+use crate::{message::UtpMessage, SocketOpts, Transport};
 
 use super::{env::MockUtpEnvironment, MockDispatcher, MockUtpSocket};
 
@@ -158,11 +158,7 @@ impl RememberingTransport {
     pub fn take_sent_utpmessages(&self) -> Vec<UtpMessage> {
         let sent = self.take_sent();
         sent.into_iter()
-            .map(|(_, msg)| {
-                let len = msg.len();
-                let packet = Packet::new(&msg);
-                UtpMessage::deserialize(packet, len).unwrap()
-            })
+            .map(|(_, msg)| UtpMessage::deserialize(&msg).unwrap())
             .collect()
     }
 }
