@@ -1634,7 +1634,7 @@ mod tests {
             env::MockUtpEnvironment, setup_test_logging, transport::RememberingTransport, ADDR_1,
             ADDR_2,
         },
-        UtpSocket,
+        SocketOpts, UtpSocket,
     };
 
     use super::{StreamArgs, UtpStream, UtpStreamStarter, VirtualSocket};
@@ -1704,11 +1704,10 @@ mod tests {
         }
     }
 
-    fn make_test_vsock() -> TestVsock {
+    fn make_test_vsock(opts: SocketOpts) -> TestVsock {
         let transport = RememberingTransport::new(ADDR_1);
         let env = MockUtpEnvironment::new();
-        let socket =
-            UtpSocket::new_with_opts(transport.clone(), env.clone(), Default::default()).unwrap();
+        let socket = UtpSocket::new_with_opts(transport.clone(), env.clone(), opts).unwrap();
         let (tx, rx) = unbounded_channel();
 
         let remote_syn = UtpHeader {
@@ -1735,7 +1734,7 @@ mod tests {
     async fn test_delayed_ack_sent_once() {
         setup_test_logging();
 
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
         t.poll_once_assert_pending().await;
         assert_eq!(t.take_sent().len(), 0);
 
@@ -1773,7 +1772,7 @@ mod tests {
     #[tokio::test]
     async fn test_doesnt_send_until_window_updated() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         assert_eq!(t.vsock.last_remote_window, 0);
 
@@ -1808,7 +1807,7 @@ mod tests {
     #[tokio::test]
     async fn test_sends_up_to_remote_window_only_single_msg() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         assert_eq!(t.vsock.last_remote_window, 0);
 
@@ -1847,7 +1846,7 @@ mod tests {
     #[tokio::test]
     async fn test_sends_up_to_remote_window_only_multi_msg() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
         t.vsock.socket_opts.max_outgoing_payload_size = 2;
 
         assert_eq!(t.vsock.last_remote_window, 0);
@@ -1892,7 +1891,7 @@ mod tests {
     #[tokio::test]
     async fn test_basic_retransmission() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         // First allow sending by setting window size
         t.vsock.last_remote_window = 1024;
@@ -1948,7 +1947,7 @@ mod tests {
     #[tokio::test]
     async fn test_fast_retransmit() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
         t.vsock.socket_opts.max_outgoing_payload_size = 5;
 
         // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
@@ -2022,7 +2021,7 @@ mod tests {
     #[tokio::test]
     async fn test_fin_shutdown_sequence_initiated_by_explicit_shutdown() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         let mut stream = t.stream.take().unwrap();
 
@@ -2119,7 +2118,7 @@ mod tests {
     #[tokio::test]
     async fn test_fin_sent_when_writer_dropped() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         let (_reader, mut writer) = t.stream.take().unwrap().split();
 
@@ -2180,7 +2179,7 @@ mod tests {
     #[tokio::test]
     async fn test_flush_works() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         let (_reader, writer) = t.stream.take().unwrap().split();
         let mut writer = tokio::io::BufWriter::new(writer);
@@ -2255,7 +2254,7 @@ mod tests {
     #[tokio::test]
     async fn test_out_of_order_delivery() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         // First allow sending by setting window size
         t.send_msg(
@@ -2341,7 +2340,7 @@ mod tests {
     #[tokio::test]
     async fn test_nagle_algorithm() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         // Enable Nagle (should be on by default, but let's be explicit)
         t.vsock.socket_opts.nagle = true;
@@ -2435,7 +2434,7 @@ mod tests {
     #[tokio::test]
     async fn test_resource_cleanup_both_sides_dropped_normally() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         // Allow sending by setting window size
         t.send_msg(
@@ -2504,7 +2503,7 @@ mod tests {
     #[tokio::test]
     async fn test_resource_cleanup_both_sides_dropped_abruptly() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         // Allow sending by setting window size
         t.send_msg(
@@ -2529,7 +2528,7 @@ mod tests {
     #[tokio::test]
     async fn test_resource_cleanup_with_pending_data() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         // Allow sending by setting window size
         t.send_msg(
@@ -2594,7 +2593,7 @@ mod tests {
     #[tokio::test]
     async fn test_sender_flow_control() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         // Set initial remote window very small
         t.send_msg(
@@ -2675,7 +2674,7 @@ mod tests {
     #[tokio::test]
     async fn test_zero_window_handling() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         // Set initial window to allow some data
         t.send_msg(
@@ -2742,7 +2741,7 @@ mod tests {
     #[tokio::test]
     async fn test_congestion_control_basics() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
 
         let remote_wnd = 64 * 1024;
 
@@ -2874,7 +2873,7 @@ mod tests {
     #[tokio::test]
     async fn test_duplicate_ack_only_on_st_state() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
         t.vsock.socket_opts.max_outgoing_payload_size = 5;
 
         // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
@@ -2979,7 +2978,7 @@ mod tests {
     #[tokio::test]
     async fn test_finack_not_sent_until_all_data_consumed() {
         setup_test_logging();
-        let mut t = make_test_vsock();
+        let mut t = make_test_vsock(Default::default());
         t.vsock.socket_opts.max_outgoing_payload_size = 5;
 
         // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
