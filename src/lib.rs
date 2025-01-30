@@ -14,8 +14,6 @@
 // Although we could just send it in a loop with connect() like every second or so no problem;
 // With jitter though! Not to flood all at the same time.
 //
-// TODO: remove smoltcp dependency. copy-paste assembler and wring buffer or write our own.
-//
 // TODO: LEDBAT congestion control
 //
 // TODO: extensions
@@ -38,11 +36,11 @@ mod socket;
 mod stream;
 mod stream_tx;
 
+mod smoltcp_assembler;
 #[cfg(test)]
 mod test_util;
 mod traits;
 mod utils;
-mod smoltcp_assembler;
 
 pub use socket::{CongestionConfig, CongestionControllerKind, SocketOpts, UtpSocket, UtpSocketUdp};
 pub use stream::{UtpStream, UtpStreamUdp};
