@@ -1,15 +1,13 @@
 use std::{
-    collections::VecDeque,
     future::Future,
     net::SocketAddr,
     pin::Pin,
     sync::{Arc, Weak},
-    task::{ready, Poll, Waker},
+    task::{ready, Poll},
     time::{Duration, Instant},
 };
 
 use anyhow::{bail, Context};
-use parking_lot::Mutex;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     sync::mpsc::{self, channel, Receiver, UnboundedReceiver},
@@ -26,11 +24,11 @@ use crate::{
     rtte::RttEstimator,
     seq_nr::SeqNr,
     socket::{ControlRequest, ValidatedSocketOpts},
-    stream_tx::Tx,
+    stream_tx::{FragmentedTx, UserTx},
     traits::{Transport, UtpEnvironment},
     utils::{
-        fill_buffer_from_rb, log_before_and_after_if_changed, spawn_print_error,
-        update_optional_waker, DropGuardSendBeforeDeath,
+        log_before_and_after_if_changed, spawn_print_error, update_optional_waker,
+        DropGuardSendBeforeDeath,
     },
     UtpSocket,
 };
@@ -217,7 +215,7 @@ struct VirtualSocket<T, Env> {
     rx: UnboundedReceiver<UtpMessage>,
 
     // Unacked fragments. Ready to send or retransmit.
-    tx: Tx,
+    tx: FragmentedTx,
 
     // The user sides's queue with packets fully processed and ready to consume.
     // This is what "UtpStream::poll_read" reads from.
@@ -357,7 +355,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     let len = item.payload_size();
                     // TODO: use rwlock
                     let g = self.user_tx.locked.lock();
-                    fill_buffer_from_rb(b, &g.buffer, offset, len)
+                    g.fill_buffer_from_ring_buffer(b, offset, len)
                         .context("error filling output buffer from user_tx")?;
                     Ok(len)
                 })
@@ -554,7 +552,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn fragment_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
         let mut g = self.user_tx.locked.lock();
 
-        if g.buffer.is_empty() {
+        if g.buffer().is_empty() {
             update_optional_waker(&mut g.buffer_has_data, cx);
 
             if g.closed {
@@ -579,15 +577,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .map(|item| item.payload_offset() + item.payload_size())
             .unwrap_or(0);
 
-        if g.buffer.len() < tx_offset {
+        if g.buffer().len() < tx_offset {
             bail!(
                 "bug in buffer computations: user_tx_buflen={} tx_offset={}",
-                g.buffer.len(),
+                g.buffer().len(),
                 tx_offset
             );
         }
 
-        let mut remaining = g.buffer.len() - tx_offset;
+        let mut remaining = g.buffer().len() - tx_offset;
         self.congestion_controller.pre_transmit(self.this_poll.now);
         let mut remote_window_remaining = self
             .effective_remote_receive_window()
@@ -727,7 +725,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
-            if g.buffer.is_empty() {
+            if g.buffer().is_empty() {
                 if let Some(w) = g.buffer_flushed.take() {
                     w.wake();
                 }
@@ -951,53 +949,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 }
 
-struct WakeableRingBuffer {
-    // Set when stream dies abruptly for writer to know about it.
-    dead: bool,
-    // When the writer shuts down, or both reader and writer die, the stream is closed.
-    closed: bool,
-
-    capacity: usize,
-    buffer: VecDeque<u8>,
-
-    // This is woken up by dispatcher when the buffer has space if it didn't have it previously.
-    buffer_no_longer_full: Option<Waker>,
-    // This is woken up by dispatcher when all outstanding packets where ACKed.
-    buffer_flushed: Option<Waker>,
-    // This is woken by by writer when it has put smth into the buffer.
-    buffer_has_data: Option<Waker>,
-}
-
-impl WakeableRingBuffer {
-    fn truncate_front(&mut self, count: usize) {
-        drop(self.buffer.drain(..count))
-    }
-
-    fn enqueue_slice(&mut self, bytes: &[u8]) -> usize {
-        // I really hope that gets optimized away
-        let len = (self.capacity - self.buffer.len()).min(bytes.len());
-        let it = bytes.iter().copied().take(len);
-        self.buffer.extend(it);
-        len
-    }
-
-    fn is_full(&self) -> bool {
-        self.buffer.len() == self.capacity
-    }
-
-    // This will send FIN (if not yet).
-    fn mark_stream_dead(&mut self) {
-        self.dead = true;
-        if let Some(waker) = self.buffer_no_longer_full.take() {
-            waker.wake();
-        }
-    }
-}
-
-struct UserTx {
-    locked: Mutex<WakeableRingBuffer>,
-}
-
 impl<T, E> Drop for VirtualSocket<T, E> {
     fn drop(&mut self) {
         self.user_tx.locked.lock().mark_stream_dead();
@@ -1016,14 +967,7 @@ pub struct UtpStreamWriteHalf {
 
 impl UtpStreamWriteHalf {
     fn close(&mut self) {
-        let mut g = self.user_tx.locked.lock();
-        if !g.closed {
-            trace!("closing writer");
-            g.closed = true;
-            if let Some(w) = g.buffer_has_data.take() {
-                w.wake();
-            }
-        }
+        self.user_tx.locked.lock().close();
     }
 }
 
@@ -1134,7 +1078,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
             return Poll::Ready(Err(std::io::Error::other("socket died")));
         }
 
-        if g.buffer.is_empty() {
+        if g.buffer().is_empty() {
             return Poll::Ready(Ok(()));
         }
 
@@ -1326,17 +1270,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             channel(socket.opts().max_user_rx_buffered_packets.get());
         // this unwrap is fine as max_user_rx_buffered_packets was validated as part of UtpSocket
         let user_rx_sender_last_eof_permit = user_rx_sender.clone().try_reserve_owned().unwrap();
-        let user_tx = Arc::new(UserTx {
-            locked: Mutex::new(WakeableRingBuffer {
-                buffer: VecDeque::new(),
-                capacity: socket.opts().virtual_socket_tx_bytes.get(),
-                buffer_no_longer_full: None,
-                buffer_has_data: None,
-                buffer_flushed: None,
-                dead: false,
-                closed: false,
-            }),
-        });
+        let user_tx = UserTx::new(socket.opts().virtual_socket_tx_bytes);
 
         let read_half = UtpStreamReadHalf {
             rx: user_rx_receiver,
@@ -1376,7 +1310,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
             rx,
-            tx: Tx::new(),
+            tx: FragmentedTx::new(),
             user_rx_sender,
             user_rx_sender_last_eof_permit: Some(user_rx_sender_last_eof_permit),
             local_rx_last_ack: None,

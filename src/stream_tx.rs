@@ -1,12 +1,101 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, num::NonZeroUsize, sync::Arc, task::Waker};
 
-use crate::{raw::UtpHeader, seq_nr::SeqNr};
+use parking_lot::Mutex;
+use tracing::trace;
+
+use crate::{raw::UtpHeader, seq_nr::SeqNr, utils::fill_buffer_from_rb};
 
 type RingBufferHeader = VecDeque<(UtpHeader, usize)>;
 
+pub struct UserTxLocked {
+    // Set when stream dies abruptly for writer to know about it.
+    pub dead: bool,
+    // When the writer shuts down, or both reader and writer die, the stream is closed.
+    pub closed: bool,
+
+    capacity: usize,
+    buffer: VecDeque<u8>,
+
+    // This is woken up by dispatcher when the buffer has space if it didn't have it previously.
+    pub buffer_no_longer_full: Option<Waker>,
+    // This is woken up by dispatcher when all outstanding packets where ACKed.
+    pub buffer_flushed: Option<Waker>,
+    // This is woken by by writer when it has put smth into the buffer.
+    pub buffer_has_data: Option<Waker>,
+}
+
+impl UserTxLocked {
+    pub fn truncate_front(&mut self, count: usize) {
+        drop(self.buffer.drain(..count))
+    }
+
+    pub fn buffer(&self) -> &VecDeque<u8> {
+        &self.buffer
+    }
+
+    pub fn fill_buffer_from_ring_buffer(
+        &self,
+        out_buf: &mut [u8],
+        offset: usize,
+        len: usize,
+    ) -> anyhow::Result<()> {
+        fill_buffer_from_rb(out_buf, &self.buffer, offset, len)
+    }
+
+    pub fn enqueue_slice(&mut self, bytes: &[u8]) -> usize {
+        // I really hope that gets optimized away
+        let len = (self.capacity - self.buffer.len()).min(bytes.len());
+        let it = bytes.iter().copied().take(len);
+        self.buffer.extend(it);
+        len
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.buffer.len() == self.capacity
+    }
+
+    // This will send FIN (if not yet).
+    pub fn mark_stream_dead(&mut self) {
+        self.dead = true;
+        if let Some(waker) = self.buffer_no_longer_full.take() {
+            waker.wake();
+        }
+    }
+
+    pub fn close(&mut self) {
+        if !self.closed {
+            trace!("closing writer");
+            self.closed = true;
+            if let Some(w) = self.buffer_has_data.take() {
+                w.wake();
+            }
+        }
+    }
+}
+
+pub struct UserTx {
+    pub locked: Mutex<UserTxLocked>,
+}
+
+impl UserTx {
+    pub fn new(capacity: NonZeroUsize) -> Arc<Self> {
+        Arc::new(UserTx {
+            locked: Mutex::new(UserTxLocked {
+                buffer: VecDeque::new(),
+                capacity: capacity.get(),
+                buffer_no_longer_full: None,
+                buffer_has_data: None,
+                buffer_flushed: None,
+                dead: false,
+                closed: false,
+            }),
+        })
+    }
+}
+
 // The TX queue of the virtual socket. uTP doesn't refragemnt, so we store the original headers.
 // The payloads are stored in the user TX behind a shared lock. Users write there with poll_write().
-pub struct Tx {
+pub struct FragmentedTx {
     headers: RingBufferHeader,
     len_bytes: usize,
     capacity: usize,
@@ -30,9 +119,9 @@ impl TxIterItem<'_> {
     }
 }
 
-impl Tx {
+impl FragmentedTx {
     pub fn new() -> Self {
-        Tx {
+        FragmentedTx {
             headers: VecDeque::new(),
             len_bytes: 0,
             capacity: 64,
