@@ -3,7 +3,7 @@ use smoltcp::storage::{Assembler, RingBuffer};
 use tokio::sync::mpsc;
 use tracing::{debug, trace};
 
-use crate::{message::UtpMessage, stream::UserRxMessage};
+use crate::{message::UtpMessage, raw::selective_ack::SelectiveAck, stream::UserRxMessage};
 
 pub struct AssembledRx {
     assembler: Assembler,
@@ -24,6 +24,10 @@ impl AssembledRx {
 
     pub fn debug_string(&self) -> &impl std::fmt::Display {
         &self.assembler
+    }
+
+    pub fn selective_ack(&self) -> Option<SelectiveAck> {
+        SelectiveAck::new(&self.assembler)
     }
 
     // anyhow error on fatal

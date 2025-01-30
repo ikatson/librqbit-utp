@@ -489,7 +489,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         cx: &mut std::task::Context<'_>,
         socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<bool> {
-        self.send_control_packet(cx, socket, self.outgoing_header())
+        let mut header = self.outgoing_header();
+        header.extensions.selective_ack = self.assembler.selective_ack();
+        self.send_control_packet(cx, socket, header)
     }
 
     fn send_challenge_ack(
