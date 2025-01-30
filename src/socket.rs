@@ -603,12 +603,10 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
         if let Some(tx) = self.streams.get(&key) {
             if tx.send(message).is_err() {
-                warn!(
+                trace!(
                     ?key,
-                    "stream dead. this branch should be rare and is probably a bug"
+                    "stream dead, but wasn't cleaned up yet, this is probably a race"
                 );
-                // TODO: we should clean up the other one too? it should have been deleted by
-                // the UtpStream drop guards, maybe it will.
                 self.streams.remove(&key);
             }
             return Ok(());
