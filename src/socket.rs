@@ -29,7 +29,7 @@ use tokio::sync::{
     mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
-use tracing::{debug, error_span, trace, trace_span, warn};
+use tracing::{debug, error_span, trace, warn};
 
 type ConnectionId = SeqNr;
 
