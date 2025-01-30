@@ -24,10 +24,10 @@
 //
 // TODO: built-in connection timeouts?
 
-mod assembled_rx;
 mod congestion;
 mod constants;
 mod message;
+mod out_of_order_rx;
 pub mod raw;
 mod rtte;
 mod seq_nr;

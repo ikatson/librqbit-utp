@@ -15,10 +15,10 @@ use tokio::{
 use tracing::{debug, error_span, trace, warn};
 
 use crate::{
-    assembled_rx::{AssemblerAddRemoveResult, OutOfOrderQueue},
     congestion::CongestionController,
     constants::{ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, UTP_HEADER_SIZE},
     message::UtpMessage,
+    out_of_order_rx::{AssemblerAddRemoveResult, OutOfOrderQueue},
     raw::{Type, UtpHeader},
     rtte::RttEstimator,
     seq_nr::SeqNr,
