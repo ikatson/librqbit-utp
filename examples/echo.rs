@@ -15,7 +15,7 @@ use tokio::{
 };
 use tracing::{error_span, info, Instrument};
 
-const MAX_COUNTER: u64 = 10000;
+const MAX_COUNTER: u64 = 1000_000;
 const TIMEOUT: Duration = Duration::from_secs(1);
 
 async fn flatten<JoinError>(
@@ -110,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
     info!("finished");
 
     // TODO: proper waiting for listener to finish
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     Ok(())
 }

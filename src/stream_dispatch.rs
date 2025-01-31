@@ -401,7 +401,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         cx: &mut std::task::Context<'_>,
         socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<bool> {
-        if self.delayed_ack_expired() && self.ack_to_transmit() {
+        let expired = self.delayed_ack_expired();
+        if expired && self.ack_to_transmit() {
             trace!("delayed ack expired, sending ACK");
             self.send_ack(cx, socket)
         } else {
@@ -410,8 +411,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn maybe_prepare_for_retransmission(&mut self) {
-        if let Some(retransmit_delta) = self.timers.retransmit.should_retransmit(self.this_poll.now)
-        {
+        if self.timers.retransmit.should_retransmit(self.this_poll.now) {
             let rewind_to = self
                 .tx
                 .first_seq_nr()
@@ -419,11 +419,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .map(|rw| rw - 1);
             let rewind_to = match rewind_to {
                 Some(v) => v,
-                None => return,
+                None => {
+                    trace!("nowhere to rewind to, resetting retransmit timer");
+                    self.timers.retransmit.set_for_idle();
+                    return;
+                }
             };
 
             // If a retransmit timer expired, we should resend data starting at the last ACK.
-            trace!("retransmitting at t+{:?}", retransmit_delta);
+            trace!("retransmitting");
 
             // Rewind "last sequence number sent", as if we never
             // had sent them. This will cause all data in the queue
@@ -804,24 +808,19 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     }
                 }
 
-                // Handle delayed acks
+                if self.immediate_ack_to_transmit() {
+                    self.send_ack(cx, socket)?;
+                }
+
                 if self.ack_to_transmit() {
                     self.timers.ack_delay_timer = match self.timers.ack_delay_timer {
                         AckDelayTimer::Idle => {
                             trace!("starting delayed ack timer");
                             AckDelayTimer::Waiting(self.this_poll.now + ACK_DELAY)
                         }
-                        AckDelayTimer::Waiting(_) if self.immediate_ack_to_transmit() => {
-                            trace!("delayed ack timer already started, forcing expiry");
-                            AckDelayTimer::Immediate
-                        }
                         timer @ AckDelayTimer::Waiting(_) => {
                             trace!("waiting until delayed ack timer expires");
                             timer
-                        }
-                        AckDelayTimer::Immediate => {
-                            trace!("delayed ack timer already force-expired");
-                            AckDelayTimer::Immediate
                         }
                     };
                 }
@@ -930,9 +929,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
     fn delayed_ack_expired(&self) -> bool {
         match self.timers.ack_delay_timer {
+            // This means we need to ack the packet immediately.
             AckDelayTimer::Idle => true,
             AckDelayTimer::Waiting(t) => t <= self.this_poll.now,
-            AckDelayTimer::Immediate => true,
         }
     }
 
@@ -942,12 +941,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         let delayed_ack_poll_at = match (want_ack, self.timers.ack_delay_timer) {
             (false, _) => PollAt::Ingress,
-            (true, AckDelayTimer::Idle) => PollAt::Now,
+            (true, AckDelayTimer::Idle) => PollAt::Ingress,
             (true, AckDelayTimer::Waiting(t)) => {
                 trace!(expires_in=?t - self.this_poll.now, "delayed ACK timer");
                 PollAt::Time(t)
             }
-            (true, AckDelayTimer::Immediate) => PollAt::Now,
         };
 
         // We wait for the earliest of our timers to fire.
@@ -1181,7 +1179,6 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
 enum AckDelayTimer {
     Idle,
     Waiting(Instant),
-    Immediate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1208,14 +1205,14 @@ impl RetransmitTimer {
         RetransmitTimer::Idle
     }
 
-    fn should_retransmit(&self, timestamp: Instant) -> Option<Duration> {
+    fn should_retransmit(&self, timestamp: Instant) -> bool {
         match *self {
-            RetransmitTimer::Retransmit { expires_at, delay } if timestamp >= expires_at => {
+            RetransmitTimer::Retransmit { expires_at, .. } if timestamp >= expires_at => {
                 trace!("should retransmit, timer expired");
-                Some(timestamp - expires_at + delay)
+                true
             }
-            RetransmitTimer::FastRetransmit => Some(Duration::from_millis(0)),
-            _ => None,
+            RetransmitTimer::FastRetransmit => true,
+            _ => false,
         }
     }
 
@@ -1287,9 +1284,6 @@ impl Timers {
             AckDelayTimer::Waiting(_) => {
                 trace!("stop delayed ack timer")
             }
-            AckDelayTimer::Immediate => {
-                trace!("stop delayed ack timer (was force-expired)")
-            }
         }
         self.ack_delay_timer = AckDelayTimer::Idle;
     }
@@ -1332,7 +1326,9 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
         this.this_poll.transport_pending = false;
         this.this_poll.now = this.env.now();
 
-        loop {
+        const MAX_ITERS: usize = 2;
+
+        for _ in 0..MAX_ITERS {
             // Flow control: flush as many out of order messages to user RX as possible.
             bail_if_err!(this.user_rx.flush(cx));
 
@@ -1357,6 +1353,7 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
             }
 
             if this.user_rx_is_closed() && this.state.is_local_fin_or_later() {
+                // TODO: run a little bit more to send the final ACK to remote FIN?
                 trace!(current_state=?this.state, "both halves are dead, no reason to continue");
                 this.just_before_death(None);
                 return Poll::Ready(Ok(()));
@@ -1364,8 +1361,9 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
 
             match this.next_poll_send_to_at() {
                 PollAt::Now => {
-                    trace!("need to repoll");
-                    continue;
+                    return Poll::Ready(Err(anyhow::anyhow!(
+                        "bug: encountered PollAt::now after running poll()",
+                    )));
                 }
                 PollAt::Time(instant) => {
                     let duration = instant - this.this_poll.now;
@@ -1373,13 +1371,17 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
                     if this.timers.arm_in(cx, duration) {
                         return Poll::Pending;
                     } else {
-                        trace!(deadline = ?instant - this.this_poll.now, "failed arming timer, continuing loop");
+                        trace!(deadline = ?instant - this.this_poll.now, "failed arming timer, continuing poll loop");
                         continue;
                     }
                 }
                 PollAt::Ingress => return Poll::Pending,
             }
         }
+
+        Poll::Ready(Err(anyhow::anyhow!(
+            "bug: too many iterations in dispatcher",
+        )))
     }
 }
 
