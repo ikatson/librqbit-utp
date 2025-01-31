@@ -1,3 +1,5 @@
+// TODO: I don't like the timer logic - it's too complex and thus probably buggy. Rewrite it.
+
 // TODO: uTP socket death
 // if main socket dies
 // - scream about it
