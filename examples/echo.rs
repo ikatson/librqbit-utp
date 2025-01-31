@@ -15,7 +15,7 @@ use tokio::{
 };
 use tracing::{error_span, info, Instrument};
 
-const MAX_COUNTER: u64 = 1;
+const MAX_COUNTER: u64 = 10000;
 const TIMEOUT: Duration = Duration::from_secs(1);
 
 async fn flatten<JoinError>(

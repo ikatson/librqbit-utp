@@ -340,11 +340,14 @@ impl OutOfOrderQueue {
                 bail!("bug: should have enqueued")
             };
         }
-        trace!(
-            packets = total_packets,
-            bytes = total_bytes,
-            "flushed from out-of-order user RX"
-        );
+        if total_bytes > 0 {
+            trace!(
+                packets = total_packets,
+                bytes = total_bytes,
+                "flushed from out-of-order user RX"
+            );
+        }
+
         Ok(total_bytes)
     }
 
