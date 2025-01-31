@@ -33,15 +33,6 @@ impl UtpMessage {
         }
     }
 
-    pub fn consume(self) -> (UtpHeader, Payload) {
-        (self.header, self.data)
-    }
-
-    #[cfg(test)]
-    pub fn into_payload(self) -> Payload {
-        self.data
-    }
-
     pub fn deserialize(buf: &[u8]) -> Option<Self> {
         let (header, hsize) = UtpHeader::deserialize(buf)?;
 

@@ -480,13 +480,6 @@ impl OutOfOrderQueue {
             contiguous,
         ))
     }
-
-    fn peek_front_size(&self) -> Option<usize> {
-        if self.filled_front > 0 {
-            return Some(self.data[0].payload().len());
-        }
-        None
-    }
 }
 
 #[cfg(test)]

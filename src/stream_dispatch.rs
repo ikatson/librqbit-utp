@@ -678,7 +678,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             };
             self.process_incoming_message(cx, socket, msg)?;
         }
-        trace!(rxlen = self.rx.len());
         Ok(())
     }
 
@@ -1384,7 +1383,7 @@ mod tests {
 
     use futures::FutureExt;
     use tokio::{
-        io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
+        io::{AsyncWrite, AsyncWriteExt},
         sync::mpsc::{unbounded_channel, UnboundedSender},
     };
     use tracing::trace;
