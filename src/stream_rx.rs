@@ -13,7 +13,8 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use tokio::{io::AsyncRead, sync::Notify};
+use futures::task::AtomicWaker;
+use tokio::io::AsyncRead;
 use tracing::{trace, warn};
 
 use crate::{
@@ -31,19 +32,6 @@ pub struct UtpStreamReadHalf {
 //
 // TODO: implement flow control
 
-impl UtpStreamReadHalf {
-    pub fn new(
-        rx: tokio::sync::mpsc::UnboundedReceiver<UserRxMessage>,
-        shared: Arc<UserRxShared>,
-    ) -> Self {
-        Self {
-            queue: rx,
-            shared,
-            current: None,
-        }
-    }
-}
-
 impl AsyncRead for UtpStreamReadHalf {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -51,6 +39,7 @@ impl AsyncRead for UtpStreamReadHalf {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let mut written = false;
+        let mut received_pending = false;
 
         'outer: while buf.remaining() > 0 {
             // If there was a previous message we haven't read till the end, do it.
@@ -65,18 +54,14 @@ impl AsyncRead for UtpStreamReadHalf {
                 let len = buf.remaining().min(payload.len());
 
                 buf.put_slice(&payload[..len]);
-                // trace!(
-                //     "reading {}..{} from {}; payload_len={}",
-                //     current.offset,
-                //     current.offset + len,
-                //     current.msg.header.seq_nr,
-                //     current.msg.payload().len(),
-                // );
                 written = true;
                 current.offset += len;
                 if current.offset == current.msg.payload().len() {
                     self.current = None;
                 }
+
+                // TODO: at this point we might wake the waker that was waiting for our queue to free up.
+                self.shared.len_bytes.fetch_sub(len, SeqCst);
                 continue 'outer;
             }
 
@@ -92,8 +77,15 @@ impl AsyncRead for UtpStreamReadHalf {
                     // This can happen only if dispatcher died and didn't send anything to us.
                     return Poll::Ready(Err(std::io::Error::other("dispatcher dead")));
                 }
-                Poll::Pending => break,
+                Poll::Pending => {
+                    received_pending = true;
+                    break;
+                }
             };
+        }
+
+        if received_pending {
+            self.shared.flush_waker.wake();
         }
 
         if written {
@@ -109,23 +101,13 @@ struct BeingRead {
     offset: usize,
 }
 
-impl BeingRead {
-    fn remaining(&self) -> usize {
-        self.msg.payload().len() - self.offset
-    }
-}
-
 pub struct UserRxShared {
     len_bytes: AtomicUsize,
-    consumed_notify: Notify,
+    flush_waker: AtomicWaker,
     capacity: usize,
 }
 
 impl UserRxShared {
-    pub fn len(&self) -> usize {
-        self.len_bytes.load(SeqCst)
-    }
-
     pub fn window(&self, ordering: std::sync::atomic::Ordering) -> anyhow::Result<usize> {
         self.capacity
             .checked_sub(self.len_bytes.load(ordering))
@@ -150,10 +132,9 @@ impl UserRx {
         out_of_order_max_packets: NonZeroUsize,
     ) -> (UserRx, UtpStreamReadHalf) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let notify = Notify::new();
         let shared = Arc::new(UserRxShared {
             len_bytes: AtomicUsize::new(0),
-            consumed_notify: notify,
+            flush_waker: AtomicWaker::new(),
             capacity: max_rx_bytes.get(),
         });
         let read_half = UtpStreamReadHalf {
@@ -186,30 +167,39 @@ impl UserRx {
             .saturating_sub(self.ooq.stored_bytes())
     }
 
-    pub fn flush(&mut self) -> anyhow::Result<usize> {
+    pub fn flush(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<usize> {
+        // Register waker if total pending bytes exceed window
+        let window = self.shared.window(SeqCst)?;
+
+        // let pending_bytes: usize = self
+        //     .ooq
+        //     .data
+        //     .iter()
+        //     .take(self.ooq.filled_front)
+        //     .map(|m| m.payload().len())
+        //     .sum();
+        // if pending_bytes > window {
+        //     self.shared.flush_waker.register(cx.waker());
+        // }
+
         // Flush as many items as possible from the beginning of out of order queue to the user RX
         let mut total_bytes = 0;
         let mut total_packets = 0;
         let mut window = self.shared.window(SeqCst)?;
 
-        // TODO: register notify if RX queue is full. Ensure proper operation ordering.
-
-        while self.ooq.filled_front > 0 && self.ooq.data[0].payload().len() <= window {
-            let msg = self.ooq.data.pop_front().unwrap();
+        while let Some(msg) = self.ooq.pop_front_if_fits(window) {
             let len = msg.payload().len();
-            self.ooq.filled_front -= 1;
-            self.ooq.len -= 1;
-            self.ooq.len_bytes -= len;
-            self.ooq.data.push_back(Default::default());
             total_bytes += len;
             window -= len;
             total_packets += 1;
-            // TODO: ensure we send FIN here. Or how do we process it?
             self.shared.len_bytes.fetch_add(len, SeqCst);
             self.tx
                 .send(UserRxMessage::Payload(msg))
                 .context("reader dead")?;
         }
+
+        // If we still have items queued, register
+
         if total_bytes > 0 {
             trace!(
                 packets = total_packets,
@@ -230,8 +220,8 @@ impl UserRx {
     }
 
     #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.shared.len()
+    pub fn len_test(&self) -> usize {
+        self.shared.len_bytes.load(SeqCst)
     }
 
     pub fn assembler_empty(&self) -> bool {
@@ -245,16 +235,32 @@ impl UserRx {
 
     pub fn add_remove(
         &mut self,
+        cx: &mut std::task::Context<'_>,
         msg: UtpMessage,
         offset: usize,
     ) -> anyhow::Result<AssemblerAddRemoveResult> {
         match self.ooq.add_remove(msg, offset)? {
             res @ AssemblerAddRemoveResult::ConsumedSequenceNumbers(..) => {
-                self.flush()?;
+                self.flush(cx)?;
                 Ok(res)
             }
             res => Ok(res),
         }
+    }
+
+    #[cfg(test)]
+    async fn add_remove_test(
+        &mut self,
+        msg: UtpMessage,
+        offset: usize,
+    ) -> anyhow::Result<AssemblerAddRemoveResult> {
+        let mut msg = Some(msg);
+        let msg = &mut msg;
+        std::future::poll_fn(move |cx| {
+            let res = self.add_remove(cx, msg.take().unwrap(), offset);
+            Poll::Ready(res)
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -293,6 +299,22 @@ impl OutOfOrderQueue {
             len_bytes: 0,
             capacity: capacity.get(),
         }
+    }
+
+    pub fn pop_front_if_fits(&mut self, window: usize) -> Option<UtpMessage> {
+        if self.filled_front == 0 {
+            return None;
+        }
+        if self.data[0].payload().len() >= window {
+            return None;
+        }
+        let msg = self.data.pop_front()?;
+        let len = msg.payload().len();
+        self.filled_front -= 1;
+        self.len -= 1;
+        self.len_bytes -= len;
+        self.data.push_back(Default::default());
+        Some(msg)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -418,6 +440,13 @@ impl OutOfOrderQueue {
             contiguous,
         ))
     }
+
+    fn peek_front_size(&self) -> Option<usize> {
+        if self.filled_front > 0 {
+            return Some(self.data[0].payload().len());
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -481,8 +510,8 @@ mod tests {
         assert_eq!(asm.filled_front(), 0);
     }
 
-    #[test]
-    fn test_asm_channel_full_asm_empty() {
+    #[tokio::test]
+    async fn test_asm_channel_full_asm_empty() {
         setup_test_logging();
         let (mut user_rx, _read) = user_rx(1, 2);
         let msg = msg(0, b"a");
@@ -493,7 +522,7 @@ mod tests {
         assert!(user_rx.shared.is_full_test());
 
         assert_eq!(
-            user_rx.add_remove(msg.clone(), 0).unwrap(),
+            user_rx.add_remove_test(msg.clone(), 0).await.unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
         );
         assert_eq!(user_rx.ooq.stored_packets(), 1);
@@ -501,8 +530,8 @@ mod tests {
         assert_eq!(user_rx.ooq.filled_front(), 1);
     }
 
-    #[test]
-    fn test_asm_channel_full_asm_not_empty() {
+    #[tokio::test]
+    async fn test_asm_channel_full_asm_not_empty() {
         let (mut user_rx, _read) = user_rx(1, 2);
         let msg = msg(0, b"a");
 
@@ -510,7 +539,7 @@ mod tests {
         user_rx.enqueue_test(UserRxMessage::Payload(msg.clone()));
 
         assert_eq!(
-            user_rx.add_remove(msg.clone(), 1).unwrap(),
+            user_rx.add_remove_test(msg.clone(), 1).await.unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
         );
 
@@ -519,7 +548,7 @@ mod tests {
         assert_eq!(user_rx.ooq.filled_front(), 0);
 
         assert_eq!(
-            user_rx.add_remove(msg.clone(), 0).unwrap(),
+            user_rx.add_remove_test(msg.clone(), 0).await.unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(2)
         );
         assert_eq!(user_rx.ooq.stored_packets(), 2);
@@ -538,20 +567,20 @@ mod tests {
         let msg_2 = msg(2, b"test");
 
         assert_eq!(
-            user_rx.add_remove(msg_1.clone(), 1).unwrap(),
+            user_rx.add_remove_test(msg_1.clone(), 1).await.unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
         assert_eq!(user_rx.ooq.stored_packets(), 1);
 
         assert_eq!(
-            user_rx.add_remove(msg_2.clone(), 2).unwrap(),
+            user_rx.add_remove_test(msg_2.clone(), 2).await.unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
 
         assert_eq!(
-            user_rx.add_remove(msg_0.clone(), 0).unwrap(),
+            user_rx.add_remove_test(msg_0.clone(), 0).await.unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(3)
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
@@ -572,20 +601,20 @@ mod tests {
         let msg_2 = msg(2, b"test");
 
         assert_eq!(
-            user_rx.add_remove(msg_0.clone(), 0).unwrap(),
+            user_rx.add_remove_test(msg_0.clone(), 0).await.unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
         assert_eq!(user_rx.ooq.stored_packets(), 0);
 
         assert_eq!(
-            user_rx.add_remove(msg_1.clone(), 0).unwrap(),
+            user_rx.add_remove_test(msg_1.clone(), 0).await.unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
 
         assert_eq!(
-            user_rx.add_remove(msg_2.clone(), 0).unwrap(),
+            user_rx.add_remove_test(msg_2.clone(), 0).await.unwrap(),
             AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
@@ -619,5 +648,38 @@ mod tests {
         );
         trace!(asm=%asm.debug_string(true));
         assert_eq!(asm.stored_packets(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_flush_waker() {
+        setup_test_logging();
+
+        // Small window to force flow control
+        let (mut user_rx, mut read) = user_rx(5, 3);
+
+        // Create messages that are bigger than window when combined
+        let msg_0 = msg(0, b"hello"); // 5 bytes
+        let msg_1 = msg(1, b"world"); // 5 bytes
+
+        // Add first message out of order - should stay in assembler
+        assert_eq!(
+            user_rx.add_remove_test(msg_1.clone(), 1).await.unwrap(),
+            AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
+        );
+
+        // Add message that completes the sequence
+        assert_eq!(
+            user_rx.add_remove_test(msg_0.clone(), 0).await.unwrap(),
+            AssemblerAddRemoveResult::ConsumedSequenceNumbers(2)
+        );
+
+        // First message should be in the read buffer now
+        let mut buf = [0u8; 5];
+        let sz = read.read(&mut buf).await.unwrap();
+        assert_eq!(std::str::from_utf8(&buf[..sz]), Ok("hello"));
+
+        // Second message should come through after reading first
+        let sz = read.read(&mut buf).await.unwrap();
+        assert_eq!(std::str::from_utf8(&buf[..sz]), Ok("world"));
     }
 }

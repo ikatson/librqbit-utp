@@ -777,7 +777,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                 match self
                     .user_rx
-                    .add_remove(msg, offset as usize)
+                    .add_remove(cx, msg, offset as usize)
                     .context("fatal error in assember")?
                 {
                     AssemblerAddRemoveResult::ConsumedSequenceNumbers(count) => {
@@ -1315,7 +1315,7 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
 
         loop {
             // Flow control: flush as many out of order messages to user RX as possible.
-            bail_if_err!(this.user_rx.flush());
+            bail_if_err!(this.user_rx.flush(cx));
 
             // Read incoming stream.
             bail_if_err!(this.process_all_incoming_messages(cx, socket));
@@ -2879,7 +2879,7 @@ mod tests {
 
         // Read all data
         let received_data = t.read_all_available().await.unwrap();
-        assert_eq!(t.vsock.user_rx.len(), 0);
+        assert_eq!(t.vsock.user_rx.len_test(), 0);
 
         // Verify data integrity
         assert_eq!(
