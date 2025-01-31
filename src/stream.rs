@@ -24,6 +24,11 @@ impl UtpStream {
     ) {
         (self.reader, self.writer)
     }
+
+    #[cfg(test)]
+    pub async fn read_all_available(&mut self) -> std::io::Result<Vec<u8>> {
+        self.reader.read_all_available().await
+    }
 }
 
 impl AsyncRead for UtpStream {

@@ -1432,6 +1432,10 @@ mod tests {
             self.transport.take_sent_utpmessages()
         }
 
+        async fn read_all_available(&mut self) -> std::io::Result<Vec<u8>> {
+            self.stream.as_mut().unwrap().read_all_available().await
+        }
+
         async fn process_all_available_incoming(&mut self) {
             std::future::poll_fn(|cx| {
                 if self.vsock.rx.is_empty() {
@@ -1440,34 +1444,6 @@ mod tests {
                 self.vsock.poll_unpin(cx).map(|r| r.unwrap())
             })
             .await
-        }
-
-        async fn read_all_available(&mut self) -> std::io::Result<Vec<u8>> {
-            let mut buf = vec![0u8; 1024 * 1024];
-            // unbounded_channel() needs time to progress. It doesn't return everything it
-            // has on each poll so we need to
-            let timeout = tokio::time::sleep(Duration::from_millis(100));
-            let mut offset = 0;
-
-            tokio::pin!(timeout);
-            let stream = self.stream.as_mut().unwrap();
-            loop {
-                tokio::select! {
-                    _ = &mut timeout => {
-                        break;
-                    },
-                    res = stream.read(&mut buf[offset..]) => {
-                        let len = res?;
-                        if len == 0 {
-                            break;
-                        }
-                        offset += len;
-                    }
-                }
-            }
-
-            buf.truncate(offset);
-            Ok(buf)
         }
 
         async fn poll_once(&mut self) -> Poll<anyhow::Result<()>> {
