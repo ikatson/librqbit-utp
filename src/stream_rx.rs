@@ -204,18 +204,16 @@ impl UserRx {
         // Register waker if total pending bytes exceed window
         let window = self.shared.window(SeqCst)?;
 
-        // TODO: test this race
-        //
-        // let pending_bytes: usize = self
-        //     .ooq
-        //     .data
-        //     .iter()
-        //     .take(self.ooq.filled_front)
-        //     .map(|m| m.payload().len())
-        //     .sum();
-        // if pending_bytes > window {
-        //     self.shared.flush_waker.register(cx.waker());
-        // }
+        let filled_front_bytes: usize = self
+            .ooq
+            .data
+            .iter()
+            .take(self.ooq.filled_front)
+            .map(|m| m.payload().len())
+            .sum();
+        if filled_front_bytes > window {
+            self.shared.flush_waker.register(cx.waker());
+        }
 
         // Flush as many items as possible from the beginning of out of order queue to the user RX
         let mut total_bytes = 0;
@@ -691,37 +689,4 @@ mod tests {
         trace!(asm=%asm.debug_string(true));
         assert_eq!(asm.stored_packets(), 1);
     }
-
-    // #[tokio::test]
-    // async fn test_flush_waker() {
-    //     setup_test_logging();
-
-    //     // Small window to force flow control
-    //     let (mut user_rx, mut read) = user_rx(5, 3);
-
-    //     // Create messages that are bigger than window when combined
-    //     let msg_0 = msg(0, b"hello"); // 5 bytes
-    //     let msg_1 = msg(1, b"world"); // 5 bytes
-
-    //     // Add first message out of order - should stay in assembler
-    //     assert_eq!(
-    //         user_rx.add_remove_test(msg_1.clone(), 1).await.unwrap(),
-    //         AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
-    //     );
-
-    //     // Add message that completes the sequence
-    //     assert_eq!(
-    //         user_rx.add_remove_test(msg_0.clone(), 0).await.unwrap(),
-    //         AssemblerAddRemoveResult::ConsumedSequenceNumbers(2)
-    //     );
-
-    //     // First message should be in the read buffer now
-    //     let mut buf = [0u8; 5];
-    //     let sz = read.read(&mut buf).await.unwrap();
-    //     assert_eq!(std::str::from_utf8(&buf[..sz]), Ok("hello"));
-
-    //     // Second message should come through after reading first
-    //     let sz = read.read(&mut buf).await.unwrap();
-    //     assert_eq!(std::str::from_utf8(&buf[..sz]), Ok("world"));
-    // }
 }
