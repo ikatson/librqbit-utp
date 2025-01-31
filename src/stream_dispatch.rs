@@ -889,6 +889,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
             Type::ST_RESET => bail!("ST_RESET received"),
             Type::ST_FIN => {
+                if let Some(close_reason) = msg.header.extensions.close_reason {
+                    debug!("remote closed with {close_reason:?}");
+                }
+
                 // This will (re)send FINACK
                 if msg.header.seq_nr - self.last_consumed_remote_seq_nr == 1 {
                     self.last_consumed_remote_seq_nr += 1;

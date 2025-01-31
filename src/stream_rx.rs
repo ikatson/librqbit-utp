@@ -281,6 +281,7 @@ impl UserRx {
     ) -> anyhow::Result<AssemblerAddRemoveResult> {
         match self.ooq.add_remove(msg, offset)? {
             res @ AssemblerAddRemoveResult::ConsumedSequenceNumbers(n) if n > 0 => {
+                // TODO: we shouldn't flush on every single message, but rather should do it after a certain threshold.
                 self.flush(cx)?;
                 Ok(res)
             }
