@@ -8,7 +8,6 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use parking_lot::Mutex;
 use tokio::{sync::mpsc::UnboundedReceiver, time::Sleep};
 use tracing::{debug, error_span, trace, warn};
 
@@ -21,14 +20,14 @@ use crate::{
     seq_nr::SeqNr,
     socket::{ControlRequest, ValidatedSocketOpts},
     stream::UtpStream,
-    stream_rx::{AssemblerAddRemoveResult, UserRx, UserRxLocked, UtpStreamReadHalf},
+    stream_rx::{AssemblerAddRemoveResult, UserRx},
     stream_tx::{FragmentedTx, UserTx, UtpStreamWriteHalf},
     traits::{Transport, UtpEnvironment},
     utils::{
         log_before_and_after_if_changed, spawn_print_error, update_optional_waker,
         DropGuardSendBeforeDeath,
     },
-    Payload, UtpSocket,
+    UtpSocket,
 };
 
 // This contains more states than Rust could model with its enums, but I'm keeping
@@ -1084,14 +1083,10 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             parent_span,
         } = args;
 
-        let user_rx_locked = Arc::new(Mutex::new(UserRxLocked::new(
-            socket.opts().max_user_rx_buffered_bytes.get(),
-        )));
-        let user_rx = UserRx::new(
-            user_rx_locked.clone(),
+        let (user_rx, read_half) = UserRx::build(
+            socket.opts().max_user_rx_buffered_bytes,
             socket.opts().max_rx_out_of_order_packets,
         );
-        let read_half = UtpStreamReadHalf::new(user_rx_locked);
 
         let user_tx = UserTx::new(socket.opts().virtual_socket_tx_bytes);
         let write_half = UtpStreamWriteHalf::new(user_tx.clone());
