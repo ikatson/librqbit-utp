@@ -60,7 +60,6 @@ impl AsyncRead for UtpStreamReadHalf {
                     self.current = None;
                 }
 
-                // TODO: at this point we might wake the waker that was waiting for our queue to free up.
                 self.shared.len_bytes.fetch_sub(len, SeqCst);
                 continue 'outer;
             }
@@ -87,6 +86,8 @@ impl AsyncRead for UtpStreamReadHalf {
         if received_pending {
             self.shared.flush_waker.wake();
         }
+
+        trace!(received_pending, written, "pending");
 
         if written {
             return Poll::Ready(Ok(()));
@@ -240,7 +241,7 @@ impl UserRx {
         offset: usize,
     ) -> anyhow::Result<AssemblerAddRemoveResult> {
         match self.ooq.add_remove(msg, offset)? {
-            res @ AssemblerAddRemoveResult::ConsumedSequenceNumbers(..) => {
+            res @ AssemblerAddRemoveResult::ConsumedSequenceNumbers(n) if n > 0 => {
                 self.flush(cx)?;
                 Ok(res)
             }
@@ -266,7 +267,7 @@ impl UserRx {
     #[cfg(test)]
     fn enqueue_test(&self, msg: UserRxMessage) {
         let win = self.shared.window(SeqCst).unwrap();
-        let msglen = msg.len_bytes();
+        let msglen = msg.len_bytes_test();
         if msglen < win {
             panic!("not enough space")
         }
