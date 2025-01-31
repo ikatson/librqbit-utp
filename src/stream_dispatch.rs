@@ -167,7 +167,7 @@ impl VirtualSocketState {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum UserRxMessage {
-    Payload(Payload),
+    Payload(UtpMessage),
     Error(String),
     Eof,
 }
@@ -175,7 +175,7 @@ pub(crate) enum UserRxMessage {
 impl UserRxMessage {
     pub fn len_bytes(&self) -> usize {
         match &self {
-            UserRxMessage::Payload(buf) => buf.len(),
+            UserRxMessage::Payload(buf) => buf.payload().len(),
             _ => 0,
         }
     }

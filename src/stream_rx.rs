@@ -42,10 +42,10 @@ impl AsyncRead for UtpStreamReadHalf {
 
         let mut g = self.locked.lock();
 
-        while buf.remaining() > 0 {
+        'outer: while buf.remaining() > 0 {
             // If there was a previous message we haven't read till the end, do it.
             if let Some(current) = g.current.as_mut() {
-                let payload = &current.payload[current.offset..];
+                let payload = &current.msg.payload()[current.offset..];
                 if payload.is_empty() {
                     return Poll::Ready(Err(std::io::Error::other(
                         "bug in UtpStreamReadHalf: payload is empty",
@@ -55,17 +55,25 @@ impl AsyncRead for UtpStreamReadHalf {
                 let len = buf.remaining().min(payload.len());
 
                 buf.put_slice(&payload[..len]);
+                // trace!(
+                //     "reading {}..{} from {}; payload_len={}",
+                //     current.offset,
+                //     current.offset + len,
+                //     current.msg.header.seq_nr,
+                //     current.msg.payload().len(),
+                // );
                 written = true;
                 current.offset += len;
-                if current.offset == current.payload.len() {
+                if current.offset == current.msg.payload().len() {
                     g.current = None;
                 }
+                continue 'outer;
             }
 
             match g.queue.pop_front() {
-                Some(UserRxMessage::Payload(payload)) => {
-                    g.queue_len_bytes -= payload.len();
-                    g.current = Some(BeingRead { payload, offset: 0 })
+                Some(UserRxMessage::Payload(msg)) => {
+                    g.queue_len_bytes -= msg.payload().len();
+                    g.current = Some(BeingRead { msg, offset: 0 })
                 }
                 Some(UserRxMessage::Error(msg)) => {
                     return Poll::Ready(Err(std::io::Error::other(msg)))
@@ -90,13 +98,13 @@ impl AsyncRead for UtpStreamReadHalf {
 }
 
 struct BeingRead {
-    payload: Payload,
+    msg: UtpMessage,
     offset: usize,
 }
 
 impl BeingRead {
     fn remaining(&self) -> usize {
-        self.payload.len() - self.offset
+        self.msg.payload().len() - self.offset
     }
 }
 
@@ -236,7 +244,7 @@ impl UserRx {
 }
 
 pub struct OutOfOrderQueue {
-    out_of_order_queue: VecDeque<Payload>,
+    out_of_order_queue: VecDeque<UtpMessage>,
     filled_front: usize,
     len: usize,
     len_bytes: usize,
@@ -321,7 +329,13 @@ impl OutOfOrderQueue {
             .out_of_order_queue
             .range(start..)
             .enumerate()
-            .filter_map(|(idx, data)| if data.is_empty() { None } else { Some(idx) });
+            .filter_map(|(idx, data)| {
+                if data.payload().is_empty() {
+                    None
+                } else {
+                    Some(idx)
+                }
+            });
 
         SelectiveAck::new(unacked)
     }
@@ -330,16 +344,18 @@ impl OutOfOrderQueue {
         // Flush as many items as possible from the beginning of out of order queue to the user RX
         let mut total_bytes = 0;
         let mut total_packets = 0;
-        while self.filled_front > 0 && self.out_of_order_queue[0].len() <= user_rx.window() {
+        while self.filled_front > 0
+            && self.out_of_order_queue[0].payload().len() <= user_rx.window()
+        {
             let msg = self
                 .out_of_order_queue
                 .pop_front()
                 .context("bug: should have popped")?;
             self.filled_front -= 1;
             self.len -= 1;
-            self.len_bytes -= msg.len();
+            self.len_bytes -= msg.payload().len();
             self.out_of_order_queue.push_back(Default::default());
-            total_bytes += msg.len();
+            total_bytes += msg.payload().len();
             total_packets += 1;
             if user_rx.enqueue(UserRxMessage::Payload(msg)).is_err() {
                 bail!("bug: should have enqueued")
@@ -383,26 +399,24 @@ impl OutOfOrderQueue {
             return Ok(AssemblerAddRemoveResult::Unavailable(msg));
         }
 
-        let (_, payload) = msg.consume();
-
         let slot = self
             .out_of_order_queue
             .get_mut(effective_offset)
             .context("bug: slot should be there")?;
-        if !slot.is_empty() {
+        if !slot.payload().is_empty() {
             bail!("bug: slot had payload")
         }
 
         self.len += 1;
-        self.len_bytes += payload.len();
-        *slot = payload;
+        self.len_bytes += msg.payload().len();
+        *slot = msg;
 
         let range = self.filled_front..self.out_of_order_queue.len();
         // Advance "filled" if a contiguous data range was found.
         let contiguous = self
             .out_of_order_queue
             .range(range)
-            .take_while(|payload| !payload.is_empty())
+            .take_while(|msg| !msg.payload().is_empty())
             .count();
         self.filled_front += contiguous;
         Ok(AssemblerAddRemoveResult::ConsumedSequenceNumbers(
@@ -487,7 +501,7 @@ mod tests {
         user_rx
             .locked
             .lock()
-            .enqueue(UserRxMessage::Payload(b"a".to_vec()))
+            .enqueue(UserRxMessage::Payload(msg.clone()))
             .unwrap();
 
         assert!(user_rx.locked.lock().is_full());
@@ -510,7 +524,7 @@ mod tests {
         user_rx
             .locked
             .lock()
-            .enqueue(UserRxMessage::Payload(b"a".to_vec()))
+            .enqueue(UserRxMessage::Payload(msg.clone()))
             .unwrap();
 
         assert_eq!(
@@ -563,15 +577,15 @@ mod tests {
 
         assert_eq!(
             asm.locked.lock().queue.pop_front().unwrap(),
-            UserRxMessage::Payload(msg_0.into_payload())
+            UserRxMessage::Payload(msg_0)
         );
         assert_eq!(
             asm.locked.lock().queue.pop_front().unwrap(),
-            UserRxMessage::Payload(msg_1.into_payload())
+            UserRxMessage::Payload(msg_1)
         );
         assert_eq!(
             asm.locked.lock().queue.pop_front().unwrap(),
-            UserRxMessage::Payload(msg_2.into_payload())
+            UserRxMessage::Payload(msg_2)
         );
     }
 
@@ -606,15 +620,15 @@ mod tests {
 
         assert_eq!(
             asm.locked.lock().queue.pop_front().unwrap(),
-            UserRxMessage::Payload(msg_0.into_payload())
+            UserRxMessage::Payload(msg_0)
         );
         assert_eq!(
             asm.locked.lock().queue.pop_front().unwrap(),
-            UserRxMessage::Payload(msg_1.into_payload())
+            UserRxMessage::Payload(msg_1)
         );
         assert_eq!(
             asm.locked.lock().queue.pop_front().unwrap(),
-            UserRxMessage::Payload(msg_2.into_payload())
+            UserRxMessage::Payload(msg_2)
         );
     }
 
