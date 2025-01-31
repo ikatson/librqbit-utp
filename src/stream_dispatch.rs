@@ -2779,7 +2779,7 @@ mod tests {
         // send in-order. This should ACK the FIN
         header.set_type(Type::ST_DATA);
         header.seq_nr = 1.into();
-        t.send_msg(header, "");
+        t.send_msg(header, "a");
         t.poll_once_assert_pending().await;
         let sent = t.take_sent();
         assert_eq!(sent.len(), 1, "we should sent FIN ACK");
