@@ -387,7 +387,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if let Some(header) = last_sent {
             self.on_packet_sent(&header);
             self.timers
-                .kind
+                .retransmit
                 .set_for_retransmit(self.this_poll.now, self.rtte.retransmission_timeout());
         } else {
             trace!(recv_wnd, "did not send anything");
@@ -410,7 +410,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn maybe_prepare_for_retransmission(&mut self) {
-        if let Some(retransmit_delta) = self.timers.kind.should_retransmit(self.this_poll.now) {
+        if let Some(retransmit_delta) = self.timers.retransmit.should_retransmit(self.this_poll.now)
+        {
             let rewind_to = self
                 .tx
                 .first_seq_nr()
@@ -433,7 +434,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // now for whatever reason (like zero window), this avoids an
             // infinite polling loop where `poll_at` returns `Now` but `dispatch`
             // can't actually do anything.
-            self.timers.kind.set_for_idle();
+            self.timers.retransmit.set_for_idle();
 
             // Inform RTTE, so that it can avoid bogus measurements.
             self.rtte.on_retransmit();
@@ -537,7 +538,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         fin.seq_nr = seq_nr;
         if self.send_control_packet(cx, socket, fin)? {
             self.timers
-                .kind
+                .retransmit
                 .set_for_retransmit(self.this_poll.now, self.rtte.retransmission_timeout());
             self.last_sent_seq_nr = seq_nr;
         }
@@ -747,8 +748,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         let ack_all = msg.header.ack_nr == self.last_sent_ack_nr;
-        if !self.timers.kind.is_retransmit() || ack_all {
-            self.timers.kind.set_for_idle();
+        if !self.timers.retransmit.is_retransmit() || ack_all {
+            self.timers.retransmit.set_for_idle();
         }
 
         match msg.header.get_type() {
@@ -872,7 +873,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         );
 
                         if self.local_rx_dup_acks == 3 {
-                            self.timers.kind.set_for_fast_retransmit();
+                            self.timers.retransmit.set_for_fast_retransmit();
                             debug!("started fast retransmit");
                         }
                     }
@@ -943,14 +944,17 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (false, _) => PollAt::Ingress,
             (true, AckDelayTimer::Idle) => PollAt::Now,
             (true, AckDelayTimer::Waiting(t)) => {
-                trace!(expires_in=?t - Instant::now(), "delayed ACK timer");
+                trace!(expires_in=?t - self.this_poll.now, "delayed ACK timer");
                 PollAt::Time(t)
             }
             (true, AckDelayTimer::Immediate) => PollAt::Now,
         };
 
         // We wait for the earliest of our timers to fire.
-        self.timers.kind.poll_at().min(delayed_ack_poll_at)
+        self.timers
+            .retransmit
+            .poll_at(self.this_poll.now)
+            .min(delayed_ack_poll_at)
     }
 
     fn user_rx_is_closed(&self) -> bool {
@@ -1112,7 +1116,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             remote,
             conn_id_send,
             timers: Timers {
-                kind: TimerKind::new(),
+                retransmit: RetransmitTimer::new(),
                 sleep: Box::pin(tokio::time::sleep(Duration::from_secs(0))),
                 challenge_ack_timer: now - CHALLENGE_ACK_RATELIMIT,
                 ack_delay_timer: AckDelayTimer::Idle,
@@ -1181,7 +1185,7 @@ enum AckDelayTimer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum TimerKind {
+enum RetransmitTimer {
     Idle,
     Retransmit {
         expires_at: Instant,
@@ -1192,39 +1196,37 @@ enum TimerKind {
 
 struct Timers {
     sleep: Pin<Box<Sleep>>,
-
-    kind: TimerKind,
-
+    retransmit: RetransmitTimer,
     ack_delay_timer: AckDelayTimer,
 
     /// Used for rate-limiting: No more challenge ACKs will be sent until this instant.
     challenge_ack_timer: Instant,
 }
 
-impl TimerKind {
-    fn new() -> TimerKind {
-        TimerKind::Idle
+impl RetransmitTimer {
+    fn new() -> RetransmitTimer {
+        RetransmitTimer::Idle
     }
 
     fn should_retransmit(&self, timestamp: Instant) -> Option<Duration> {
         match *self {
-            TimerKind::Retransmit { expires_at, delay } if timestamp >= expires_at => {
+            RetransmitTimer::Retransmit { expires_at, delay } if timestamp >= expires_at => {
                 trace!("should retransmit, timer expired");
                 Some(timestamp - expires_at + delay)
             }
-            TimerKind::FastRetransmit => Some(Duration::from_millis(0)),
+            RetransmitTimer::FastRetransmit => Some(Duration::from_millis(0)),
             _ => None,
         }
     }
 
-    fn poll_at(&self) -> PollAt {
+    fn poll_at(&self, now: Instant) -> PollAt {
         match *self {
-            TimerKind::Idle => PollAt::Ingress,
-            TimerKind::Retransmit { expires_at, .. } => {
-                trace!(expires=?Instant::now() - expires_at, "retransmit timer");
+            RetransmitTimer::Idle => PollAt::Ingress,
+            RetransmitTimer::Retransmit { expires_at, .. } => {
+                trace!(expires=?expires_at - now, "retransmit timer");
                 PollAt::Time(expires_at)
             }
-            TimerKind::FastRetransmit => {
+            RetransmitTimer::FastRetransmit => {
                 trace!("fast restransmit: now");
                 PollAt::Now
             }
@@ -1233,37 +1235,37 @@ impl TimerKind {
 
     fn set_for_idle(&mut self) {
         trace!("resetting timer");
-        *self = TimerKind::Idle
+        *self = RetransmitTimer::Idle
     }
 
-    fn set_for_retransmit(&mut self, timestamp: Instant, delay: Duration) {
+    fn set_for_retransmit(&mut self, now: Instant, delay: Duration) {
         trace!(?delay, "setting retransmit timer");
         match *self {
-            TimerKind::Idle { .. } | TimerKind::FastRetransmit { .. } => {
-                *self = TimerKind::Retransmit {
-                    expires_at: timestamp + delay,
+            RetransmitTimer::Idle { .. } | RetransmitTimer::FastRetransmit { .. } => {
+                *self = RetransmitTimer::Retransmit {
+                    expires_at: now + delay,
                     delay,
                 }
             }
-            TimerKind::Retransmit { expires_at, delay } if timestamp >= expires_at => {
-                *self = TimerKind::Retransmit {
-                    expires_at: timestamp + delay,
+            RetransmitTimer::Retransmit { expires_at, delay } if now >= expires_at => {
+                *self = RetransmitTimer::Retransmit {
+                    expires_at: now + delay,
                     delay: delay * 2,
                 }
             }
-            TimerKind::Retransmit { .. } => (),
+            RetransmitTimer::Retransmit { .. } => (),
         }
     }
 
     fn set_for_fast_retransmit(&mut self) {
         trace!("setting for fast retransmit");
-        *self = TimerKind::FastRetransmit
+        *self = RetransmitTimer::FastRetransmit
     }
 
     fn is_retransmit(&self) -> bool {
         matches!(
             *self,
-            TimerKind::Retransmit { .. } | TimerKind::FastRetransmit
+            RetransmitTimer::Retransmit { .. } | RetransmitTimer::FastRetransmit
         )
     }
 }
@@ -2911,5 +2913,107 @@ mod tests {
             DATA_SIZE
         );
         assert_eq!(received_data, test_data, "Data corruption detected");
+    }
+
+    #[tokio::test]
+    async fn test_retransmission_behavior() {
+        setup_test_logging();
+        let mut t = make_test_vsock(SocketOpts {
+            ..Default::default()
+        });
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Write some test data
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(b"hello world")
+            .await
+            .unwrap();
+        t.poll_once_assert_pending().await;
+
+        // Initial send
+        let initial_sent = t.take_sent();
+        assert_eq!(initial_sent.len(), 1, "Should send data initially");
+        assert_eq!(initial_sent[0].payload(), b"hello world");
+        let initial_seq_nr = initial_sent[0].header.seq_nr;
+
+        // No retransmission should occur before timeout
+        t.env.increment_now(Duration::from_millis(500));
+        t.poll_once_assert_pending().await;
+        assert_eq!(
+            t.take_sent().len(),
+            0,
+            "Should not retransmit before timeout"
+        );
+
+        // After timeout, packet should be retransmitted
+        t.env.increment_now(Duration::from_secs(1));
+        t.poll_once_assert_pending().await;
+        let first_retransmit = t.take_sent();
+        assert_eq!(first_retransmit.len(), 1, "Should retransmit after timeout");
+        assert_eq!(
+            first_retransmit[0].header.seq_nr, initial_seq_nr,
+            "Retransmitted packet should have same sequence number"
+        );
+        assert_eq!(
+            first_retransmit[0].payload(),
+            b"hello world",
+            "Retransmitted packet should have same payload"
+        );
+
+        // Second timeout should trigger another retransmission with doubled timeout
+        t.env.increment_now(Duration::from_secs(2));
+        t.poll_once_assert_pending().await;
+        let second_retransmit = t.take_sent();
+        assert_eq!(
+            second_retransmit.len(),
+            1,
+            "Should retransmit after second timeout"
+        );
+        assert_eq!(
+            second_retransmit[0].header.seq_nr, initial_seq_nr,
+            "Second retransmit should have same sequence number"
+        );
+
+        // Now ACK the packet - should stop retransmissions
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: initial_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+
+        // No more retransmissions should occur
+        t.env.increment_now(Duration::from_secs(4));
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 0, "Should not retransmit after ACK");
+
+        // Write new data - should use next sequence number
+        t.stream.as_mut().unwrap().write_all(b"test").await.unwrap();
+        t.poll_once_assert_pending().await;
+        let new_sent = t.take_sent();
+        assert_eq!(new_sent.len(), 1, "Should send new data");
+        assert_eq!(
+            new_sent[0].header.seq_nr.0,
+            initial_seq_nr.0 + 1,
+            "New packet should use next sequence number"
+        );
     }
 }
