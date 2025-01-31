@@ -942,7 +942,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let delayed_ack_poll_at = match (want_ack, self.timers.ack_delay_timer) {
             (false, _) => PollAt::Ingress,
             (true, AckDelayTimer::Idle) => PollAt::Now,
-            (true, AckDelayTimer::Waiting(t)) => PollAt::Time(t),
+            (true, AckDelayTimer::Waiting(t)) => {
+                trace!(expires_in=?t - Instant::now(), "delayed ACK timer");
+                PollAt::Time(t)
+            }
             (true, AckDelayTimer::Immediate) => PollAt::Now,
         };
 
@@ -1206,6 +1209,7 @@ impl TimerKind {
     fn should_retransmit(&self, timestamp: Instant) -> Option<Duration> {
         match *self {
             TimerKind::Retransmit { expires_at, delay } if timestamp >= expires_at => {
+                trace!("should retransmit, timer expired");
                 Some(timestamp - expires_at + delay)
             }
             TimerKind::FastRetransmit => Some(Duration::from_millis(0)),
@@ -1216,16 +1220,24 @@ impl TimerKind {
     fn poll_at(&self) -> PollAt {
         match *self {
             TimerKind::Idle => PollAt::Ingress,
-            TimerKind::Retransmit { expires_at, .. } => PollAt::Time(expires_at),
-            TimerKind::FastRetransmit => PollAt::Now,
+            TimerKind::Retransmit { expires_at, .. } => {
+                trace!(expires=?Instant::now() - expires_at, "retransmit timer");
+                PollAt::Time(expires_at)
+            }
+            TimerKind::FastRetransmit => {
+                trace!("fast restransmit: now");
+                PollAt::Now
+            }
         }
     }
 
     fn set_for_idle(&mut self) {
+        trace!("resetting timer");
         *self = TimerKind::Idle
     }
 
     fn set_for_retransmit(&mut self, timestamp: Instant, delay: Duration) {
+        trace!(?delay, "setting retransmit timer");
         match *self {
             TimerKind::Idle { .. } | TimerKind::FastRetransmit { .. } => {
                 *self = TimerKind::Retransmit {
@@ -1244,6 +1256,7 @@ impl TimerKind {
     }
 
     fn set_for_fast_retransmit(&mut self) {
+        trace!("setting for fast retransmit");
         *self = TimerKind::FastRetransmit
     }
 
