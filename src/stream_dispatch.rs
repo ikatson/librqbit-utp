@@ -678,6 +678,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             };
             self.process_incoming_message(cx, socket, msg)?;
         }
+        trace!(rxlen = self.rx.len());
         Ok(())
     }
 
@@ -782,7 +783,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 {
                     AssemblerAddRemoveResult::ConsumedSequenceNumbers(count) => {
                         if count > 0 {
-                            trace!(count, "dequeued messages to user rx");
+                            trace!(count, "acked messages, we have them stored in RX buffers");
                         } else {
                             trace!("out of order");
                         }
@@ -1387,7 +1388,7 @@ mod tests {
 
     use futures::FutureExt;
     use tokio::{
-        io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+        io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
         sync::mpsc::{unbounded_channel, UnboundedSender},
     };
     use tracing::trace;
@@ -1436,26 +1437,10 @@ mod tests {
         }
 
         async fn read_all_available(&mut self) -> std::io::Result<Vec<u8>> {
-            std::future::poll_fn(|cx| {
-                let mut buf = vec![0u8; 1024];
-                let mut rb = tokio::io::ReadBuf::new(&mut buf);
-                let mut s = Pin::new(self.stream.as_mut().unwrap());
-
-                loop {
-                    match s.as_mut().poll_read(cx, &mut rb) {
-                        Poll::Ready(Ok(())) => continue,
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => {
-                            return Poll::Ready(Ok({
-                                let filled = rb.filled().len();
-                                buf.truncate(filled);
-                                buf
-                            }))
-                        }
-                    }
-                }
-            })
-            .await
+            let mut buf = vec![0u8; 1024 * 1024];
+            let len = self.stream.as_mut().unwrap().read(&mut buf).await?;
+            buf.truncate(len);
+            Ok(buf)
         }
 
         async fn poll_once(&mut self) -> Poll<anyhow::Result<()>> {
@@ -2855,5 +2840,60 @@ mod tests {
         // Verify data was dropped
         let read = String::from_utf8(t.read_all_available().await.unwrap()).unwrap();
         assert!(!read.contains("dropped"));
+    }
+
+    #[tokio::test]
+    async fn test_data_integrity_manual_packets() {
+        setup_test_logging();
+        let mut t = make_test_vsock(SocketOpts {
+            rx_bufsize: Some(1024 * 1024),
+            ..Default::default()
+        });
+
+        const DATA_SIZE: usize = 1024 * 1024;
+        let mut test_data = Vec::with_capacity(DATA_SIZE);
+
+        for char in std::iter::repeat(b'a'..=b'z').flatten().take(DATA_SIZE) {
+            test_data.push(char);
+        }
+
+        // Send data in chunks
+        const CHUNK_SIZE: usize = 1024;
+        let chunks = test_data.chunks(CHUNK_SIZE);
+        let mut header = UtpHeader {
+            htype: Type::ST_DATA,
+            seq_nr: 0.into(),
+            ack_nr: t.vsock.last_sent_seq_nr,
+            wnd_size: 64 * 1024,
+            ..Default::default()
+        };
+        for chunk in chunks {
+            header.seq_nr += 1;
+            trace!(?header.seq_nr, "sending");
+            t.send_msg(header, std::str::from_utf8(chunk).unwrap());
+        }
+
+        // Process all messages
+        while !t.vsock.rx.is_empty() {
+            t.poll_once_assert_pending().await;
+            // Smth prevents tokio from consuming the whole channel without yielding.
+            tokio::task::yield_now().await;
+        }
+
+        assert!(t.vsock.user_rx.assembler_empty());
+
+        // Read all data
+        let received_data = t.read_all_available().await.unwrap();
+        assert_eq!(t.vsock.user_rx.len(), 0);
+
+        // Verify data integrity
+        assert_eq!(
+            received_data.len(),
+            DATA_SIZE,
+            "Received data size mismatch: got {} bytes, expected {}",
+            received_data.len(),
+            DATA_SIZE
+        );
+        assert_eq!(received_data, test_data, "Data corruption detected");
     }
 }

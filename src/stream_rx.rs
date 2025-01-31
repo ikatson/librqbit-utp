@@ -206,6 +206,11 @@ impl UserRx {
         self.out_of_order_queue.selective_ack()
     }
 
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.locked.lock().len()
+    }
+
     pub fn assembler_empty(&self) -> bool {
         self.out_of_order_queue.is_empty()
     }
