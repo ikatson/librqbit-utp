@@ -30,7 +30,6 @@ mod message;
 pub mod raw;
 mod rtte;
 mod seq_nr;
-mod smoltcp_assembler;
 mod socket;
 mod stream;
 mod stream_dispatch;

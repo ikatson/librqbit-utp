@@ -1,7 +1,5 @@
 use bitvec::{order::Lsb0, BitArr};
 
-use crate::{smoltcp_assembler::Assembler, stream_rx::OutOfOrderQueue};
-
 type SelectiveAckData = BitArr!(for 64, in u8, Lsb0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,11 +24,9 @@ impl SelectiveAck {
 
 #[cfg(test)]
 mod tests {
-    use std::num::{NonZeroU64, NonZeroUsize};
+    use std::num::NonZeroUsize;
 
-    use crate::{
-        message::UtpMessage, raw::selective_ack::SelectiveAck, stream_rx::OutOfOrderQueue,
-    };
+    use crate::{message::UtpMessage, stream_rx::OutOfOrderQueue};
 
     fn asm() -> OutOfOrderQueue {
         OutOfOrderQueue::new(NonZeroUsize::new(65).unwrap())

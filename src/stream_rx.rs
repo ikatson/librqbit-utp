@@ -6,11 +6,11 @@ use std::{
     task::{Poll, Waker},
 };
 
-use crate::{smoltcp_assembler::Assembler, utils::update_optional_waker, Payload};
+use crate::{utils::update_optional_waker, Payload};
 use anyhow::{bail, Context};
-use parking_lot::{Mutex, MutexGuard};
-use tokio::{io::AsyncRead, sync::mpsc};
-use tracing::{debug, trace, warn};
+use parking_lot::Mutex;
+use tokio::io::AsyncRead;
+use tracing::{trace, warn};
 
 use crate::{
     message::UtpMessage, raw::selective_ack::SelectiveAck, stream_dispatch::UserRxMessage,
@@ -23,6 +23,12 @@ pub struct UtpStreamReadHalf {
 impl UtpStreamReadHalf {
     pub fn new(locked: Arc<Mutex<UserRxLocked>>) -> Self {
         Self { locked }
+    }
+}
+
+impl Drop for UtpStreamReadHalf {
+    fn drop(&mut self) {
+        self.locked.lock().close();
     }
 }
 
@@ -96,9 +102,14 @@ impl BeingRead {
 
 pub struct UserRxLocked {
     closed: bool,
+    dead: bool,
     current: Option<BeingRead>,
     queue: VecDeque<UserRxMessage>,
+
+    // Woken by dispatcher
     queue_has_data: Option<Waker>,
+
+    dispatcher: Option<Waker>,
 
     queue_len_bytes: usize,
     capacity_bytes: usize,
@@ -108,11 +119,23 @@ impl UserRxLocked {
     pub fn new(capacity_bytes: usize) -> Self {
         Self {
             closed: false,
+            dead: false,
             current: None,
             queue: Default::default(),
             queue_has_data: None,
             queue_len_bytes: 0,
+            dispatcher: None,
             capacity_bytes,
+        }
+    }
+
+    fn close(&mut self) {
+        if !self.closed {
+            trace!("closing reader");
+            self.closed = true;
+            if let Some(w) = self.dispatcher.take() {
+                w.wake();
+            }
         }
     }
 
@@ -124,12 +147,12 @@ impl UserRxLocked {
         self.capacity_bytes - self.len()
     }
 
+    #[cfg(test)]
     pub fn is_full(&self) -> bool {
         self.window() == 0
     }
 
     // Returns back the message if there's no space.
-    #[must_use]
     pub fn enqueue(&mut self, msg: UserRxMessage) -> Result<(), UserRxMessage> {
         let len = msg.len_bytes();
         if len > self.window() {
@@ -157,6 +180,14 @@ impl UserRx {
         }
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.locked.lock().closed
+    }
+
+    pub fn mark_stream_dead(&self) {
+        self.locked.lock().dead = true;
+    }
+
     pub fn window(&self) -> usize {
         let w = self.locked.lock().window();
         w.saturating_sub(self.out_of_order_queue.stored_bytes())
@@ -168,7 +199,7 @@ impl UserRx {
 
     pub fn enqueue_last_message(&self, msg: UserRxMessage) {
         let mut g = self.locked.lock();
-        todo!()
+        g.queue.push_back(msg);
     }
 
     pub fn selective_ack(&self) -> Option<SelectiveAck> {
@@ -179,6 +210,7 @@ impl UserRx {
         self.out_of_order_queue.is_empty()
     }
 
+    #[cfg(test)]
     pub fn assembler_packets(&self) -> usize {
         self.out_of_order_queue.stored_packets()
     }
@@ -231,19 +263,22 @@ impl OutOfOrderQueue {
         self.len == self.capacity
     }
 
-    pub fn filled_front(&self) -> usize {
+    #[cfg(test)]
+    fn filled_front(&self) -> usize {
         self.filled_front
     }
 
-    pub fn stored_packets(&self) -> usize {
+    #[cfg(test)]
+    fn stored_packets(&self) -> usize {
         self.len
     }
 
-    pub fn stored_bytes(&self) -> usize {
+    fn stored_bytes(&self) -> usize {
         self.len_bytes
     }
 
-    pub fn debug_string(&self, with_data: bool) -> impl std::fmt::Display + '_ {
+    #[cfg(test)]
+    fn debug_string(&self, with_data: bool) -> impl std::fmt::Display + '_ {
         struct D<'a> {
             q: &'a OutOfOrderQueue,
             with_data: bool,
@@ -373,7 +408,6 @@ mod tests {
     use std::{num::NonZeroUsize, sync::Arc};
 
     use parking_lot::Mutex;
-    use tokio::sync::mpsc::channel;
     use tracing::trace;
 
     use crate::{

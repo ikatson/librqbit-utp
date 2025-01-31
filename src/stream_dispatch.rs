@@ -642,6 +642,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .unwrap_or(UserRxMessage::Eof),
         );
 
+        // This will close the reader.
+        self.user_rx.mark_stream_dead();
+
         // This will close the writer.
         self.user_tx.locked.lock().mark_stream_dead();
     }
@@ -944,13 +947,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn user_rx_is_closed(&self) -> bool {
-        todo!()
+        self.user_rx.is_closed()
     }
 }
 
 impl<T, E> Drop for VirtualSocket<T, E> {
     fn drop(&mut self) {
-        self.user_tx.locked.lock().mark_stream_dead();
+        self.user_tx.mark_stream_dead();
+        self.user_rx.mark_stream_dead();
     }
 }
 
@@ -1314,6 +1318,9 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
         this.this_poll.now = this.env.now();
 
         loop {
+            // Flow control: flush as many out of order messages to user RX as possible.
+            bail_if_err!(this.user_rx.flush());
+
             // Read incoming stream.
             bail_if_err!(this.process_all_incoming_messages(cx, socket));
 

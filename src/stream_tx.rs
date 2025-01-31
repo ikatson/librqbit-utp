@@ -106,6 +106,10 @@ impl UserTx {
             }),
         })
     }
+
+    pub fn mark_stream_dead(&self) {
+        self.locked.lock().mark_stream_dead();
+    }
 }
 
 // The TX queue of the virtual socket. uTP doesn't refragemnt, so we store the original headers.
