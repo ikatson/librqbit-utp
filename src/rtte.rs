@@ -60,12 +60,13 @@ impl RttEstimator {
         Duration::from_millis(ms as u64)
     }
 
-    fn sample(&mut self, new_rtt: u32) {
+    fn sample(&mut self, new_rtt: Duration) {
         // "Congestion Avoidance and Control", Van Jacobson, Michael J. Karels, 1988
-        self.rtt = (self.rtt * 7 + new_rtt + 7) / 8;
-        let diff = (self.rtt as i32 - new_rtt as i32).unsigned_abs();
+        self.rtt = (self.rtt * 7 + new_rtt.as_millis() as u32 + 7) / 8;
+        let diff = (self.rtt as i32 - new_rtt.as_millis() as i32).unsigned_abs();
         self.deviation = (self.deviation * 3 + diff + 3) / 4;
 
+        // This was there in smoltcp, however it seems to interfere - retransmission
         self.rto_count = 0;
 
         let rto = self.retransmission_timeout().as_millis();
@@ -95,7 +96,7 @@ impl RttEstimator {
     pub fn on_ack(&mut self, timestamp: Instant, seq: SeqNr) {
         if let Some((sent_timestamp, sent_seq)) = self.timestamp {
             if seq >= sent_seq {
-                self.sample((timestamp - sent_timestamp).as_millis() as u32);
+                self.sample(timestamp - sent_timestamp);
                 self.timestamp = None;
             }
         }

@@ -1,11 +1,12 @@
 use std::time::Instant;
 
-use tracing::trace;
+use tracing::{trace, Level};
 
 use crate::{rtte::RttEstimator, utils::log_before_and_after_if_changed};
 
 use super::CongestionController;
 
+#[derive(Debug)]
 pub struct TracingController<I> {
     inner: I,
 }
@@ -16,7 +17,10 @@ impl<I> TracingController<I> {
     }
 }
 
-impl<I: CongestionController> CongestionController for TracingController<I> {
+impl<I> CongestionController for TracingController<I>
+where
+    I: CongestionController + PartialEq + Copy + 'static,
+{
     fn window(&self) -> usize {
         self.inner.window()
     }
@@ -30,8 +34,9 @@ impl<I: CongestionController> CongestionController for TracingController<I> {
         log_before_and_after_if_changed(
             "on_ack:cwnd",
             self,
-            |s| s.window(),
+            |s| s.inner,
             |s| s.inner.on_ack(now, len, rtt),
+            |_, _| Level::TRACE,
         )
     }
 
@@ -39,8 +44,9 @@ impl<I: CongestionController> CongestionController for TracingController<I> {
         log_before_and_after_if_changed(
             "on_retransmit:cwnd",
             self,
-            |s| s.window(),
+            |s| s.inner,
             |s| s.inner.on_retransmit(now),
+            |_, _| Level::TRACE,
         )
     }
 
@@ -48,8 +54,9 @@ impl<I: CongestionController> CongestionController for TracingController<I> {
         log_before_and_after_if_changed(
             "on_duplicate_ack:cwnd",
             self,
-            |s| s.window(),
+            |s| s.inner,
             |s| s.inner.on_duplicate_ack(now),
+            |_, _| Level::TRACE,
         )
     }
 
@@ -57,8 +64,9 @@ impl<I: CongestionController> CongestionController for TracingController<I> {
         log_before_and_after_if_changed(
             "pre_transmit:cwnd",
             self,
-            |s| s.window(),
+            |s| s.inner,
             |s| s.inner.pre_transmit(now),
+            |_, _| Level::TRACE,
         )
     }
 

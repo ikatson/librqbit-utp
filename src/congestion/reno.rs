@@ -4,7 +4,7 @@ use crate::rtte::RttEstimator;
 
 use super::CongestionController;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct Reno {
     cwnd: usize,
     min_cwnd: usize,

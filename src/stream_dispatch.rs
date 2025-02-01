@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use tokio::{sync::mpsc::UnboundedReceiver, time::Sleep};
-use tracing::{debug, error_span, trace, warn};
+use tracing::{debug, error_span, trace, warn, Level};
 
 use crate::{
     congestion::CongestionController,
@@ -407,7 +407,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn maybe_prepare_for_retransmission(&mut self) {
-        if self.timers.retransmit.should_retransmit(self.this_poll.now) {
+        if let Some(expired_delay) = self.timers.retransmit.should_retransmit(self.this_poll.now) {
             let rewind_to = self
                 .fragmented_tx
                 .first_seq_nr()
@@ -423,7 +423,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             };
 
             // If a retransmit timer expired, we should resend data starting at the last ACK.
-            trace!("retransmitting");
+            trace!(?expired_delay, ?rewind_to, ?self.last_sent_seq_nr, "retransmitting");
 
             // Rewind "last sequence number sent", as if we never
             // had sent them. This will cause all data in the queue
@@ -437,7 +437,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.timers.retransmit.set_for_idle();
 
             // Inform RTTE, so that it can avoid bogus measurements.
-            self.rtte.on_retransmit();
+            log_before_and_after_if_changed(
+                "rtte:on_retransmit",
+                &mut self.rtte,
+                |r| r.retransmission_timeout(),
+                |r| r.on_retransmit(),
+                |_, _| Level::DEBUG,
+            );
 
             // Inform the congestion controller that we're retransmitting.
             self.congestion_controller.on_retransmit(self.this_poll.now);
@@ -561,6 +567,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     &mut self.state,
                     |s| *s,
                     |s| s.transition_to_fin_sent(self.next_seq_nr),
+                    |_, _| Level::DEBUG,
                 );
                 if changed {
                     trace!("writer closed");
@@ -706,6 +713,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     msg.header.ack_nr,
                 )
             },
+            |_, _| Level::DEBUG,
         );
 
         // Remove everything from tx_buffer that was acked by this message.
@@ -734,7 +742,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.congestion_controller
             .set_remote_window(msg.header.wnd_size as usize);
 
-        self.rtte.on_ack(self.this_poll.now, msg.header.ack_nr);
+        log_before_and_after_if_changed(
+            "rtte:on_ack",
+            self,
+            |s| s.rtte.retransmission_timeout(),
+            |s| s.rtte.on_ack(s.this_poll.now, msg.header.ack_nr),
+            |_, _| Level::TRACE,
+        );
         if removed_bytes > 0 {
             self.congestion_controller
                 .on_ack(self.this_poll.now, removed_bytes, &self.rtte);
@@ -1194,14 +1208,14 @@ impl RetransmitTimer {
         RetransmitTimer::Idle
     }
 
-    fn should_retransmit(&self, timestamp: Instant) -> bool {
+    fn should_retransmit(&self, timestamp: Instant) -> Option<Duration> {
         match *self {
-            RetransmitTimer::Retransmit { expires_at, .. } if timestamp >= expires_at => {
+            RetransmitTimer::Retransmit { expires_at, delay } if timestamp >= expires_at => {
                 trace!("should retransmit, timer expired");
-                true
+                Some(delay)
             }
-            RetransmitTimer::FastRetransmit => true,
-            _ => false,
+            RetransmitTimer::FastRetransmit => Some(Duration::from_secs(0)),
+            _ => None,
         }
     }
 

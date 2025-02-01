@@ -7,7 +7,7 @@ use std::time::Instant;
 use crate::rtte::RttEstimator;
 
 #[allow(unused_variables)]
-pub trait CongestionController: Send + Sync {
+pub trait CongestionController: Send + Sync + core::fmt::Debug {
     /// Returns the number of bytes that can be sent.
     fn window(&self) -> usize;
 

@@ -9,7 +9,7 @@ use super::CongestionController;
 const BETA_CUBIC: f64 = 0.7;
 const C: f64 = 0.4;
 
-#[derive(Debug)]
+#[derive(Clone, Copy)]
 pub struct Cubic {
     cwnd: usize,     // Congestion window
     min_cwnd: usize, // The minimum size of congestion window
@@ -18,6 +18,22 @@ pub struct Cubic {
     rwnd: usize, // Remote window
     last_update: Instant,
     ssthresh: usize,
+}
+
+impl core::fmt::Debug for Cubic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cwnd={},w_max={},sshthresh:{}",
+            self.cwnd, self.w_max, self.ssthresh
+        )
+    }
+}
+
+impl PartialEq for Cubic {
+    fn eq(&self, other: &Self) -> bool {
+        self.cwnd == other.cwnd && self.ssthresh == other.ssthresh && self.w_max == other.w_max
+    }
 }
 
 impl Cubic {
