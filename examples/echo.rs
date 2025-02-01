@@ -32,7 +32,7 @@ async fn flatten<JoinError>(
 async fn echo(stream: UtpStreamUdp) -> anyhow::Result<()> {
     let (reader, writer) = stream.split();
 
-    let mut reader = tokio::io::BufReader::new(reader);
+    let mut reader = reader;
 
     let reader = async move {
         for expected in 0..=MAX_COUNTER {
