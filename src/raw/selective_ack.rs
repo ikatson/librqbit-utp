@@ -20,13 +20,23 @@ impl SelectiveAck {
     pub fn as_bytes(&self) -> &[u8] {
         self.data.as_raw_slice()
     }
+
+    pub fn deserialize(bytes: &[u8]) -> Self {
+        // If it's longer than 8 bytes, it may truncate the bytes, which is fine.
+        let len = bytes.len().min(std::mem::size_of::<SelectiveAckData>());
+        let mut data = SelectiveAckData::default();
+        data.as_raw_mut_slice()[..len].copy_from_slice(&bytes[..len]);
+        Self { data }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
 
-    use crate::{message::UtpMessage, stream_rx::OutOfOrderQueue};
+    use crate::{
+        message::UtpMessage, raw::selective_ack::SelectiveAck, stream_rx::OutOfOrderQueue,
+    };
 
     fn asm() -> OutOfOrderQueue {
         OutOfOrderQueue::new(NonZeroUsize::new(65).unwrap())
@@ -49,9 +59,13 @@ mod tests {
         asm.add_remove(msg(), 1).unwrap();
         asm.add_remove(msg(), 2).unwrap();
         asm.add_remove(msg(), 64).unwrap();
+
+        let sack = asm.selective_ack().unwrap();
         assert_eq!(
-            asm.selective_ack().unwrap().data.as_raw_slice(),
+            sack.data.as_raw_slice(),
             [0b1000_0011, 0, 0, 0, 0, 0, 0, 0b1000_0000]
         );
+
+        assert_eq!(sack, SelectiveAck::deserialize(sack.as_bytes()));
     }
 }

@@ -29,7 +29,7 @@ use tokio::sync::{
     mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
-use tracing::{debug, error_span, trace, warn};
+use tracing::{debug, error_span, trace, trace_span, warn};
 
 type ConnectionId = SeqNr;
 
@@ -657,6 +657,7 @@ fn start_recvfrom_task<T: Transport>(
                 .recv_from(&mut buf)
                 .await
                 .context("error reading from transport")?;
+
             if let Some(msg) = UtpMessage::deserialize(&buf[..len]) {
                 tx.send((addr, msg)).await.context("channel dead")?;
             }

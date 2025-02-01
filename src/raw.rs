@@ -133,7 +133,8 @@ impl UtpHeader {
         Ok(sz + payload_sz)
     }
 
-    pub fn deserialize(mut buffer: &[u8]) -> Option<(Self, usize)> {
+    pub fn deserialize(orig_buffer: &[u8]) -> Option<(Self, usize)> {
+        let mut buffer = orig_buffer;
         if buffer.len() < UTP_HEADER_SIZE {
             return None;
         }
@@ -168,10 +169,8 @@ impl UtpHeader {
             let ext_data = buffer.get(2..2 + ext_len)?;
             match (ext, ext_len) {
                 (EXT_SELECTIVE_ACK, _) => {
-                    debug!(
-                        ext,
-                        next_ext, ext_len, "selective ACK deserializing not supported yet"
-                    );
+                    header.extensions.selective_ack =
+                        Some(selective_ack::SelectiveAck::deserialize(ext_data));
                 }
                 (EXT_CLOSE_REASON, 4) => {
                     header.extensions.close_reason =
