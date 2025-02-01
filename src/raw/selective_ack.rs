@@ -17,6 +17,21 @@ impl SelectiveAck {
         Some(Self { data })
     }
 
+    #[cfg(test)]
+    pub fn new_test(acked: impl IntoIterator<Item = usize>) -> Option<Self> {
+        let mut data = SelectiveAckData::default();
+        let mut count = 0;
+        for idx in acked {
+            data.get_mut(idx).unwrap().set(true);
+            count += 1;
+        }
+        if count > 0 {
+            Some(Self { data })
+        } else {
+            None
+        }
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         self.data.as_raw_slice()
     }
@@ -32,6 +47,10 @@ impl SelectiveAck {
         let mut data = SelectiveAckData::default();
         data.as_raw_mut_slice()[..len].copy_from_slice(&bytes[..len]);
         Self { data }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {
+        self.data.iter().map(|b| *b)
     }
 }
 

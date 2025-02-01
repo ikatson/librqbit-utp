@@ -717,7 +717,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         );
 
         // Remove everything from tx_buffer that was acked by this message.
-        let (removed_headers, removed_bytes) = self.tx.remove_up_to_ack(msg.header.ack_nr);
+        let (removed_headers, removed_bytes) = self.tx.remove_up_to_ack(&msg.header);
         if removed_headers > 0 {
             let mut g = self.user_tx.locked.lock();
             let was_full = g.is_full();

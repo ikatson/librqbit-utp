@@ -120,6 +120,8 @@ impl UserTx {
 
 // The TX queue of the virtual socket. uTP doesn't refragemnt, so we store the original headers.
 // The payloads are stored in the user TX behind a shared lock. Users write there with poll_write().
+//
+// TODO: this is redundant, we can store less info. Just the first seq_nr, that's it.
 pub struct FragmentedTx {
     headers: RingBufferHeader,
     len_bytes: usize,
@@ -164,6 +166,14 @@ impl FragmentedTx {
         self.headers.len()
     }
 
+    #[cfg(test)]
+    pub fn count_delivered_test(&self) -> usize {
+        self.headers
+            .iter()
+            .map(|h| if h.is_delivered { 1 } else { 0 })
+            .sum()
+    }
+
     pub fn total_len_bytes(&self) -> usize {
         self.len_bytes
     }
@@ -198,12 +208,12 @@ impl FragmentedTx {
     }
 
     // Returns number of removed headers, and their comibined payload size.
-    pub fn remove_up_to_ack(&mut self, ack_nr: SeqNr) -> (usize, usize) {
+    pub fn remove_up_to_ack(&mut self, ack_header: &UtpHeader) -> (usize, usize) {
         let mut removed = 0;
         let mut payload_size = 0;
 
         while let Some(fragment) = self.headers.front() {
-            if ack_nr < fragment.header.seq_nr {
+            if ack_header.ack_nr < fragment.header.seq_nr {
                 break;
             }
             let fragment = self.headers.pop_front().unwrap();
@@ -211,6 +221,18 @@ impl FragmentedTx {
             payload_size += fragment.payload_size;
             self.len_bytes -= fragment.payload_size;
         }
+
+        // If TX start matches with header ACK and it's a selective ACK, mark all fragments delivered.
+        match (self.headers.front(), ack_header.extensions.selective_ack) {
+            (Some(fragment), Some(sack)) if fragment.header.seq_nr > ack_header.ack_nr => {
+                let offset = (fragment.header.seq_nr - ack_header.ack_nr) as usize;
+
+                for (fragment, acked) in self.headers.iter_mut().skip(offset).zip(sack.iter()) {
+                    fragment.is_delivered |= acked;
+                }
+            }
+            _ => {}
+        };
 
         (removed, payload_size)
     }
@@ -309,5 +331,123 @@ impl AsyncWrite for UtpStreamWriteHalf {
         }
         self.get_mut().close();
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        raw::{selective_ack::SelectiveAck, UtpHeader},
+        seq_nr::SeqNr,
+    };
+
+    use super::FragmentedTx;
+
+    fn make_fragmented_tx(start_seq_nr: u16, count: u16) -> FragmentedTx {
+        let mut ftx = FragmentedTx::new();
+
+        let start: SeqNr = start_seq_nr.into();
+        let end = start + count;
+        for seq_nr in start.0..end.0 {
+            assert!(ftx.enqueue(
+                UtpHeader {
+                    htype: crate::raw::Type::ST_DATA,
+                    seq_nr: seq_nr.into(),
+                    ..Default::default()
+                },
+                1,
+            ));
+        }
+
+        ftx
+    }
+
+    fn make_sack_header(ack_nr: u16, acked: impl IntoIterator<Item = usize>) -> UtpHeader {
+        UtpHeader {
+            ack_nr: ack_nr.into(),
+            extensions: crate::raw::Extensions {
+                selective_ack: SelectiveAck::new_test(acked),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_selective_ack_marking() {
+        // Test Case 1: Basic setup with 4 packets starting from sequence number 3
+        let mut ftx = make_fragmented_tx(3, 4);
+        assert_eq!(ftx.total_len_bytes(), 4);
+        assert_eq!(ftx.total_len_packets(), 4);
+        assert_eq!(ftx.first_seq_nr().unwrap(), 3.into());
+        assert_eq!(ftx.count_delivered_test(), 0);
+
+        // Test Case 1.1: ACK with sequence number 4, should remove first two packets
+        let mut ftx = make_fragmented_tx(3, 4);
+        ftx.remove_up_to_ack(&make_sack_header(4, []));
+        assert_eq!(ftx.total_len_bytes(), 2);
+        assert_eq!(ftx.total_len_packets(), 2);
+        assert_eq!(ftx.first_seq_nr().unwrap(), 5.into());
+        assert_eq!(ftx.count_delivered_test(), 0);
+
+        // Test Case 1.2: ACK all packets, queue should be empty
+        let mut ftx = make_fragmented_tx(3, 4);
+        ftx.remove_up_to_ack(&make_sack_header(6, []));
+        assert_eq!(ftx.total_len_bytes(), 0);
+        assert_eq!(ftx.total_len_packets(), 0);
+        assert!(ftx.first_seq_nr().is_none());
+        assert_eq!(ftx.count_delivered_test(), 0);
+
+        // Test Case 2: ACK with sequence number 2 (below our start sequence)
+        // Should not remove any packets or mark any as delivered
+        let mut ftx = make_fragmented_tx(3, 4);
+        ftx.remove_up_to_ack(&make_sack_header(2, []));
+        assert_eq!(ftx.total_len_bytes(), 4);
+        assert_eq!(ftx.total_len_packets(), 4);
+        assert_eq!(ftx.first_seq_nr().unwrap(), 3.into());
+        assert_eq!(ftx.count_delivered_test(), 0);
+
+        // Test Case 3: ACK with sequence number 3 (matches our start sequence)
+        // Should remove the first packet, leaving 3 packets
+        let mut ftx = make_fragmented_tx(3, 4);
+        ftx.remove_up_to_ack(&make_sack_header(3, []));
+        assert_eq!(ftx.total_len_bytes(), 3);
+        assert_eq!(ftx.total_len_packets(), 3);
+        assert_eq!(ftx.first_seq_nr().unwrap(), 4.into());
+        assert_eq!(ftx.count_delivered_test(), 0);
+
+        // Test Case 4: ACK with sequence number 2 and selective ACK for next packet
+        // Should mark the second packet as delivered but not remove any
+        let mut ftx = make_fragmented_tx(3, 4);
+        ftx.remove_up_to_ack(&make_sack_header(2, [0]));
+        assert_eq!(ftx.total_len_bytes(), 4);
+        assert_eq!(ftx.total_len_packets(), 4);
+        assert_eq!(ftx.first_seq_nr().unwrap(), 3.into());
+        assert_eq!(ftx.count_delivered_test(), 1);
+        assert!(ftx.headers.get(1).unwrap().is_delivered);
+
+        // Test Case 5: ACK with sequence number 2 and selective ACK for second and fourth packets
+        // Should mark both packets as delivered but not remove any
+        let mut ftx = make_fragmented_tx(3, 4);
+        ftx.remove_up_to_ack(&make_sack_header(2, [0, 2]));
+        assert_eq!(ftx.total_len_bytes(), 4);
+        assert_eq!(ftx.total_len_packets(), 4);
+        assert_eq!(ftx.first_seq_nr().unwrap(), 3.into());
+        assert_eq!(ftx.count_delivered_test(), 2);
+        assert!(ftx.headers.get(1).unwrap().is_delivered);
+        assert!(ftx.headers.get(3).unwrap().is_delivered);
+
+        // Test Case 6: Selective ACK with gaps
+        let mut ftx = make_fragmented_tx(3, 6); // Create 6 packets
+        ftx.remove_up_to_ack(&make_sack_header(2, [0, 2, 4])); // ACK 2nd, 4th, and 6th packets
+        assert_eq!(ftx.total_len_bytes(), 6);
+        assert_eq!(ftx.total_len_packets(), 6);
+        assert_eq!(ftx.count_delivered_test(), 3);
+        assert!(ftx.headers.get(1).unwrap().is_delivered);
+        assert!(ftx.headers.get(3).unwrap().is_delivered);
+        assert!(ftx.headers.get(5).unwrap().is_delivered);
+        assert!(!ftx.headers.front().unwrap().is_delivered);
+        assert!(!ftx.headers.get(2).unwrap().is_delivered);
+        assert!(!ftx.headers.get(4).unwrap().is_delivered);
     }
 }
