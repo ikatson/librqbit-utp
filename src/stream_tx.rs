@@ -21,7 +21,7 @@ pub struct UserTxLocked {
     buffer: VecDeque<u8>,
 
     // This is woken up by dispatcher when the buffer has space if it didn't have it previously.
-    pub buffer_no_longer_full: Option<Waker>,
+    pub buffer_has_space: Option<Waker>,
     // This is woken up by dispatcher when all outstanding packets where ACKed.
     pub buffer_flushed: Option<Waker>,
 
@@ -66,7 +66,7 @@ impl UserTxLocked {
     // This will send FIN (if not yet).
     pub fn mark_stream_dead(&mut self) {
         self.dead = true;
-        if let Some(waker) = self.buffer_no_longer_full.take() {
+        if let Some(waker) = self.buffer_has_space.take() {
             waker.wake();
         }
     }
@@ -92,7 +92,7 @@ impl UserTx {
             locked: Mutex::new(UserTxLocked {
                 buffer: VecDeque::new(),
                 capacity: capacity.get(),
-                buffer_no_longer_full: None,
+                buffer_has_space: None,
                 buffer_has_data: None,
                 buffer_flushed: None,
                 dead: false,
@@ -162,7 +162,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
         this.written_without_yield += count as u64;
         if count == 0 {
             assert!(g.is_full());
-            update_optional_waker(&mut g.buffer_no_longer_full, cx);
+            update_optional_waker(&mut g.buffer_has_space, cx);
             this.written_without_yield = 0;
             return Poll::Pending;
         }

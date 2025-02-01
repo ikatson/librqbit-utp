@@ -712,12 +712,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let (removed_headers, removed_bytes) = self.fragmented_tx.remove_up_to_ack(&msg.header);
         if removed_headers > 0 {
             let mut g = self.user_tx.locked.lock();
-            let was_full = g.is_full();
             g.truncate_front(removed_bytes);
-            if was_full {
-                if let Some(w) = g.buffer_no_longer_full.take() {
-                    w.wake();
-                }
+            if let Some(w) = g.buffer_has_space.take() {
+                w.wake();
             }
 
             if g.buffer().is_empty() {
