@@ -207,6 +207,12 @@ impl FragmentedTx {
         format!("headers: {}/{}", self.headers.len(), self.capacity)
     }
 
+    fn pop_front(&mut self) -> Option<Fragmented> {
+        let frag = self.headers.pop_front()?;
+        self.len_bytes -= frag.payload_size;
+        Some(frag)
+    }
+
     // Returns number of removed headers, and their comibined payload size.
     pub fn remove_up_to_ack(&mut self, ack_header: &UtpHeader) -> (usize, usize) {
         let mut removed = 0;
@@ -216,10 +222,9 @@ impl FragmentedTx {
             if ack_header.ack_nr < fragment.header.seq_nr {
                 break;
             }
-            let fragment = self.headers.pop_front().unwrap();
             removed += 1;
             payload_size += fragment.payload_size;
-            self.len_bytes -= fragment.payload_size;
+            self.pop_front().unwrap();
         }
 
         // If TX start matches with header ACK and it's a selective ACK, mark all fragments delivered.
@@ -229,6 +234,16 @@ impl FragmentedTx {
 
                 for (fragment, acked) in self.headers.iter_mut().skip(offset).zip(sack.iter()) {
                     fragment.is_delivered |= acked;
+                }
+
+                // Cleanup the beginning of the queue if an older ACK ends up marking it delivered.
+                while let Some(fragment) = self.headers.front() {
+                    if !fragment.is_delivered {
+                        break;
+                    }
+                    removed += 1;
+                    payload_size += fragment.payload_size;
+                    self.pop_front().unwrap();
                 }
             }
             _ => {}
@@ -374,9 +389,9 @@ mod tests {
     }
 
     #[test]
-    fn test_selective_ack_marking() {
+    fn test_remove_up_to_ack() {
         // Test Case 1: Basic setup with 4 packets starting from sequence number 3
-        let mut ftx = make_fragmented_tx(3, 4);
+        let ftx = make_fragmented_tx(3, 4);
         assert_eq!(ftx.total_len_bytes(), 4);
         assert_eq!(ftx.total_len_packets(), 4);
         assert_eq!(ftx.first_seq_nr().unwrap(), 3.into());
@@ -426,6 +441,15 @@ mod tests {
         assert_eq!(ftx.count_delivered_test(), 1);
         assert!(ftx.headers.get(1).unwrap().is_delivered);
 
+        // Test Case 4.1 (edge case): an older selective ACK should mark packets delivered.
+        let mut ftx = make_fragmented_tx(3, 4);
+        ftx.remove_up_to_ack(&make_sack_header(1, [1])); // means 2 and 3 are not delivered, but 4 is
+        assert_eq!(ftx.total_len_bytes(), 4);
+        assert_eq!(ftx.total_len_packets(), 4);
+        assert_eq!(ftx.first_seq_nr().unwrap(), 3.into());
+        assert_eq!(ftx.count_delivered_test(), 1);
+        assert!(ftx.headers.get(1).unwrap().is_delivered);
+
         // Test Case 5: ACK with sequence number 2 and selective ACK for second and fourth packets
         // Should mark both packets as delivered but not remove any
         let mut ftx = make_fragmented_tx(3, 4);
@@ -449,5 +473,13 @@ mod tests {
         assert!(!ftx.headers.front().unwrap().is_delivered);
         assert!(!ftx.headers.get(2).unwrap().is_delivered);
         assert!(!ftx.headers.get(4).unwrap().is_delivered);
+
+        // Test Case 7: selective ACK should be able to clean up the queue
+        let mut ftx = make_fragmented_tx(3, 4);
+        ftx.remove_up_to_ack(&make_sack_header(1, [0, 1, 2])); // means 3,4,5 were received
+        assert_eq!(ftx.total_len_bytes(), 1);
+        assert_eq!(ftx.total_len_packets(), 1);
+        assert_eq!(ftx.count_delivered_test(), 0);
+        assert_eq!(ftx.first_seq_nr().unwrap(), 6.into());
     }
 }
