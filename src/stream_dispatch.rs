@@ -1404,7 +1404,7 @@ mod tests {
     use crate::{
         constants::{IPV4_HEADER, MIN_UDP_HEADER, UTP_HEADER_SIZE},
         message::UtpMessage,
-        raw::{Type, UtpHeader},
+        raw::{selective_ack::SelectiveAck, Type, UtpHeader},
         stream_dispatch::VirtualSocketState,
         test_util::{
             env::MockUtpEnvironment, setup_test_logging, transport::RememberingTransport, ADDR_1,
@@ -3008,6 +3008,101 @@ mod tests {
             new_sent[0].header.seq_nr.0,
             initial_seq_nr.0 + 1,
             "New packet should use next sequence number"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_selective_ack_retransmission() {
+        setup_test_logging();
+        let mut t = make_test_vsock(Default::default());
+        t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(5).unwrap();
+
+        const FORCED_RETRANSMISSION_TIME: Duration = Duration::from_secs(1);
+        t.vsock.rtte.force_timeout(FORCED_RETRANSMISSION_TIME);
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Write enough data to generate multiple packets
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(b"helloworld")
+            .await
+            .unwrap();
+        t.poll_once_assert_pending().await;
+
+        // Should have sent two packets
+        let initial_sent = t.take_sent();
+        assert_eq!(initial_sent.len(), 2, "Should have sent 2 packets");
+        assert_eq!(initial_sent[0].payload(), b"hello");
+        assert_eq!(initial_sent[1].payload(), b"world");
+        let first_seq_nr = initial_sent[0].header.seq_nr;
+
+        // Send selective ACK indicating second packet was received but first wasn't
+        let header = UtpHeader {
+            htype: Type::ST_STATE,
+            seq_nr: 0.into(),
+            ack_nr: first_seq_nr - 1, // ACK previous packet
+            wnd_size: 1024,
+            extensions: crate::raw::Extensions {
+                selective_ack: SelectiveAck::new_test([0]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        t.send_msg(header, "");
+
+        // After receiving selective ACK and waiting for retransmit
+        t.env.increment_now(FORCED_RETRANSMISSION_TIME);
+        t.poll_once_assert_pending().await;
+
+        // Should only retransmit the first packet
+        let retransmitted = t.take_sent();
+        assert_eq!(
+            retransmitted.len(),
+            1,
+            "Should only retransmit first packet"
+        );
+        assert_eq!(
+            retransmitted[0].header.seq_nr, first_seq_nr,
+            "Should retransmit first packet"
+        );
+        assert_eq!(
+            retransmitted[0].payload(),
+            b"hello",
+            "Should retransmit correct data"
+        );
+
+        // Send normal ACK for first packet
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: first_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+
+        // No more retransmissions should occur
+        t.env.increment_now(Duration::from_secs(1));
+        t.poll_once_assert_pending().await;
+        assert_eq!(
+            t.take_sent().len(),
+            0,
+            "Should not retransmit after both packets acknowledged"
         );
     }
 }
