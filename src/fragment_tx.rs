@@ -1,3 +1,9 @@
+// uTP doesn't refragment, so we pre-fragment TX once.
+// We also store the delivered state of the fragments here.
+//
+// When an ACK arrives this tells us how much (if any) bytes we can
+// remove from the actual TX (bytes) that are stored in struct UserTx.
+
 use std::collections::VecDeque;
 
 use tracing::debug;
@@ -9,7 +15,6 @@ struct PreparedFragment {
     is_delivered: bool,
 }
 
-// uTP doesn't refragment, so we pre-fragment TX once.
 pub struct FragmentedTx {
     fragments: VecDeque<PreparedFragment>,
     len_bytes: usize,
