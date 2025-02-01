@@ -335,9 +335,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         // Send only the stuff we haven't sent yet, up to sender's window.
         for item in self.tx.iter() {
+            // Re-delivery - don't send until retransmission happens (it will rewind elf.last_sent_seq_nr).
             let already_sent = item.header().seq_nr - self.last_sent_seq_nr <= 0;
             if already_sent {
                 recv_wnd = recv_wnd.saturating_sub(item.payload_size());
+                continue;
+            }
+
+            // Selective ACK already marked this, ignore.
+            if item.is_delivered() {
                 continue;
             }
 
