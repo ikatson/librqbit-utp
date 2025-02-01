@@ -22,7 +22,12 @@ impl SelectiveAck {
     }
 
     pub fn deserialize(bytes: &[u8]) -> Self {
-        // If it's longer than 8 bytes, it may truncate the bytes, which is fine.
+        // The spec says the len must be a multiple of 4, but there's a ton of messages
+        // in the wild that are 1 bytes long (probably coming from libutp). So we can
+        // thus deserialize any payload.
+        //
+        // If it's longer than 8 bytes (unlikely), it will truncate the end, which is fine, as
+        // we'll just resend that data if anything.
         let len = bytes.len().min(std::mem::size_of::<SelectiveAckData>());
         let mut data = SelectiveAckData::default();
         data.as_raw_mut_slice()[..len].copy_from_slice(&bytes[..len]);
