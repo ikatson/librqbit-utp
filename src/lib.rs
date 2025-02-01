@@ -18,12 +18,6 @@
 //
 // TODO: LEDBAT congestion control
 //
-// TODO: extensions
-// - selective ACKs on sending side
-//
-// TODO: memory management. Think about a data structure that will let the UDP incoming packet
-// get written straight out to use Rx buffer.//
-//
 // TODO: built-in connection timeouts?
 
 mod congestion;
