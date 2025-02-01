@@ -15,7 +15,13 @@ use crate::{
     utils::{fill_buffer_from_rb, update_optional_waker},
 };
 
-type RingBufferHeader = VecDeque<(UtpHeader, usize)>;
+struct Fragmented {
+    header: UtpHeader,
+    payload_size: usize,
+    is_delivered: bool,
+}
+
+type RingBufferHeader = VecDeque<Fragmented>;
 
 pub struct UserTxLocked {
     // Set when stream dies abruptly for writer to know about it.
@@ -121,17 +127,19 @@ pub struct FragmentedTx {
 }
 
 pub struct TxIterItem<'a> {
-    pub header: &'a UtpHeader,
-    payload_size: usize,
+    fragment: &'a Fragmented,
     payload_offset: usize,
 }
 
 impl TxIterItem<'_> {
     pub fn header(&self) -> &UtpHeader {
-        self.header
+        &self.fragment.header
+    }
+    pub fn is_delivered(&self) -> bool {
+        self.fragment.is_delivered
     }
     pub fn payload_size(&self) -> usize {
-        self.payload_size
+        self.fragment.payload_size
     }
     pub fn payload_offset(&self) -> usize {
         self.payload_offset
@@ -148,7 +156,7 @@ impl FragmentedTx {
     }
 
     pub fn first_seq_nr(&self) -> Option<SeqNr> {
-        Some(self.headers.front()?.0.seq_nr)
+        Some(self.headers.front()?.header.seq_nr)
     }
 
     #[cfg(test)]
@@ -170,12 +178,16 @@ impl FragmentedTx {
     }
 
     #[must_use]
-    pub fn enqueue(&mut self, h: UtpHeader, payload_size: usize) -> bool {
+    pub fn enqueue(&mut self, header: UtpHeader, payload_len: usize) -> bool {
         if self.headers.len() == self.capacity {
             return false;
         }
-        self.headers.push_back((h, payload_size));
-        self.len_bytes += payload_size;
+        self.headers.push_back(Fragmented {
+            header,
+            payload_size: payload_len,
+            is_delivered: false,
+        });
+        self.len_bytes += payload_len;
         true
     }
 
@@ -190,15 +202,14 @@ impl FragmentedTx {
         let mut removed = 0;
         let mut payload_size = 0;
 
-        while let Some((header, ps)) = self.headers.pop_front() {
-            if ack_nr < header.seq_nr {
-                self.headers.push_front((header, ps));
+        while let Some(fragment) = self.headers.front() {
+            if ack_nr < fragment.header.seq_nr {
                 break;
             }
-
+            let fragment = self.headers.pop_front().unwrap();
             removed += 1;
-            payload_size += ps;
-            self.len_bytes -= ps;
+            payload_size += fragment.payload_size;
+            self.len_bytes -= fragment.payload_size;
         }
 
         (removed, payload_size)
@@ -206,17 +217,14 @@ impl FragmentedTx {
 
     // Iterate stored data - headers and their payloads (as a function to copy payload to some other buffer).
     pub fn iter(&self) -> impl Iterator<Item = TxIterItem<'_>> {
-        self.headers
-            .iter()
-            .scan(0, |offset, (header, payload_size)| {
-                let current_offset = *offset;
-                *offset += payload_size;
-                Some(TxIterItem {
-                    header,
-                    payload_size: *payload_size,
-                    payload_offset: current_offset,
-                })
+        self.headers.iter().scan(0, |offset, fragment| {
+            let current_offset = *offset;
+            *offset += fragment.payload_size;
+            Some(TxIterItem {
+                fragment,
+                payload_offset: current_offset,
             })
+        })
     }
 }
 
