@@ -108,11 +108,15 @@ impl UserTx {
 
 pub struct UtpStreamWriteHalf {
     user_tx: Arc<UserTx>,
+    written_without_yield: u64,
 }
 
 impl UtpStreamWriteHalf {
     pub fn new(user_tx: Arc<UserTx>) -> Self {
-        Self { user_tx }
+        Self {
+            user_tx,
+            written_without_yield: 0,
+        }
     }
 
     fn close(&mut self) {
@@ -128,11 +132,21 @@ impl Drop for UtpStreamWriteHalf {
 
 impl AsyncWrite for UtpStreamWriteHalf {
     fn poll_write(
-        self: std::pin::Pin<&mut Self>,
+        mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> Poll<Result<usize, std::io::Error>> {
-        let mut g = self.user_tx.locked.lock();
+        let this = &mut *self;
+
+        // Yield sometimes to cooperate. 8192 is just an arbitrary number.
+        const YIELD_EVERY: u64 = 8192;
+        if this.written_without_yield > YIELD_EVERY {
+            this.written_without_yield = 0;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+
+        let mut g = this.user_tx.locked.lock();
 
         if g.dead {
             return Poll::Ready(Err(std::io::Error::other("socket died")));
@@ -145,9 +159,11 @@ impl AsyncWrite for UtpStreamWriteHalf {
         }
 
         let count = g.enqueue_slice(buf);
+        this.written_without_yield += count as u64;
         if count == 0 {
             assert!(g.is_full());
             update_optional_waker(&mut g.buffer_no_longer_full, cx);
+            this.written_without_yield = 0;
             return Poll::Pending;
         }
 
