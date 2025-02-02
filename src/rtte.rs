@@ -1,6 +1,4 @@
-use std::time::{Duration, Instant};
-
-use crate::seq_nr::SeqNr;
+use std::time::Duration;
 
 // rfc6298: 2.1. Until a round-trip time (RTT) measurement has been made for a
 // segment sent between the sender and receiver, the sender SHOULD
@@ -69,7 +67,7 @@ impl RttEstimator {
         }
     }
 
-    fn sample(&mut self, new_rtt: Duration) {
+    pub fn sample(&mut self, new_rtt: Duration) {
         match &mut self.state {
             RttState::Initial { .. } => {
                 let srtt = new_rtt;
@@ -89,14 +87,6 @@ impl RttEstimator {
                 *rto = clamp(*srtt + K * *rttvar);
             }
         }
-    }
-
-    pub fn on_send(&mut self, _timestamp: Instant, _seq: SeqNr) {
-        // Nothing, we compute that in segements
-    }
-
-    pub fn on_ack(&mut self, rtt: Duration) {
-        self.sample(rtt);
     }
 
     pub fn on_retransmit(&mut self) {

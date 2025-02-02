@@ -460,7 +460,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.last_sent_seq_nr = header.seq_nr;
         self.last_sent_ack_nr = header.ack_nr;
         self.timers.reset_delayed_ack_timer();
-        self.rtte.on_send(self.this_poll.now, header.seq_nr);
     }
 
     fn send_control_packet(
@@ -757,7 +756,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     "rtte:on_ack",
                     self,
                     |s| s.rtte.retransmission_timeout(),
-                    |s| s.rtte.on_ack(rtt),
+                    |s| s.rtte.sample(rtt),
                     |_, _| Level::TRACE,
                 );
             }
@@ -1169,8 +1168,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             rtte: {
                 let mut rtt = RttEstimator::default();
                 if let (Some(sent), Some(recv)) = (syn_sent_ts, ack_received_ts) {
-                    rtt.on_send(sent, next_seq_nr);
-                    rtt.on_ack(recv - sent);
+                    rtt.sample(recv - sent);
                 }
                 rtt
             },
