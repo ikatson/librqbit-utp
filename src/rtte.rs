@@ -23,7 +23,6 @@ pub struct RttEstimator {
     // Using u32 instead of Duration to save space (Duration is i64)
     rtt: u32,
     deviation: u32,
-    timestamp: Option<(Instant, SeqNr)>,
     rto_count: u8,
 
     #[cfg(test)]
@@ -35,7 +34,6 @@ impl Default for RttEstimator {
         Self {
             rtt: RTTE_INITIAL_RTT,
             deviation: RTTE_INITIAL_DEV,
-            timestamp: None,
             rto_count: 0,
 
             #[cfg(test)]
@@ -89,10 +87,6 @@ impl RttEstimator {
     }
 
     pub fn on_retransmit(&mut self) {
-        if self.timestamp.is_some() {
-            trace!("rtte: abort sampling due to retransmit");
-        }
-        self.timestamp = None;
         self.rto_count = self.rto_count.saturating_add(1);
         if self.rto_count >= 3 {
             // This happens in 2 scenarios:
