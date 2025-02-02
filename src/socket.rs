@@ -338,17 +338,18 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     connecting: HashMap<SocketAddr, ConnectingPerAddr>,
     control_rx: UnboundedReceiver<ControlRequest>,
     next_connection_id: SeqNr,
-    transport_rx: mpsc::Receiver<(SocketAddr, UtpMessage)>,
 }
 
 impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     pub(crate) async fn run_forever(mut self) -> anyhow::Result<()> {
+        let mut read_buf = [0u8; 16384];
+
         loop {
-            self.run_once().await?;
+            self.run_once(&mut read_buf).await?;
         }
     }
 
-    async fn run_once(&mut self) -> anyhow::Result<()> {
+    async fn run_once(&mut self, read_buf: &mut [u8]) -> anyhow::Result<()> {
         // This should get us into a state where either there's no SYNs or no accepts available.
         self.cleanup_accept_queue()?;
 
@@ -364,9 +365,16 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 // TODO: do smth about this
                 self.on_control(control).await;
             },
-            recv = self.transport_rx.recv() => {
-                let (addr, msg) = recv.context("error receiving, all recv threads dead")?;
-                self.on_recv(addr, msg)?;
+            recv = self.socket.transport.recv_from(read_buf) => {
+                let (len, addr) = recv.context("error receiving")?;
+                let message = match UtpMessage::deserialize(&read_buf[..len]) {
+                    Some(msg) => msg,
+                    None => {
+                        debug!(len, ?addr, "error desserializing and validating UTP message");
+                        return Ok(())
+                    }
+                };
+                self.on_recv(addr, message)?;
             }
         }
 
@@ -609,7 +617,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
 pub struct UtpSocket<T, E> {
     // The underlying transport, usually UDP.
-    pub(crate) transport: Arc<T>,
+    pub(crate) transport: T,
     // When was the socket created. All the uTP "timestamp_microsends" are relative to it.
     pub(crate) created: Instant,
     pub(crate) control_requests: UnboundedSender<ControlRequest>,
@@ -647,29 +655,6 @@ impl UtpSocketUdp {
     }
 }
 
-fn start_recvfrom_task<T: Transport>(
-    t: Arc<T>,
-    chan_size: usize,
-) -> tokio::sync::mpsc::Receiver<(SocketAddr, UtpMessage)> {
-    let (tx, rx) = tokio::sync::mpsc::channel(chan_size);
-    tokio::spawn(async move {
-        let mut buf = [0u8; 16384];
-        loop {
-            let (len, addr) = t
-                .recv_from(&mut buf)
-                .await
-                .context("error reading from transport")?;
-
-            if let Some(msg) = UtpMessage::deserialize(&buf[..len]) {
-                tx.send((addr, msg)).await.context("channel dead")?;
-            }
-        }
-        #[allow(unused)]
-        Ok::<_, anyhow::Error>(())
-    });
-    rx
-}
-
 impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     pub fn new_with_opts(transport: T, env: Env, opts: SocketOpts) -> anyhow::Result<Arc<Self>> {
         let (sock, dispatcher) = Self::new_with_opts_and_dispatcher(transport, env, opts)?;
@@ -692,10 +677,8 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_QUEUE_MAX_ACCEPTORS);
         let (control_tx, control_rx) = unbounded_channel();
 
-        let transport = Arc::new(sock);
-
         let sock = Arc::new(Self {
-            transport,
+            transport: sock,
             created: env.now(),
             control_requests: control_tx,
             local_addr,
@@ -704,14 +687,11 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             accept_requests: accept_tx,
         });
 
-        let rx = start_recvfrom_task(sock.transport.clone(), 128);
-
         let dispatcher = Dispatcher {
             streams: Default::default(),
             connecting: Default::default(),
             next_connection_id: env.random_u16().into(),
             control_rx,
-            transport_rx: rx,
             socket: sock.clone(),
             env,
             accept_queue: AcceptQueue {
