@@ -9,13 +9,13 @@ use std::{
 
 use anyhow::{bail, Context};
 use tokio::{sync::mpsc::UnboundedReceiver, time::Sleep};
-use tracing::{debug, error_span, trace, warn, Level};
+use tracing::{debug, error_span, event, trace, warn, Level};
 
 use crate::{
     congestion::CongestionController,
     constants::{
-        ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, RTTE_TRACING_LOG_LEVEL,
-        UTP_HEADER_SIZE,
+        ACK_DELAY, CHALLENGE_ACK_RATELIMIT, CONGESTION_TRACING_LOG_LEVEL, IMMEDIATE_ACK_EVERY,
+        RTTE_TRACING_LOG_LEVEL, UTP_HEADER_SIZE,
     },
     message::UtpMessage,
     raw::{Type, UtpHeader},
@@ -431,7 +431,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             };
 
             // If a retransmit timer expired, we should resend data starting at the last ACK.
-            trace!(?expired_delay, ?rewind_to, ?self.last_sent_seq_nr, "retransmitting");
+            event!(CONGESTION_TRACING_LOG_LEVEL, ?expired_delay, ?rewind_to, ?self.last_sent_seq_nr, "retransmitting");
 
             // Rewind "last sequence number sent", as if we never
             // had sent them. This will cause all data in the queue
@@ -452,7 +452,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 &mut self.rtte,
                 |r| r.retransmission_timeout(),
                 |r| r.on_retransmit(),
-                |_, _| RTTE_TRACING_LOG_LEVEL,
+                |_, _| CONGESTION_TRACING_LOG_LEVEL,
             );
 
             // Inform the congestion controller that we're retransmitting.
