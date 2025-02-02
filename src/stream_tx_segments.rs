@@ -274,7 +274,7 @@ impl Segments {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use crate::{
         raw::{selective_ack::SelectiveAck, UtpHeader},
@@ -408,5 +408,38 @@ mod tests {
         assert_eq!(ftx.total_len_packets(), 1);
         assert_eq!(ftx.count_delivered_test(), 0);
         assert_eq!(ftx.first_seq_nr().unwrap(), 6.into());
+    }
+
+    #[test]
+    fn test_rtt() {
+        // Test Case 1: Basic setup with 4 packets starting from sequence number 3
+        let mut now = Instant::now();
+        let mut ftx = make_segmented_tx(3, 5);
+        for mut item in ftx.iter_mut() {
+            item.on_sent(now);
+        }
+        now += Duration::from_secs(1);
+        let res = ftx.remove_up_to_ack(now, &make_sack_header(3, []));
+        assert_eq!(res.new_rtt, Some(Duration::from_secs(1)));
+
+        // One second later an ACK arrives for later segment (delayed ACK)
+        now += Duration::from_secs(1);
+        let res = ftx.remove_up_to_ack(now, &make_sack_header(5, []));
+        // This inflates rtt
+        assert_eq!(res.new_rtt, Some(Duration::from_secs(2)));
+        assert_eq!(ftx.first_seq_nr(), Some(6.into()));
+
+        // We retransmit the rest
+        for mut item in ftx.iter_mut() {
+            item.on_sent(now);
+        }
+
+        // they are ACKed, but RTT should not be updated for retransmitted packets.
+        now += Duration::from_secs(1);
+        let res = ftx.remove_up_to_ack(now, &make_sack_header(7, []));
+        assert_eq!(ftx.first_seq_nr(), None);
+        assert_eq!(res.acked_segments_count, 2);
+        // This inflates rtt
+        assert_eq!(res.new_rtt, None);
     }
 }
