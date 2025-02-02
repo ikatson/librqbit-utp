@@ -775,6 +775,10 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         buf: &[u8],
         addr: SocketAddr,
     ) -> anyhow::Result<bool> {
+        // TODO: uncomment to simulate packet loss.
+        // if rand::Rng::gen_bool(&mut rand::thread_rng(), 0.01) {
+        //     return Ok(true);
+        // }
         match self.transport.poll_send_to(cx, buf, addr) {
             Poll::Ready(Ok(sz)) => {
                 if sz != buf.len() {

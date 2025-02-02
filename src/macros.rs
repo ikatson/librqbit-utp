@@ -1,5 +1,5 @@
 macro_rules! once_every_ms {
-    ($dur:expr, $code:tt) => {
+    ($dur:expr, $code:tt) => {{
         static LAST_RUN: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
 
         if let Ok(now) = std::time::SystemTime::now().duration_since(::std::time::UNIX_EPOCH) {
@@ -16,41 +16,37 @@ macro_rules! once_every_ms {
                 }
             }
         }
-    };
+    }};
 }
 
 macro_rules! log_every_ms {
     ($dur:expr, $level:expr, $($rest:tt)*) => {
-        once_every_ms!($dur, {
-            tracing::event!($level, $($rest)*);
-        });
+        if tracing::enabled!($level) {
+            once_every_ms!($dur, {
+                tracing::event!($level, $($rest)*);
+            });
+        }
     };
 }
 
 #[allow(unused)]
 macro_rules! trace_every_ms {
     ($dur:expr, $($rest:tt)*) => {
-        once_every_ms!($dur, {
-            tracing::trace!($($rest)*);
-        });
+        log_every_ms!($dur, tracing::Level::TRACE, $($rest)*);
     };
 }
 
 #[allow(unused)]
 macro_rules! debug_every_ms {
     ($dur:expr, $($rest:tt)*) => {
-        once_every_ms!($dur, {
-            tracing::debug!($($rest)*);
-        });
+        log_every_ms!($dur, tracing::Level::DEBUG, $($rest)*);
     };
 }
 
 #[allow(unused)]
 macro_rules! warn_every_ms {
     ($dur:expr, $($rest:tt)*) => {
-        once_every_ms!($dur, {
-            tracing::warn!($($rest)*);
-        });
+        log_every_ms!($dur, tracing::Level::WARN, $($rest)*);
     };
 }
 
@@ -61,4 +57,25 @@ macro_rules! log_every_ms_if_changed {
             log_every_ms!($dur, $level, before=?before, after=?after, "{} changed", $name);
         });
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{constants::CONGESTION_TRACING_LOG_LEVEL, test_util::setup_test_logging};
+
+    #[test]
+    fn test_log_every_msg() {
+        setup_test_logging();
+
+        for _ in 0..5 {
+            log_every_ms!(
+                100,
+                CONGESTION_TRACING_LOG_LEVEL,
+                arg1 = 1,
+                arg2 = 2,
+                arg3 = 3,
+                "retransmitting"
+            );
+        }
+    }
 }
