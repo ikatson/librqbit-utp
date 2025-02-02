@@ -752,18 +752,21 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.congestion_controller
             .set_remote_window(msg.header.wnd_size as usize);
 
-        log_before_and_after_if_changed(
-            "rtte:on_ack",
-            self,
-            |s| s.rtte.retransmission_timeout(),
-            |s| s.rtte.on_ack(s.this_poll.now, msg.header.ack_nr),
-            |_, _| Level::TRACE,
-        );
         if on_ack_result.acked_bytes > 0 {
             self.congestion_controller.on_ack(
                 self.this_poll.now,
                 on_ack_result.acked_bytes,
                 &self.rtte,
+            );
+        }
+
+        if let Some(rtt) = on_ack_result.new_rtt {
+            log_before_and_after_if_changed(
+                "rtte:on_ack",
+                self,
+                |s| s.rtte.retransmission_timeout(),
+                |s| s.rtte.on_ack(rtt),
+                |_, _| Level::TRACE,
             );
         }
 
@@ -1151,7 +1154,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 let mut rtt = RttEstimator::default();
                 if let (Some(sent), Some(recv)) = (syn_sent_ts, ack_received_ts) {
                     rtt.on_send(sent, next_seq_nr);
-                    rtt.on_ack(recv, next_seq_nr);
+                    rtt.on_ack(recv - sent);
                 }
                 rtt
             },

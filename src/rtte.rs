@@ -24,7 +24,6 @@ pub struct RttEstimator {
     rtt: u32,
     deviation: u32,
     timestamp: Option<(Instant, SeqNr)>,
-    max_seq_sent: Option<SeqNr>,
     rto_count: u8,
 
     #[cfg(test)]
@@ -37,7 +36,6 @@ impl Default for RttEstimator {
             rtt: RTTE_INITIAL_RTT,
             deviation: RTTE_INITIAL_DEV,
             timestamp: None,
-            max_seq_sent: None,
             rto_count: 0,
 
             #[cfg(test)]
@@ -82,27 +80,12 @@ impl RttEstimator {
         );
     }
 
-    pub fn on_send(&mut self, timestamp: Instant, seq: SeqNr) {
-        if self
-            .max_seq_sent
-            .map(|max_seq_sent| seq > max_seq_sent)
-            .unwrap_or(true)
-        {
-            self.max_seq_sent = Some(seq);
-            if self.timestamp.is_none() {
-                self.timestamp = Some((timestamp, seq));
-                trace!("rtte: sampling at seq={:?}", seq);
-            }
-        }
+    pub fn on_send(&mut self, _timestamp: Instant, _seq: SeqNr) {
+        // Nothing, we compute that in segements
     }
 
-    pub fn on_ack(&mut self, timestamp: Instant, seq: SeqNr) {
-        if let Some((sent_timestamp, sent_seq)) = self.timestamp {
-            if seq >= sent_seq {
-                self.sample(timestamp - sent_timestamp);
-                self.timestamp = None;
-            }
-        }
+    pub fn on_ack(&mut self, rtt: Duration) {
+        self.sample(rtt);
     }
 
     pub fn on_retransmit(&mut self) {
