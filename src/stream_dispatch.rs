@@ -384,9 +384,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         if let Some(header) = last_sent {
             self.on_packet_sent(&header);
-            self.timers
-                .retransmit
-                .set_for_retransmit(self.this_poll.now, self.rtte.retransmission_timeout());
+            // rfc6298 5.1
+            self.timers.retransmit.set_for_retransmit(
+                self.this_poll.now,
+                self.rtte.retransmission_timeout(),
+                false,
+            );
         } else {
             trace!(recv_wnd, "did not send anything");
         }
@@ -545,9 +548,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         fin.set_type(Type::ST_FIN);
         fin.seq_nr = seq_nr;
         if self.send_control_packet(cx, socket, fin)? {
-            self.timers
-                .retransmit
-                .set_for_retransmit(self.this_poll.now, self.rtte.retransmission_timeout());
+            self.timers.retransmit.set_for_retransmit(
+                self.this_poll.now,
+                self.rtte.retransmission_timeout(),
+                false,
+            );
             self.last_sent_seq_nr = seq_nr;
         }
         Ok(())
@@ -728,20 +733,46 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let on_ack_result = self
             .user_tx_segments
             .remove_up_to_ack(self.this_poll.now, &msg.header);
-        if on_ack_result.acked_segments_count > 0 {
-            let mut g = self.user_tx.locked.lock();
-            g.truncate_front(on_ack_result.acked_bytes);
-            if let Some(w) = g.buffer_has_space.take() {
-                w.wake();
-            }
 
-            if g.buffer().is_empty() {
-                if let Some(w) = g.buffer_flushed.take() {
+        if on_ack_result.acked_segments_count > 0 {
+            {
+                let mut g = self.user_tx.locked.lock();
+                g.truncate_front(on_ack_result.acked_bytes);
+                if let Some(w) = g.buffer_has_space.take() {
                     w.wake();
+                }
+
+                if g.buffer().is_empty() {
+                    if let Some(w) = g.buffer_flushed.take() {
+                        w.wake();
+                    }
                 }
             }
 
             trace!(?on_ack_result, "removed ACKed tx messages");
+
+            // Update RTO
+            if let Some(rtt) = on_ack_result.new_rtt {
+                log_before_and_after_if_changed(
+                    "rtte:on_ack",
+                    self,
+                    |s| s.rtte.retransmission_timeout(),
+                    |s| s.rtte.on_ack(rtt),
+                    |_, _| Level::TRACE,
+                );
+            }
+
+            if self.user_tx_segments.is_empty() {
+                // rfc6298 5.2
+                self.timers.retransmit.set_for_idle();
+            } else {
+                // rfc6298 5.3
+                self.timers.retransmit.set_for_retransmit(
+                    self.this_poll.now,
+                    self.rtte.retransmission_timeout(),
+                    true,
+                );
+            }
         }
 
         self.last_remote_timestamp = msg.header.timestamp_microseconds;
@@ -757,16 +788,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.this_poll.now,
                 on_ack_result.acked_bytes,
                 &self.rtte,
-            );
-        }
-
-        if let Some(rtt) = on_ack_result.new_rtt {
-            log_before_and_after_if_changed(
-                "rtte:on_ack",
-                self,
-                |s| s.rtte.retransmission_timeout(),
-                |s| s.rtte.on_ack(rtt),
-                |_, _| Level::TRACE,
             );
         }
 
@@ -1250,27 +1271,25 @@ impl RetransmitTimer {
     }
 
     fn set_for_idle(&mut self) {
-        trace!("resetting timer");
         *self = RetransmitTimer::Idle
     }
 
-    fn set_for_retransmit(&mut self, now: Instant, delay: Duration) {
-        trace!(?delay, "setting retransmit timer");
-        match *self {
-            RetransmitTimer::Idle { .. } | RetransmitTimer::FastRetransmit { .. } => {
-                *self = RetransmitTimer::Retransmit {
-                    expires_at: now + delay,
-                    delay,
-                }
+    fn set_for_retransmit(&mut self, now: Instant, delay: Duration, restart: bool) {
+        *self = match *self {
+            RetransmitTimer::Idle => RetransmitTimer::Retransmit {
+                expires_at: now + delay,
+                delay,
+            },
+            RetransmitTimer::Retransmit { .. } if restart => RetransmitTimer::Retransmit {
+                expires_at: now + delay,
+                delay,
+            },
+            // If timer already present, leave as is, even if expired.
+            RetransmitTimer::Retransmit { expires_at, delay } => {
+                RetransmitTimer::Retransmit { expires_at, delay }
             }
-            RetransmitTimer::Retransmit { expires_at, delay } if now >= expires_at => {
-                *self = RetransmitTimer::Retransmit {
-                    expires_at: now + delay,
-                    delay: delay * 2,
-                }
-            }
-            RetransmitTimer::Retransmit { .. } => (),
-        }
+            RetransmitTimer::FastRetransmit => RetransmitTimer::FastRetransmit,
+        };
     }
 
     fn set_for_fast_retransmit(&mut self) {

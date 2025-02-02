@@ -2,6 +2,7 @@
 // Recent RFCs that we might try to implement exactly to make everyting super explicit
 // RFC 9293 https://datatracker.ietf.org/doc/html/rfc9293 (TCP) (2022, standard)
 // RFC 6298 https://datatracker.ietf.org/doc/html/rfc6298 (2011, draft) - RTO calculation, references RTT calculation
+// RFC 5681 https://datatracker.ietf.org/doc/html/rfc5681 (2009, draft) - congestion control, fast retransmit, fast recovery
 //
 // rfc8985 (draft, 2021) - RACK algorithm
 
