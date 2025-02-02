@@ -791,11 +791,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             );
         }
 
-        let ack_all = msg.header.ack_nr == self.last_sent_ack_nr;
-        if !self.timers.retransmit.is_retransmit() || ack_all {
-            self.timers.retransmit.set_for_idle();
-        }
-
         match msg.header.get_type() {
             Type::ST_DATA => {
                 trace!(payload_size = msg.payload().len(), "received ST_DATA");
@@ -1276,10 +1271,12 @@ impl RetransmitTimer {
 
     fn set_for_retransmit(&mut self, now: Instant, delay: Duration, restart: bool) {
         *self = match *self {
+            // rfc6298 5.1
             RetransmitTimer::Idle => RetransmitTimer::Retransmit {
                 expires_at: now + delay,
                 delay,
             },
+            // rfc6298 5.3
             RetransmitTimer::Retransmit { .. } if restart => RetransmitTimer::Retransmit {
                 expires_at: now + delay,
                 delay,
@@ -1295,13 +1292,6 @@ impl RetransmitTimer {
     fn set_for_fast_retransmit(&mut self) {
         trace!("setting for fast retransmit");
         *self = RetransmitTimer::FastRetransmit
-    }
-
-    fn is_retransmit(&self) -> bool {
-        matches!(
-            *self,
-            RetransmitTimer::Retransmit { .. } | RetransmitTimer::FastRetransmit
-        )
     }
 }
 
