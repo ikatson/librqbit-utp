@@ -75,19 +75,19 @@ async fn main() -> anyhow::Result<()> {
     }
     let _ = tracing_subscriber::fmt::try_init();
 
-    let client = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 8001);
-    let server = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 8002);
+    let client_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 8001).into();
+    let server_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 8002).into();
 
-    let listener = UtpSocket::new_udp(server)
+    let listener = UtpSocket::new_udp(server_addr)
         .await
         .context("error creating socket")?;
 
     let client = tokio::spawn(
         async move {
-            let client = UtpSocket::new_udp(client)
+            let client = UtpSocket::new_udp(client_addr)
                 .await
                 .context("error creating socket")?;
-            let sock = timeout(TIMEOUT, client.connect(server))
+            let sock = timeout(TIMEOUT, client.connect(server_addr))
                 .await
                 .context("timeout connecting")?
                 .context("error connecting")?;

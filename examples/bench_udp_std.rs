@@ -48,8 +48,8 @@ fn main() -> anyhow::Result<()> {
     }
     let _ = tracing_subscriber::fmt::try_init();
 
-    let client_addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 8001);
-    let server_addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 8002);
+    let client_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 8001).into();
+    let server_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 8002).into();
 
     // Check command line arguments
     let args: Vec<String> = std::env::args().collect();
