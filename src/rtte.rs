@@ -4,6 +4,9 @@ use tracing::trace;
 
 use crate::seq_nr::SeqNr;
 
+// NOTE: RTT = round trip time
+// NOTE: RTO = retransmission time out
+
 // Conservative initial RTT estimate.
 const RTTE_INITIAL_RTT: u32 = 300;
 const RTTE_INITIAL_DEV: u32 = 100;
