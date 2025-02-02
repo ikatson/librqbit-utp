@@ -442,9 +442,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // now for whatever reason (like zero window), this avoids an
             // infinite polling loop where `poll_at` returns `Now` but `dispatch`
             // can't actually do anything.
+            //
+            // Ideally, we only clear it after we were able to send anything.
             self.timers.retransmit.set_for_idle();
 
-            // Inform RTTE, so that it can avoid bogus measurements.
+            // Inform RTTE to become more conservative.
             log_before_and_after_if_changed(
                 "rtte:on_retransmit",
                 &mut self.rtte,
@@ -2983,7 +2985,7 @@ mod tests {
         let initial_seq_nr = initial_sent[0].header.seq_nr;
 
         // No retransmission should occur before timeout
-        t.env.increment_now(Duration::from_millis(500));
+        t.env.increment_now(Duration::from_millis(100));
         t.poll_once_assert_pending().await;
         assert_eq!(
             t.take_sent().len(),

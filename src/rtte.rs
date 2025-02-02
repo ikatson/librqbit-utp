@@ -10,8 +10,15 @@ const RTTE_MIN_RTO: Duration = Duration::from_secs(1);
 // rfc6298 2.4
 const RTTE_MAX_RTO: Duration = Duration::from_secs(60);
 
+// rfc6298 section 4
+const CLOCK_GRANULARITY: Duration = Duration::from_millis(10);
+
 fn clamp(rto: Duration) -> Duration {
     rto.clamp(RTTE_MIN_RTO, RTTE_MAX_RTO)
+}
+
+fn calc_rto(srtt: Duration, rttvar: Duration) -> Duration {
+    clamp(srtt + (rttvar * K).max(CLOCK_GRANULARITY))
 }
 
 const K: u32 = 4;
@@ -73,7 +80,7 @@ impl RttEstimator {
                 let srtt = new_rtt;
                 let rttvar = new_rtt / 2;
 
-                let rto = clamp(srtt + rttvar * K); // SRTT + max (G, K*RTTVAR);
+                let rto = calc_rto(srtt, rttvar);
                 self.state = RttState::Subsequent { rto, srtt, rttvar }
             }
             RttState::Subsequent { rto, srtt, rttvar } => {
@@ -84,7 +91,7 @@ impl RttEstimator {
 
                 *rttvar = *rttvar * 3 / 4 + srtt.abs_diff(new_rtt) / 4;
                 *srtt = (*srtt * 7 + new_rtt) / 8;
-                *rto = clamp(*srtt + K * *rttvar);
+                *rto = calc_rto(*srtt, *rttvar);
             }
         }
     }
