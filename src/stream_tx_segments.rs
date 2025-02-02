@@ -13,6 +13,7 @@ use tracing::debug;
 
 use crate::{raw::UtpHeader, seq_nr::SeqNr};
 
+#[derive(Clone, Copy)]
 enum RttMeasurement {
     NotSent,
     SentTime(Instant),
@@ -25,6 +26,18 @@ struct Segment {
     rtt: RttMeasurement,
 }
 
+impl Segment {
+    fn update_rtt(&self, now: Instant, rtt: &mut Option<Duration>) {
+        match self.rtt {
+            // This should not happen.
+            RttMeasurement::NotSent | RttMeasurement::Retransmitted => {}
+            RttMeasurement::SentTime(sent_ts) => {
+                *rtt = Some(now - sent_ts);
+            }
+        }
+    }
+}
+
 pub struct Segments {
     segments: VecDeque<Segment>,
     len_bytes: usize,
@@ -33,7 +46,7 @@ pub struct Segments {
 }
 
 pub struct SegmentIterItem<'a> {
-    segment: &'a Segment,
+    segment: &'a mut Segment,
     seq_nr: SeqNr,
     payload_offset: usize,
 }
@@ -50,6 +63,14 @@ impl SegmentIterItem<'_> {
     }
     pub fn payload_offset(&self) -> usize {
         self.payload_offset
+    }
+
+    pub fn on_sent(&mut self, now: Instant) {
+        self.segment.rtt = match self.segment.rtt {
+            RttMeasurement::NotSent => RttMeasurement::SentTime(now),
+            RttMeasurement::SentTime(_) => RttMeasurement::Retransmitted,
+            RttMeasurement::Retransmitted => RttMeasurement::Retransmitted,
+        };
     }
 }
 
@@ -158,20 +179,21 @@ impl Segments {
     }
 
     // Returns number of removed headers, and their comibined payload size.
-    pub fn remove_up_to_ack(&mut self, ack_header: &UtpHeader) -> OnAckResult {
+    pub fn remove_up_to_ack(&mut self, now: Instant, ack_header: &UtpHeader) -> OnAckResult {
         let mut removed = 0;
         let mut payload_size = 0;
+
+        let mut new_rtt: Option<Duration> = None;
 
         while let Some(seq_nr) = self.first_seq_nr {
             if ack_header.ack_nr < seq_nr {
                 break;
             }
             let segment = self.pop_front().unwrap();
+            segment.update_rtt(now, &mut new_rtt);
             removed += 1;
             payload_size += segment.payload_size;
         }
-
-        let mut new_rtt: Option<Duration> = None;
 
         // If TX start matches with header ACK and it's a selective ACK, mark all segments delivered.
         match (self.first_seq_nr(), ack_header.extensions.selective_ack) {
@@ -187,6 +209,9 @@ impl Segments {
                         .zip(sack.iter())
                     {
                         segment.is_delivered |= acked;
+                        if acked {
+                            segment.update_rtt(now, &mut new_rtt);
+                        }
                     }
                 } else {
                     for (segment, acked) in self
@@ -195,6 +220,9 @@ impl Segments {
                         .zip(sack.iter().skip((-sack_start_offset) as usize))
                     {
                         segment.is_delivered |= acked;
+                        if acked {
+                            segment.update_rtt(now, &mut new_rtt);
+                        }
                     }
                 }
 
@@ -219,23 +247,24 @@ impl Segments {
     }
 
     // Iterate stored data - headers and their payload offsets (as a function to copy payload to some other buffer).
-    pub fn iter(&self) -> impl Iterator<Item = SegmentIterItem<'_>> {
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = SegmentIterItem<'_>> {
         struct State {
             seq_nr: SeqNr,
             payload_offset: usize,
         }
-        self.segments.iter().scan(
+        self.segments.iter_mut().scan(
             State {
                 seq_nr: self.first_seq_nr.unwrap_or(0.into()),
                 payload_offset: 0,
             },
             |state, segment| {
+                let ps = segment.payload_size;
                 let item = SegmentIterItem {
                     segment,
                     payload_offset: state.payload_offset,
                     seq_nr: state.seq_nr,
                 };
-                state.payload_offset += segment.payload_size;
+                state.payload_offset += ps;
                 state.seq_nr += 1;
                 Some(item)
             },
@@ -245,6 +274,8 @@ impl Segments {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use crate::{
         raw::{selective_ack::SelectiveAck, UtpHeader},
         seq_nr::SeqNr,
@@ -278,6 +309,7 @@ mod tests {
     #[test]
     fn test_remove_up_to_ack() {
         // Test Case 1: Basic setup with 4 packets starting from sequence number 3
+        let now = Instant::now();
         let ftx = make_segmented_tx(3, 4);
         assert_eq!(ftx.total_len_bytes(), 4);
         assert_eq!(ftx.total_len_packets(), 4);
@@ -286,7 +318,7 @@ mod tests {
 
         // Test Case 1.1: ACK with sequence number 4, should remove first two packets
         let mut ftx = make_segmented_tx(3, 4);
-        ftx.remove_up_to_ack(&make_sack_header(4, []));
+        ftx.remove_up_to_ack(now, &make_sack_header(4, []));
         assert_eq!(ftx.total_len_bytes(), 2);
         assert_eq!(ftx.total_len_packets(), 2);
         assert_eq!(ftx.first_seq_nr().unwrap(), 5.into());
@@ -294,7 +326,7 @@ mod tests {
 
         // Test Case 1.2: ACK all packets, queue should be empty
         let mut ftx = make_segmented_tx(3, 4);
-        ftx.remove_up_to_ack(&make_sack_header(6, []));
+        ftx.remove_up_to_ack(now, &make_sack_header(6, []));
         assert_eq!(ftx.total_len_bytes(), 0);
         assert_eq!(ftx.total_len_packets(), 0);
         assert!(ftx.first_seq_nr().is_none());
@@ -303,7 +335,7 @@ mod tests {
         // Test Case 2: ACK with sequence number 2 (below our start sequence)
         // Should not remove any packets or mark any as delivered
         let mut ftx = make_segmented_tx(3, 4);
-        ftx.remove_up_to_ack(&make_sack_header(2, []));
+        ftx.remove_up_to_ack(now, &make_sack_header(2, []));
         assert_eq!(ftx.total_len_bytes(), 4);
         assert_eq!(ftx.total_len_packets(), 4);
         assert_eq!(ftx.first_seq_nr().unwrap(), 3.into());
@@ -312,7 +344,7 @@ mod tests {
         // Test Case 3: ACK with sequence number 3 (matches our start sequence)
         // Should remove the first packet, leaving 3 packets
         let mut ftx = make_segmented_tx(3, 4);
-        ftx.remove_up_to_ack(&make_sack_header(3, []));
+        ftx.remove_up_to_ack(now, &make_sack_header(3, []));
         assert_eq!(ftx.total_len_bytes(), 3);
         assert_eq!(ftx.total_len_packets(), 3);
         assert_eq!(ftx.first_seq_nr().unwrap(), 4.into());
@@ -321,7 +353,7 @@ mod tests {
         // Test Case 4: ACK with sequence number 2 and selective ACK for next packet
         // Should mark the second packet as delivered but not remove any
         let mut ftx = make_segmented_tx(3, 4);
-        ftx.remove_up_to_ack(&make_sack_header(2, [0]));
+        ftx.remove_up_to_ack(now, &make_sack_header(2, [0]));
         assert_eq!(ftx.total_len_bytes(), 4);
         assert_eq!(ftx.total_len_packets(), 4);
         assert_eq!(ftx.first_seq_nr().unwrap(), 3.into());
@@ -330,7 +362,7 @@ mod tests {
 
         // Test Case 4.1 (edge case): an older selective ACK should mark packets delivered.
         let mut ftx = make_segmented_tx(3, 4);
-        ftx.remove_up_to_ack(&make_sack_header(1, [1])); // means 2 and 3 are not delivered, but 4 is
+        ftx.remove_up_to_ack(now, &make_sack_header(1, [1])); // means 2 and 3 are not delivered, but 4 is
         assert_eq!(ftx.total_len_bytes(), 4);
         assert_eq!(ftx.total_len_packets(), 4);
         assert_eq!(ftx.first_seq_nr().unwrap(), 3.into());
@@ -340,7 +372,7 @@ mod tests {
         // Test Case 5: ACK with sequence number 2 and selective ACK for second and fourth packets
         // Should mark both packets as delivered but not remove any
         let mut ftx = make_segmented_tx(3, 4);
-        ftx.remove_up_to_ack(&make_sack_header(2, [0, 2]));
+        ftx.remove_up_to_ack(now, &make_sack_header(2, [0, 2]));
         assert_eq!(ftx.total_len_bytes(), 4);
         assert_eq!(ftx.total_len_packets(), 4);
         assert_eq!(ftx.first_seq_nr().unwrap(), 3.into());
@@ -350,7 +382,7 @@ mod tests {
 
         // Test Case 6: Selective ACK with gaps
         let mut ftx = make_segmented_tx(3, 6); // Create 6 packets
-        ftx.remove_up_to_ack(&make_sack_header(2, [0, 2, 4])); // ACK 2nd, 4th, and 6th packets
+        ftx.remove_up_to_ack(now, &make_sack_header(2, [0, 2, 4])); // ACK 2nd, 4th, and 6th packets
         assert_eq!(ftx.total_len_bytes(), 6);
         assert_eq!(ftx.total_len_packets(), 6);
         assert_eq!(ftx.count_delivered_test(), 3);
@@ -363,7 +395,7 @@ mod tests {
 
         // Test Case 7: selective ACK should be able to clean up the queue
         let mut ftx = make_segmented_tx(3, 4);
-        ftx.remove_up_to_ack(&make_sack_header(1, [0, 1, 2])); // means 3,4,5 were received
+        ftx.remove_up_to_ack(now, &make_sack_header(1, [0, 1, 2])); // means 3,4,5 were received
         assert_eq!(ftx.total_len_bytes(), 1);
         assert_eq!(ftx.total_len_packets(), 1);
         assert_eq!(ftx.count_delivered_test(), 0);
@@ -371,7 +403,7 @@ mod tests {
 
         // Test Case 7.1: selective ACK should be able to clean up the queue - even further away
         let mut ftx = make_segmented_tx(3, 4);
-        ftx.remove_up_to_ack(&make_sack_header(0, [0, 1, 2, 3])); // means 3,4,5 were received
+        ftx.remove_up_to_ack(now, &make_sack_header(0, [0, 1, 2, 3])); // means 3,4,5 were received
         assert_eq!(ftx.total_len_bytes(), 1);
         assert_eq!(ftx.total_len_packets(), 1);
         assert_eq!(ftx.count_delivered_test(), 0);

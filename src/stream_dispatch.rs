@@ -320,8 +320,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.congestion_controller.pre_transmit(self.this_poll.now);
         let mut recv_wnd = self.effective_remote_receive_window();
 
+        let mut header = self.outgoing_header();
+
         // Send only the stuff we haven't sent yet, up to sender's window.
-        for item in self.user_tx_segments.iter() {
+        for mut item in self.user_tx_segments.iter_mut() {
             // Re-delivery - don't send until retransmission happens (it will rewind elf.last_sent_seq_nr).
             let already_sent = item.seq_nr() - self.last_sent_seq_nr <= 0;
             if already_sent {
@@ -339,7 +341,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 break;
             }
 
-            let mut header = self.outgoing_header();
             header.set_type(Type::ST_DATA);
             header.seq_nr = item.seq_nr();
 
@@ -369,6 +370,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if self.this_poll.transport_pending {
                 break;
             }
+
+            item.on_sent(self.this_poll.now);
 
             recv_wnd = recv_wnd.saturating_sub(item.payload_size());
 
@@ -581,7 +584,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         let tx_offset = self
             .user_tx_segments
-            .iter()
+            .iter_mut()
             .last()
             .map(|item| item.payload_offset() + item.payload_size())
             .unwrap_or(0);
@@ -722,7 +725,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         );
 
         // Remove everything from tx_buffer that was acked by this message.
-        let on_ack_result = self.user_tx_segments.remove_up_to_ack(&msg.header);
+        let on_ack_result = self
+            .user_tx_segments
+            .remove_up_to_ack(self.this_poll.now, &msg.header);
         if on_ack_result.acked_segments_count > 0 {
             let mut g = self.user_tx.locked.lock();
             g.truncate_front(on_ack_result.acked_bytes);
