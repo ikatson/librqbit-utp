@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 macro_rules! once_every_ms {
     ($dur:expr, $code:tt) => {
         static LAST_RUN: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
@@ -21,22 +19,46 @@ macro_rules! once_every_ms {
     };
 }
 
-#[cfg(test)]
-mod tests {
-    use std::time::Duration;
+macro_rules! log_every_ms {
+    ($dur:expr, $level:expr, $($rest:tt)*) => {
+        once_every_ms!($dur, {
+            tracing::event!($level, $($rest)*);
+        });
+    };
+}
 
-    use tracing::info;
+#[allow(unused)]
+macro_rules! trace_every_ms {
+    ($dur:expr, $($rest:tt)*) => {
+        once_every_ms!($dur, {
+            tracing::trace!($($rest)*);
+        });
+    };
+}
 
-    use crate::test_util::setup_test_logging;
+#[allow(unused)]
+macro_rules! debug_every_ms {
+    ($dur:expr, $($rest:tt)*) => {
+        once_every_ms!($dur, {
+            tracing::debug!($($rest)*);
+        });
+    };
+}
 
-    #[test]
-    fn test_once_every_ms() {
-        setup_test_logging();
-        for i in 0..5 {
-            once_every_ms!(100, {
-                info!("hello {i}");
-            });
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
+#[allow(unused)]
+macro_rules! warn_every_ms {
+    ($dur:expr, $($rest:tt)*) => {
+        once_every_ms!($dur, {
+            tracing::warn!($($rest)*);
+        });
+    };
+}
+
+// obj, calc, maybe_change, callback
+macro_rules! log_every_ms_if_changed {
+    ($dur:expr, $level:expr, $name:expr, $obj:expr, $calc:expr, $maybe_change:expr) => {
+        crate::utils::run_before_and_after_if_changed($obj, $calc, $maybe_change, |_, before, after| {
+            log_every_ms!($dur, $level, before=?before, after=?after, "{} changed", $name);
+        });
+    };
 }

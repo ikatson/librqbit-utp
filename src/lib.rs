@@ -28,6 +28,7 @@
 //
 // TODO: built-in connection timeouts?
 
+#[macro_use]
 mod macros;
 
 mod congestion;

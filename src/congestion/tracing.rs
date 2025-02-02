@@ -2,10 +2,7 @@ use std::time::Instant;
 
 use tracing::trace;
 
-use crate::{
-    constants::CONGESTION_TRACING_LOG_LEVEL, rtte::RttEstimator,
-    utils::log_before_and_after_if_changed,
-};
+use crate::{constants::CONGESTION_TRACING_LOG_LEVEL, rtte::RttEstimator};
 
 use super::CongestionController;
 
@@ -34,43 +31,47 @@ where
     }
 
     fn on_ack(&mut self, now: Instant, len: usize, rtt: &RttEstimator) {
-        log_before_and_after_if_changed(
+        log_every_ms_if_changed!(
+            500,
+            CONGESTION_TRACING_LOG_LEVEL,
             "on_ack:cwnd",
             self,
             |s| s.inner,
-            |s| s.inner.on_ack(now, len, rtt),
-            |_, _| CONGESTION_TRACING_LOG_LEVEL,
-        )
+            |s| s.inner.on_ack(now, len, rtt)
+        );
     }
 
     fn on_retransmit(&mut self, now: Instant) {
-        log_before_and_after_if_changed(
+        log_every_ms_if_changed!(
+            500,
+            CONGESTION_TRACING_LOG_LEVEL,
             "on_retransmit:cwnd",
             self,
             |s| s.inner,
-            |s| s.inner.on_retransmit(now),
-            |_, _| CONGESTION_TRACING_LOG_LEVEL,
-        )
+            |s| s.inner.on_retransmit(now)
+        );
     }
 
     fn on_duplicate_ack(&mut self, now: Instant) {
-        log_before_and_after_if_changed(
+        log_every_ms_if_changed!(
+            500,
+            CONGESTION_TRACING_LOG_LEVEL,
             "on_duplicate_ack:cwnd",
             self,
             |s| s.inner,
-            |s| s.inner.on_duplicate_ack(now),
-            |_, _| CONGESTION_TRACING_LOG_LEVEL,
-        )
+            |s| s.inner.on_duplicate_ack(now)
+        );
     }
 
     fn pre_transmit(&mut self, now: Instant) {
-        log_before_and_after_if_changed(
+        log_every_ms_if_changed!(
+            500,
+            CONGESTION_TRACING_LOG_LEVEL,
             "pre_transmit:cwnd",
             self,
             |s| s.inner,
-            |s| s.inner.pre_transmit(now),
-            |_, _| CONGESTION_TRACING_LOG_LEVEL,
-        )
+            |s| s.inner.pre_transmit(now)
+        );
     }
 
     fn set_mss(&mut self, mss: usize) {

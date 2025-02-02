@@ -136,6 +136,27 @@ impl<Msg> Drop for DropGuardSendBeforeDeath<Msg> {
 }
 
 #[inline(always)]
+pub fn run_before_and_after_if_changed<
+    'a,
+    Object: 'a,
+    Value: PartialEq + Copy + std::fmt::Debug + 'static,
+    ChangeResult,
+>(
+    obj: &mut Object,
+    calc: impl Fn(&Object) -> Value,
+    maybe_change: impl FnOnce(&mut Object) -> ChangeResult,
+    callback: impl FnOnce(&Object, &Value, &Value),
+) -> ChangeResult {
+    let before = calc(obj);
+    let result = maybe_change(obj);
+    let after = calc(obj);
+    if before != after {
+        callback(obj, &before, &after);
+    }
+    result
+}
+
+#[inline(always)]
 pub fn log_before_and_after_if_changed<
     'a,
     Object: 'a,
