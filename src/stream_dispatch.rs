@@ -722,10 +722,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         );
 
         // Remove everything from tx_buffer that was acked by this message.
-        let (removed_headers, removed_bytes) = self.user_tx_segments.remove_up_to_ack(&msg.header);
-        if removed_headers > 0 {
+        let on_ack_result = self.user_tx_segments.remove_up_to_ack(&msg.header);
+        if on_ack_result.acked_segments_count > 0 {
             let mut g = self.user_tx.locked.lock();
-            g.truncate_front(removed_bytes);
+            g.truncate_front(on_ack_result.acked_bytes);
             if let Some(w) = g.buffer_has_space.take() {
                 w.wake();
             }
@@ -736,7 +736,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
-            trace!(removed_headers, removed_bytes, "removed ACKed tx messages");
+            trace!(?on_ack_result, "removed ACKed tx messages");
         }
 
         self.last_remote_timestamp = msg.header.timestamp_microseconds;
@@ -754,9 +754,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             |s| s.rtte.on_ack(s.this_poll.now, msg.header.ack_nr),
             |_, _| Level::TRACE,
         );
-        if removed_bytes > 0 {
-            self.congestion_controller
-                .on_ack(self.this_poll.now, removed_bytes, &self.rtte);
+        if on_ack_result.acked_bytes > 0 {
+            self.congestion_controller.on_ack(
+                self.this_poll.now,
+                on_ack_result.acked_bytes,
+                &self.rtte,
+            );
         }
 
         let ack_all = msg.header.ack_nr == self.last_sent_ack_nr;

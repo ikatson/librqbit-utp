@@ -1,4 +1,11 @@
-// TODO: I don't like the timer logic - it's too complex and thus probably buggy. Rewrite it.
+// RTT, RTO, congestion
+// Recent RFCs that we might try to implement exactly to make everyting super explicit
+// RFC 9293 https://datatracker.ietf.org/doc/html/rfc9293 (TCP) (2022, standard)
+// RFC 6298 https://datatracker.ietf.org/doc/html/rfc6298 (2011, draft) - RTO calculation, references RTT calculation
+//
+// rfc8985 (draft, 2021) - RACK algorithm
+
+// (partly done) TODO: I don't like the timer logic - it's too complex and thus probably buggy. Rewrite it.
 
 // TODO: uTP socket death
 // if main socket dies

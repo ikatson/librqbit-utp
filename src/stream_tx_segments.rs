@@ -4,15 +4,25 @@
 // When an ACK arrives this tells us how much (if any) bytes we can
 // remove from the actual TX (bytes) that are stored in struct UserTx.
 
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use tracing::debug;
 
 use crate::{raw::UtpHeader, seq_nr::SeqNr};
 
+enum RttMeasurement {
+    NotSent,
+    SentTime(Instant),
+    Retransmitted,
+}
+
 struct Segment {
     payload_size: usize,
     is_delivered: bool,
+    rtt: RttMeasurement,
 }
 
 pub struct Segments {
@@ -40,6 +50,22 @@ impl SegmentIterItem<'_> {
     }
     pub fn payload_offset(&self) -> usize {
         self.payload_offset
+    }
+}
+
+pub struct OnAckResult {
+    pub acked_segments_count: usize,
+    pub acked_bytes: usize,
+    pub new_rtt: Option<Duration>,
+}
+
+impl core::fmt::Debug for OnAckResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "acked_segments={}, bytes={}, new_rtt={:?}",
+            self.acked_segments_count, self.acked_bytes, self.new_rtt
+        )
     }
 }
 
@@ -107,6 +133,7 @@ impl Segments {
         self.segments.push_back(Segment {
             payload_size: payload_len,
             is_delivered: false,
+            rtt: RttMeasurement::NotSent,
         });
         self.len_bytes += payload_len;
         true
@@ -131,7 +158,7 @@ impl Segments {
     }
 
     // Returns number of removed headers, and their comibined payload size.
-    pub fn remove_up_to_ack(&mut self, ack_header: &UtpHeader) -> (usize, usize) {
+    pub fn remove_up_to_ack(&mut self, ack_header: &UtpHeader) -> OnAckResult {
         let mut removed = 0;
         let mut payload_size = 0;
 
@@ -143,6 +170,8 @@ impl Segments {
             removed += 1;
             payload_size += segment.payload_size;
         }
+
+        let mut new_rtt: Option<Duration> = None;
 
         // If TX start matches with header ACK and it's a selective ACK, mark all segments delivered.
         match (self.first_seq_nr(), ack_header.extensions.selective_ack) {
@@ -182,7 +211,11 @@ impl Segments {
             _ => {}
         };
 
-        (removed, payload_size)
+        OnAckResult {
+            acked_segments_count: removed,
+            acked_bytes: payload_size,
+            new_rtt,
+        }
     }
 
     // Iterate stored data - headers and their payload offsets (as a function to copy payload to some other buffer).
