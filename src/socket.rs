@@ -1,5 +1,5 @@
 use std::{
-    collections::{hash_map::Entry, HashMap, VecDeque},
+    collections::{hash_map::Entry, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::NonZeroUsize,
     sync::{
@@ -9,6 +9,8 @@ use std::{
     task::Poll,
     time::Instant,
 };
+
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::UtpStream;
 use crate::{
