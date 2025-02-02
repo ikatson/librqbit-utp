@@ -5,8 +5,8 @@ use std::time::Duration;
 // set RTO <- 1 second
 const RTTE_INITIAL_RTT: Duration = Duration::from_millis(300);
 
-// rfc6298 2.4. However looks like modern OSes override this and keep it lower.
-// Linux has 200ms.
+// rfc6298 2.4 says to set min 1s. However looks like modern OSes override
+// this and keep it lower. Linux has 200ms. uTP BEP 29 is 500ms.
 const RTTE_MIN_RTO: Duration = Duration::from_millis(200);
 // rfc6298 2.4
 const RTTE_MAX_RTO: Duration = Duration::from_secs(60);
