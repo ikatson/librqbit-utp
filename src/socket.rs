@@ -70,7 +70,7 @@ impl CongestionConfig {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct SocketOpts {
     // The MTU to base calculations on.
     pub mtu: Option<usize>,
@@ -772,7 +772,11 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
                 }
             }
             Poll::Ready(Err(e)) => {
-                bail!("error sending to UDP socket: {e:#}");
+                bail!(
+                    "error sending to UDP socket addr={}, len={}: {e:#}",
+                    addr,
+                    buf.len()
+                );
             }
             Poll::Pending => {
                 debug!("UDP socket full, could not send packet");

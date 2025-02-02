@@ -4,29 +4,15 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use futures::FutureExt;
-use librqbit_utp::{UtpSocket, UtpStreamUdp};
+use librqbit_utp::{SocketOpts, UtpSocket, UtpStreamUdp};
 use rand::Rng;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    time::timeout,
-    try_join,
-};
-use tracing::{error_span, info, Instrument};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::timeout;
+use tracing::info;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const PRINT_INTERVAL: Duration = Duration::from_secs(1);
 const BUFFER_SIZE: usize = 16384; // 16KB buffer
-
-async fn flatten<JoinError>(
-    handle: impl std::future::Future<Output = Result<anyhow::Result<()>, JoinError>>,
-) -> anyhow::Result<()> {
-    match handle.await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(err)) => Err(err),
-        Err(_) => bail!("joining failed"),
-    }
-}
 
 async fn sender(mut stream: UtpStreamUdp) -> anyhow::Result<()> {
     let mut buffer = vec![0u8; BUFFER_SIZE];
@@ -75,34 +61,54 @@ async fn main() -> anyhow::Result<()> {
     let client_addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 8001);
     let server_addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 8002);
 
-    let listener = UtpSocket::new_udp(server_addr)
-        .await
-        .context("error creating socket")?;
+    let opts = SocketOpts {
+        // mtu: Some(8192),
+        // mtu_autodetect_host: Some(Ipv4Addr::LOCALHOST.into()),
+        ..Default::default()
+    };
 
-    let client = tokio::spawn(
-        async move {
-            let client = UtpSocket::new_udp(client_addr)
-                .await
-                .context("error creating socket")?;
-            let sock = timeout(TIMEOUT, client.connect(server_addr))
-                .await
-                .context("timeout connecting")?
-                .context("error connecting")?;
-            sender(sock).await.context("error running sender")
+    // Check command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        // If no arguments, spawn both client and server processes
+        let server_child = std::process::Command::new(&args[0])
+            .arg("server")
+            .spawn()
+            .context("Failed to spawn server process")?;
+
+        // Wait a bit for the server to start
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let client_child = std::process::Command::new(&args[0])
+            .arg("client")
+            .spawn()
+            .context("Failed to spawn client process")?;
+
+        // Wait for both processes to complete
+        server_child.wait_with_output()?;
+        client_child.wait_with_output()?;
+
+        Ok(())
+    } else {
+        match args[1].as_str() {
+            "server" => {
+                let listener = UtpSocket::new_udp_with_opts(server_addr, opts)
+                    .await
+                    .context("error creating socket")?;
+                let sock = listener.accept().await.context("error accepting")?;
+                receiver(sock).await.context("error running receiver")
+            }
+            "client" => {
+                let client = UtpSocket::new_udp_with_opts(client_addr, opts)
+                    .await
+                    .context("error creating socket")?;
+                let sock = timeout(TIMEOUT, client.connect(server_addr))
+                    .await
+                    .context("timeout connecting")?
+                    .context("error connecting")?;
+                sender(sock).await.context("error running sender")
+            }
+            _ => bail!("Invalid argument. Use 'server' or 'client'"),
         }
-        .instrument(error_span!("sender"))
-        .map(|v| v.context("sender died")),
-    );
-
-    let server = tokio::spawn(
-        async move {
-            let sock = listener.accept().await.context("error accepting")?;
-            receiver(sock).await.context("error running receiver")
-        }
-        .instrument(error_span!("receiver"))
-        .map(|v| v.context("receiver died")),
-    );
-
-    try_join!(flatten(client), flatten(server))?;
-    Ok(())
+    }
 }
