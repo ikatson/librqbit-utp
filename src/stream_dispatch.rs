@@ -14,7 +14,6 @@ use tracing::{debug, error_span, trace, warn, Level};
 use crate::{
     congestion::CongestionController,
     constants::{ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, UTP_HEADER_SIZE},
-    fragment_tx::FragmentedTx,
     message::UtpMessage,
     raw::{Type, UtpHeader},
     rtte::RttEstimator,
@@ -23,6 +22,7 @@ use crate::{
     stream::UtpStream,
     stream_rx::{AssemblerAddRemoveResult, UserRx},
     stream_tx::{UserTx, UtpStreamWriteHalf},
+    stream_tx_segments::Segments,
     traits::{Transport, UtpEnvironment},
     utils::{
         log_before_and_after_if_changed, spawn_print_error, update_optional_waker,
@@ -201,7 +201,7 @@ struct VirtualSocket<T, Env> {
     last_remote_timestamp_instant: Instant,
     last_remote_window: u32,
 
-    // Next sequence number to use when fragmenting user input.
+    // Next sequence number to use when segmenting user input.
     next_seq_nr: SeqNr,
 
     // The last seq_nr we told the other end about.
@@ -219,19 +219,18 @@ struct VirtualSocket<T, Env> {
     //
     // TODO: make bounded
     rx: UnboundedReceiver<UtpMessage>,
-
-    // Unacked fragments. Ready to send or retransmit.
-    fragmented_tx: FragmentedTx,
-
     user_rx: UserRx,
 
     // Last received ACK for fast retransmit
     local_rx_last_ack: Option<SeqNr>,
     local_rx_dup_acks: u8,
 
-    // The user ppayload that we haven't yet fragmented into uTP messages.
+    // The user ppayload that we haven't yet segmented into uTP messages.
     // This is what "UtpStream::poll_write" writes to.
     user_tx: Arc<UserTx>,
+    // Unacked segments. Ready to send or retransmit.
+    user_tx_segments: Segments,
+
     rtte: RttEstimator,
     congestion_controller: Box<dyn CongestionController>,
 
@@ -308,7 +307,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         cx: &mut std::task::Context<'_>,
         socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<()> {
-        if self.fragmented_tx.is_empty() {
+        if self.user_tx_segments.is_empty() {
             return Ok(());
         }
 
@@ -322,7 +321,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let mut recv_wnd = self.effective_remote_receive_window();
 
         // Send only the stuff we haven't sent yet, up to sender's window.
-        for item in self.fragmented_tx.iter() {
+        for item in self.user_tx_segments.iter() {
             // Re-delivery - don't send until retransmission happens (it will rewind elf.last_sent_seq_nr).
             let already_sent = item.seq_nr() - self.last_sent_seq_nr <= 0;
             if already_sent {
@@ -409,7 +408,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn maybe_prepare_for_retransmission(&mut self) {
         if let Some(expired_delay) = self.timers.retransmit.should_retransmit(self.this_poll.now) {
             let rewind_to = self
-                .fragmented_tx
+                .user_tx_segments
                 .first_seq_nr()
                 .or_else(|| self.state.our_fin_if_unacked())
                 .map(|rw| rw - 1);
@@ -555,7 +554,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         (self.last_remote_window as usize).min(self.congestion_controller.window())
     }
 
-    fn fragment_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
+    fn split_tx_queue_into_segments(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> anyhow::Result<()> {
         let mut g = self.user_tx.locked.lock();
 
         if g.buffer().is_empty() {
@@ -578,7 +580,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         let tx_offset = self
-            .fragmented_tx
+            .user_tx_segments
             .iter()
             .last()
             .map(|item| item.payload_offset() + item.payload_size())
@@ -596,9 +598,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.congestion_controller.pre_transmit(self.this_poll.now);
         let mut remote_window_remaining = self
             .effective_remote_receive_window()
-            .saturating_sub(self.fragmented_tx.total_len_bytes());
+            .saturating_sub(self.user_tx_segments.total_len_bytes());
 
-        while !self.fragmented_tx.is_full() && remaining > 0 && remote_window_remaining > 0 {
+        while !self.user_tx_segments.is_full() && remaining > 0 && remote_window_remaining > 0 {
             let max_payload_size = self
                 .socket_opts
                 .max_outgoing_payload_size
@@ -609,7 +611,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // Run Nagle algorithm to prevent sending too many small segments.
             {
                 let can_send_full_payload = payload_size == max_payload_size;
-                let data_in_flight = !self.fragmented_tx.is_empty();
+                let data_in_flight = !self.user_tx_segments.is_empty();
 
                 if self.socket_opts.nagle && !can_send_full_payload && data_in_flight {
                     trace!(payload_size, max_payload_size, "nagle: buffering more data");
@@ -617,12 +619,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
-            if !self.fragmented_tx.enqueue(self.next_seq_nr, payload_size) {
-                bail!("bug, can't enqueue next fragment")
+            if !self
+                .user_tx_segments
+                .enqueue(self.next_seq_nr, payload_size)
+            {
+                bail!("bug, can't enqueue next segment")
             }
             remaining -= payload_size;
             remote_window_remaining -= payload_size;
-            trace!(bytes = payload_size, "fragmented");
+            trace!(bytes = payload_size, "segmented");
             self.next_seq_nr += 1;
         }
 
@@ -717,7 +722,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         );
 
         // Remove everything from tx_buffer that was acked by this message.
-        let (removed_headers, removed_bytes) = self.fragmented_tx.remove_up_to_ack(&msg.header);
+        let (removed_headers, removed_bytes) = self.user_tx_segments.remove_up_to_ack(&msg.header);
         if removed_headers > 0 {
             let mut g = self.user_tx.locked.lock();
             g.truncate_front(removed_bytes);
@@ -1130,7 +1135,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
             rx,
-            fragmented_tx: FragmentedTx::new(),
+            user_tx_segments: Segments::new(),
             local_rx_last_ack: None,
             local_rx_dup_acks: 0,
             user_tx,
@@ -1342,8 +1347,7 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
 
             this.maybe_prepare_for_retransmission();
 
-            // Fragment data sent by user
-            bail_if_cannot_send!(this.fragment_tx_queue(cx));
+            bail_if_cannot_send!(this.split_tx_queue_into_segments(cx));
 
             // (Re)send tx queue.
             bail_if_cannot_send!(this.send_tx_queue(cx, socket));
@@ -2129,7 +2133,7 @@ mod tests {
 
         // Enable Nagle (should be on by default, but let's be explicit)
         t.vsock.socket_opts.nagle = true;
-        // Set a large max payload size to ensure we're testing Nagle, not fragmentation
+        // Set a large max payload size to ensure we're testing Nagle, not segmentation
         t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(1024).unwrap();
 
         // Allow sending by setting window size
@@ -2168,10 +2172,13 @@ mod tests {
         t.poll_once_assert_pending().await;
         assert_eq!(t.take_sent().len(), 0);
 
-        // As debugging, ensure we did not even fragment the new packets yet.
-        assert_eq!(t.vsock.fragmented_tx.total_len_packets(), 1);
-        assert_eq!(t.vsock.fragmented_tx.total_len_bytes(), 1);
-        assert_eq!(t.vsock.fragmented_tx.first_seq_nr().unwrap(), first_seq_nr);
+        // As debugging, ensure we did not even segment the new packets yet.
+        assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
+        assert_eq!(t.vsock.user_tx_segments.total_len_bytes(), 1);
+        assert_eq!(
+            t.vsock.user_tx_segments.first_seq_nr().unwrap(),
+            first_seq_nr
+        );
 
         trace!("Acknowledge first packet");
         t.send_msg(
@@ -2186,8 +2193,8 @@ mod tests {
         );
         t.poll_once_assert_pending().await;
 
-        assert_eq!(t.vsock.fragmented_tx.total_len_packets(), 1);
-        assert_eq!(t.vsock.fragmented_tx.total_len_bytes(), 2);
+        assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
+        assert_eq!(t.vsock.user_tx_segments.total_len_bytes(), 2);
 
         // After ACK, buffered data should be sent as one packet
         let sent = t.take_sent();
@@ -2683,7 +2690,7 @@ mod tests {
         assert!(sent.len() == 2, "Should have sent 2 packets");
         assert_eq!(sent[0].payload(), b"hello");
         assert_eq!(sent[1].payload(), b"world");
-        assert_eq!(t.vsock.fragmented_tx.total_len_packets(), 2);
+        assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 2);
 
         let first_seq_nr = sent[0].header.seq_nr;
 
@@ -2700,7 +2707,7 @@ mod tests {
         t.send_msg(header, "");
         t.poll_once_assert_pending().await;
         assert_eq!(t.vsock.local_rx_dup_acks, 0);
-        assert_eq!(t.vsock.fragmented_tx.total_len_packets(), 1);
+        assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
 
         // Change to ST_DATA with same ACK - shouldn't count as duplicate
         header.htype = Type::ST_DATA;
@@ -2708,14 +2715,14 @@ mod tests {
         t.send_msg(header, "a");
         t.poll_once_assert_pending().await;
         assert_eq!(t.vsock.local_rx_dup_acks, 0);
-        assert_eq!(t.vsock.fragmented_tx.total_len_packets(), 1);
+        assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
 
         // Another ST_DATA - shouldn't count
         header.seq_nr += 1;
         t.send_msg(header, "b");
         t.poll_once_assert_pending().await;
         assert_eq!(t.vsock.local_rx_dup_acks, 0);
-        assert_eq!(t.vsock.fragmented_tx.total_len_packets(), 1);
+        assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
 
         // ST_FIN with same ACK - shouldn't count
         header.htype = Type::ST_FIN;
@@ -2726,7 +2733,7 @@ mod tests {
 
         // Duplicate ACK count should be 0 since non-ST_STATE packets don't count
         assert_eq!(t.vsock.local_rx_dup_acks, 0);
-        assert_eq!(t.vsock.fragmented_tx.total_len_packets(), 1);
+        assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
         let sent = t.take_sent();
         assert_eq!(
             sent.len(),

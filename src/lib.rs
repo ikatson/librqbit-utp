@@ -22,7 +22,6 @@
 
 mod congestion;
 mod constants;
-mod fragment_tx;
 mod message;
 pub mod raw;
 mod rtte;
@@ -32,6 +31,7 @@ mod stream;
 mod stream_dispatch;
 mod stream_rx;
 mod stream_tx;
+mod stream_tx_segments;
 #[cfg(test)]
 mod test_util;
 mod traits;
