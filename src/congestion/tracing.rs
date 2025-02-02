@@ -1,8 +1,11 @@
 use std::time::Instant;
 
-use tracing::{trace, Level};
+use tracing::trace;
 
-use crate::{rtte::RttEstimator, utils::log_before_and_after_if_changed};
+use crate::{
+    constants::CONGESTION_TRACING_LOG_LEVEL, rtte::RttEstimator,
+    utils::log_before_and_after_if_changed,
+};
 
 use super::CongestionController;
 
@@ -36,7 +39,7 @@ where
             self,
             |s| s.inner,
             |s| s.inner.on_ack(now, len, rtt),
-            |_, _| Level::TRACE,
+            |_, _| CONGESTION_TRACING_LOG_LEVEL,
         )
     }
 
@@ -46,7 +49,7 @@ where
             self,
             |s| s.inner,
             |s| s.inner.on_retransmit(now),
-            |_, _| Level::TRACE,
+            |_, _| CONGESTION_TRACING_LOG_LEVEL,
         )
     }
 
@@ -56,7 +59,7 @@ where
             self,
             |s| s.inner,
             |s| s.inner.on_duplicate_ack(now),
-            |_, _| Level::TRACE,
+            |_, _| CONGESTION_TRACING_LOG_LEVEL,
         )
     }
 
@@ -66,7 +69,7 @@ where
             self,
             |s| s.inner,
             |s| s.inner.pre_transmit(now),
-            |_, _| Level::TRACE,
+            |_, _| CONGESTION_TRACING_LOG_LEVEL,
         )
     }
 

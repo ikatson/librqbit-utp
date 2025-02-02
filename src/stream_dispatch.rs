@@ -13,7 +13,10 @@ use tracing::{debug, error_span, trace, warn, Level};
 
 use crate::{
     congestion::CongestionController,
-    constants::{ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, UTP_HEADER_SIZE},
+    constants::{
+        ACK_DELAY, CHALLENGE_ACK_RATELIMIT, IMMEDIATE_ACK_EVERY, RTTE_TRACING_LOG_LEVEL,
+        UTP_HEADER_SIZE,
+    },
     message::UtpMessage,
     raw::{Type, UtpHeader},
     rtte::RttEstimator,
@@ -447,7 +450,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 &mut self.rtte,
                 |r| r.retransmission_timeout(),
                 |r| r.on_retransmit(),
-                |_, _| Level::DEBUG,
+                |_, _| RTTE_TRACING_LOG_LEVEL,
             );
 
             // Inform the congestion controller that we're retransmitting.
@@ -753,11 +756,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // Update RTO
             if let Some(rtt) = on_ack_result.new_rtt {
                 log_before_and_after_if_changed(
-                    "rtte:on_ack",
+                    "rtte:sample",
                     self,
                     |s| s.rtte.retransmission_timeout(),
                     |s| s.rtte.sample(rtt),
-                    |_, _| Level::TRACE,
+                    |_, _| RTTE_TRACING_LOG_LEVEL,
                 );
             }
 

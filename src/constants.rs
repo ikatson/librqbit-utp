@@ -3,6 +3,8 @@
 
 use std::time::Duration;
 
+use tracing::Level;
+
 pub const IPV4_HEADER: usize = 20;
 pub const MIN_UDP_HEADER: usize = 8;
 pub const UTP_HEADER_SIZE: usize = 20;
@@ -22,4 +24,5 @@ pub const IMMEDIATE_ACK_EVERY: isize = 5;
 
 pub const WRAP_TOLERANCE: u16 = 1024;
 
-// pub const GRACEFUL_TERMINATION_TIMEOUT: Duration = Duration::from_secs(1);
+pub const CONGESTION_TRACING_LOG_LEVEL: Level = Level::DEBUG;
+pub const RTTE_TRACING_LOG_LEVEL: Level = Level::DEBUG;
