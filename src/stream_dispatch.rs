@@ -9,7 +9,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use tokio::{sync::mpsc::UnboundedReceiver, time::Sleep};
-use tracing::{debug, error_span, event, trace, warn, Level};
+use tracing::{debug, error_span, trace, warn, Level};
 
 use crate::{
     congestion::CongestionController,
@@ -431,7 +431,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             };
 
             // If a retransmit timer expired, we should resend data starting at the last ACK.
-            event!(CONGESTION_TRACING_LOG_LEVEL, ?expired_delay, ?rewind_to, ?self.last_sent_seq_nr, "retransmitting");
+            log_every_ms!(100, CONGESTION_TRACING_LOG_LEVEL, ?expired_delay, ?rewind_to, ?self.last_sent_seq_nr, "retransmitting");
 
             // Rewind "last sequence number sent", as if we never
             // had sent them. This will cause all data in the queue
