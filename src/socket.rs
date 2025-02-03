@@ -11,7 +11,7 @@ use std::{
 };
 
 use rustc_hash::FxHashMap as HashMap;
-use tokio_util::sync::{CancellationToken, DropGuard};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     congestion::CongestionController,
@@ -633,7 +633,6 @@ pub struct UtpSocket<T, E> {
     opts: ValidatedSocketOpts,
 
     pub(crate) cancellation_token: CancellationToken,
-    _cancellation_token_drop_guard: DropGuard,
 }
 
 impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
@@ -696,7 +695,6 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             env: env.copy(),
             accept_requests: accept_tx,
             cancellation_token: opts.cancellation_token.clone(),
-            _cancellation_token_drop_guard: opts.cancellation_token.drop_guard(),
         });
 
         let dispatcher = Dispatcher {

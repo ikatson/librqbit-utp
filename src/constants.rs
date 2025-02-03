@@ -24,5 +24,5 @@ pub const IMMEDIATE_ACK_EVERY: isize = 5;
 
 pub const WRAP_TOLERANCE: u16 = 1024;
 
-pub const CONGESTION_TRACING_LOG_LEVEL: Level = Level::WARN;
-pub const RTTE_TRACING_LOG_LEVEL: Level = Level::WARN;
+pub const CONGESTION_TRACING_LOG_LEVEL: Level = Level::TRACE;
+pub const RTTE_TRACING_LOG_LEVEL: Level = Level::TRACE;
