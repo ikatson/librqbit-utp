@@ -38,6 +38,7 @@ pub mod raw;
 mod rtte;
 mod seq_nr;
 mod socket;
+mod spawn_utils;
 mod stream;
 mod stream_dispatch;
 mod stream_rx;

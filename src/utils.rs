@@ -1,22 +1,8 @@
-use std::{cmp::Ordering, collections::VecDeque, future::Future, task::Waker};
+use std::{cmp::Ordering, collections::VecDeque, task::Waker};
 
 use anyhow::bail;
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
-use tracing::{error, info, trace, warn, Instrument, Level};
-
-pub fn spawn_print_error(
-    span: tracing::Span,
-    f: impl Future<Output = anyhow::Result<()>> + Send + 'static,
-) {
-    tokio::spawn(
-        async move {
-            if let Err(e) = f.await {
-                tracing::debug!("error: {e:#}");
-            }
-        }
-        .instrument(span),
-    );
-}
+use tracing::{error, info, trace, warn, Level};
 
 pub fn update_optional_waker(waker: &mut Option<Waker>, cx: &std::task::Context<'_>) {
     match waker.as_mut() {

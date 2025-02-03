@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use tokio::{sync::mpsc::UnboundedReceiver, time::Sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error_span, trace, warn, Level};
 
 use crate::{
@@ -22,15 +23,13 @@ use crate::{
     rtte::RttEstimator,
     seq_nr::SeqNr,
     socket::{ControlRequest, ValidatedSocketOpts},
+    spawn_utils::spawn_with_cancel,
     stream::UtpStream,
     stream_rx::{AssemblerAddRemoveResult, UserRx},
     stream_tx::{UserTx, UtpStreamWriteHalf},
     stream_tx_segments::Segments,
     traits::{Transport, UtpEnvironment},
-    utils::{
-        log_before_and_after_if_changed, spawn_print_error, update_optional_waker,
-        DropGuardSendBeforeDeath,
-    },
+    utils::{log_before_and_after_if_changed, update_optional_waker, DropGuardSendBeforeDeath},
     UtpSocket,
 };
 
@@ -1090,6 +1089,7 @@ pub(crate) struct UtpStreamStarter<T, E> {
     stream: UtpStream,
     vsock: VirtualSocket<T, E>,
     first_packet: Option<UtpHeader>,
+    cancellation_token: CancellationToken,
 }
 
 impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
@@ -1098,6 +1098,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             stream,
             vsock,
             first_packet,
+            cancellation_token,
         } = self;
 
         let span = match vsock.parent_span.clone() {
@@ -1105,7 +1106,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             None => error_span!(parent: None, "utp_stream", conn_id_send = ?vsock.conn_id_send),
         };
 
-        spawn_print_error(span, vsock.run_forever(first_packet));
+        spawn_with_cancel(span, cancellation_token, vsock.run_forever(first_packet));
         stream
     }
 
@@ -1142,14 +1143,15 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
         let env = socket.env.copy();
         let now = env.now();
 
-        let socket_opts = socket.opts();
+        let cancellation_token = socket.cancellation_token.child_token();
 
         let vsock = VirtualSocket {
             state: VirtualSocketState::Established,
             env,
+            socket_opts: socket.opts().clone(),
+            congestion_controller: socket.opts().congestion.create(now),
             socket: Arc::downgrade(socket),
             socket_created: socket.created,
-            socket_opts: *socket_opts,
             remote,
             conn_id_send,
             timers: Timers {
@@ -1182,7 +1184,6 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 tmp_buf: vec![0u8; socket.opts().max_incoming_packet_size.get()],
                 transport_pending: false,
             },
-            congestion_controller: socket_opts.congestion.create(now),
             parent_span,
             drop_guard: DropGuardSendBeforeDeath::new(
                 ControlRequest::Shutdown((remote, conn_id_recv)),
@@ -1205,6 +1206,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             stream,
             vsock,
             first_packet,
+            cancellation_token,
         }
     }
 

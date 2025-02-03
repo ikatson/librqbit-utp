@@ -11,8 +11,8 @@ use std::{
 };
 
 use rustc_hash::FxHashMap as HashMap;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
-use crate::UtpStream;
 use crate::{
     congestion::CongestionController,
     constants::{
@@ -24,8 +24,9 @@ use crate::{
     seq_nr::SeqNr,
     stream_dispatch::{StreamArgs, UtpStreamStarter},
     traits::{DefaultUtpEnvironment, Transport, UtpEnvironment},
-    utils::{spawn_print_error, DropGuardSendBeforeDeath},
+    utils::DropGuardSendBeforeDeath,
 };
+use crate::{spawn_utils::spawn_with_cancel, UtpStream};
 use anyhow::{bail, Context};
 use tokio::sync::{
     mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender},
@@ -40,14 +41,14 @@ type StreamRecvKey = (SocketAddr, ConnectionId);
 
 const DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK: usize = 1024 * 1024;
 
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub enum CongestionControllerKind {
     Reno,
     #[default]
     Cubic,
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct CongestionConfig {
     pub kind: CongestionControllerKind,
     pub tracing: bool,
@@ -70,7 +71,7 @@ impl CongestionConfig {
     }
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct SocketOpts {
     // The MTU to base calculations on.
     pub mtu: Option<usize>,
@@ -92,6 +93,9 @@ pub struct SocketOpts {
     pub disable_nagle: bool,
 
     pub congestion: CongestionConfig,
+
+    pub parent_span: Option<tracing::Span>,
+    pub cancellation_token: CancellationToken,
 }
 
 impl SocketOpts {
@@ -172,7 +176,7 @@ impl SocketOpts {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct ValidatedSocketOpts {
     pub max_incoming_packet_size: NonZeroUsize,
     pub max_outgoing_payload_size: NonZeroUsize,
@@ -627,6 +631,9 @@ pub struct UtpSocket<T, E> {
 
     local_addr: SocketAddr,
     opts: ValidatedSocketOpts,
+
+    pub(crate) cancellation_token: CancellationToken,
+    _cancellation_token_drop_guard: DropGuard,
 }
 
 impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
@@ -657,9 +664,17 @@ impl UtpSocketUdp {
 
 impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     pub fn new_with_opts(transport: T, env: Env, opts: SocketOpts) -> anyhow::Result<Arc<Self>> {
+        let parent_span = opts.parent_span.clone();
         let (sock, dispatcher) = Self::new_with_opts_and_dispatcher(transport, env, opts)?;
-        spawn_print_error(
-            error_span!("utp_socket", addr=?sock.transport.bind_addr()),
+        let span = match parent_span {
+            Some(parent) => {
+                error_span!(parent: parent, "utp_socket", addr=?sock.transport.bind_addr())
+            }
+            None => error_span!("utp_socket", addr=?sock.transport.bind_addr()),
+        };
+        spawn_with_cancel(
+            span,
+            sock.cancellation_token.clone(),
             dispatcher.run_forever(),
         );
         Ok(sock)
@@ -670,7 +685,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         env: Env,
         opts: SocketOpts,
     ) -> anyhow::Result<(Arc<Self>, Dispatcher<T, Env>)> {
-        let opts = opts.validate().context("error validating socket options")?;
+        let validated_opts = opts.validate().context("error validating socket options")?;
         let sock = transport;
         let local_addr = sock.bind_addr();
 
@@ -682,9 +697,11 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             created: env.now(),
             control_requests: control_tx,
             local_addr,
-            opts,
+            opts: validated_opts,
             env: env.copy(),
             accept_requests: accept_tx,
+            cancellation_token: opts.cancellation_token.clone(),
+            _cancellation_token_drop_guard: opts.cancellation_token.drop_guard(),
         });
 
         let dispatcher = Dispatcher {
