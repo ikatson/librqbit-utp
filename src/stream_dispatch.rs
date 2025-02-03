@@ -1412,7 +1412,7 @@ mod tests {
 
     use futures::FutureExt;
     use tokio::{
-        io::{AsyncWrite, AsyncWriteExt},
+        io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
         sync::mpsc::{unbounded_channel, UnboundedSender},
     };
     use tracing::trace;
@@ -3122,6 +3122,104 @@ mod tests {
             t.take_sent().len(),
             0,
             "Should not retransmit after both packets acknowledged"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_st_reset_error_propagation() {
+        setup_test_logging();
+        let mut t = make_test_vsock(Default::default());
+
+        let (mut reader, _writer) = t.stream.take().unwrap().split();
+
+        // Send a RESET packet
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_RESET,
+                seq_nr: 1.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Process the RESET packet
+        let _ = t.poll_once().await;
+
+        // Try to read - should get an error containing "ST_RESET"
+        let read_result = reader.read(&mut [0u8; 1024]).await;
+        assert!(
+            read_result.is_err(),
+            "Read should fail after receiving RESET"
+        );
+        let err = read_result.unwrap_err();
+        assert!(
+            err.to_string().contains("ST_RESET"),
+            "Error should mention ST_RESET: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fin_sent_when_both_halves_dropped() {
+        setup_test_logging();
+        let mut t = make_test_vsock(Default::default());
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        let (reader, mut writer) = t.stream.take().unwrap().split();
+
+        // Write some data
+        writer.write_all(b"hello").await.unwrap();
+        t.poll_once_assert_pending().await;
+
+        // Data should be sent
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
+        assert_eq!(sent[0].payload(), b"hello");
+        let data_seq_nr = sent[0].header.seq_nr;
+
+        // Acknowledge the data
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: data_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+
+        // Drop both halves - this should trigger sending FIN
+        drop(reader);
+        drop(writer);
+
+        // Next poll should send FIN
+        let result = t.poll_once().await;
+        assert!(
+            matches!(result, Poll::Ready(Ok(()))),
+            "Socket should complete immediately after both halves dropped"
+        );
+
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "Should send FIN after both halves dropped");
+        assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
+        assert_eq!(
+            sent[0].header.seq_nr.0,
+            data_seq_nr.0 + 1,
+            "FIN should use next sequence number"
         );
     }
 }
