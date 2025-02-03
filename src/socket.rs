@@ -778,7 +778,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
                 if sz != buf.len() {
                     warn!(
                         actual_len = sz,
-                        expectedlen = buf.len(),
+                        expected_len = buf.len(),
                         "sent a broken packet"
                     );
                 }
@@ -791,7 +791,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
                 );
             }
             Poll::Pending => {
-                debug!("UDP socket full, could not send packet");
+                debug_every_ms!(500, "UDP socket full, could not send packet");
                 return Ok(true);
             }
         }

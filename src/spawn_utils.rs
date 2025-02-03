@@ -1,6 +1,6 @@
 use anyhow::bail;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, trace, Instrument};
+use tracing::{debug, warn, Instrument};
 
 #[derive(Debug)]
 struct CancelledError {}
@@ -18,25 +18,25 @@ pub fn spawn(
     fut: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
     let fut = async move {
-        trace!("started");
+        debug!("started");
         tokio::pin!(fut);
         let mut trace_interval = tokio::time::interval(std::time::Duration::from_secs(5));
 
         loop {
             tokio::select! {
                 _ = trace_interval.tick() => {
-                    trace!("still running");
+                    debug!("still running");
                 },
                 r = &mut fut => {
                     match r {
                         Ok(_) => {
-                            trace!("finished");
+                            debug!("finished");
                         }
                         Err(e) => {
                             if e.is::<CancelledError>() {
                                 debug!("task cancelled")
                             } else {
-                                error!("finished with error: {:#}", e)
+                                warn!("finished with error: {:#}", e)
                             }
 
                         }
