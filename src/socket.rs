@@ -1,6 +1,6 @@
 use std::{
     collections::{hash_map::Entry, VecDeque},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -16,8 +16,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     congestion::CongestionController,
     constants::{
-        DEFAULT_CONSERVATIVE_OUTGOING_MTU, DEFAULT_INCOMING_MTU, IPV4_HEADER, MIN_UDP_HEADER,
-        UTP_HEADER_SIZE,
+        DEFAULT_CONSERVATIVE_OUTGOING_MTU, DEFAULT_INCOMING_MTU, DEFAULT_MAX_OUT_OF_ORDER_PACKETS,
+        DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK, DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK,
+        DEFAULT_MTU_AUTODETECT_IP, IPV4_HEADER, MIN_UDP_HEADER, UTP_HEADER_SIZE,
     },
     message::UtpMessage,
     raw::{Type, UtpHeader},
@@ -38,8 +39,6 @@ type ConnectionId = SeqNr;
 
 // When we get incoming packets this connection id is used to pick the stream.
 type StreamRecvKey = (SocketAddr, ConnectionId);
-
-const DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK: usize = 1024 * 1024;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub enum CongestionControllerKind {
@@ -136,7 +135,7 @@ impl SocketOpts {
             None => {
                 let autodetect_host = self
                     .mtu_autodetect_host
-                    .unwrap_or(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)));
+                    .unwrap_or(DEFAULT_MTU_AUTODETECT_IP);
                 match ::mtu::interface_and_mtu(autodetect_host) {
                     Ok((iface, mtu)) => {
                         trace!(?autodetect_host, iface, mtu, "autodetected MTU");
@@ -157,12 +156,15 @@ impl SocketOpts {
             NonZeroUsize::new(self.rx_bufsize.unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK))
                 .context("max_user_rx_buffered_bytes = 0. Increase rx_bufsize")?;
 
-        let max_rx_out_of_order_packets =
-            NonZeroUsize::new(self.max_rx_out_of_order_packets.unwrap_or(64))
-                .context("invalid configuration: virtual_socket_tx_packets = 0")?;
+        let max_rx_out_of_order_packets = NonZeroUsize::new(
+            self.max_rx_out_of_order_packets
+                .unwrap_or(DEFAULT_MAX_OUT_OF_ORDER_PACKETS),
+        )
+        .context("invalid configuration: virtual_socket_tx_packets = 0")?;
 
-        let virtual_socket_tx_bytes = NonZeroUsize::new(self.tx_bytes.unwrap_or(1024 * 1024))
-            .context("invalid configuration: virtual_socket_tx_bytes = 0")?;
+        let virtual_socket_tx_bytes =
+            NonZeroUsize::new(self.tx_bytes.unwrap_or(DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK))
+                .context("invalid configuration: virtual_socket_tx_bytes = 0")?;
 
         Ok(ValidatedSocketOpts {
             max_incoming_packet_size: incoming.max_packet_size,
