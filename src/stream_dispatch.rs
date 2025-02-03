@@ -15,8 +15,8 @@ use tracing::{debug, error_span, trace, warn, Level};
 use crate::{
     congestion::CongestionController,
     constants::{
-        ACK_DELAY, CHALLENGE_ACK_RATELIMIT, CONGESTION_TRACING_LOG_LEVEL, IMMEDIATE_ACK_EVERY,
-        RTTE_TRACING_LOG_LEVEL, UTP_HEADER_SIZE,
+        ACK_DELAY, CONGESTION_TRACING_LOG_LEVEL, IMMEDIATE_ACK_EVERY, RTTE_TRACING_LOG_LEVEL,
+        UTP_HEADER_SIZE,
     },
     message::UtpMessage,
     raw::{Type, UtpHeader},
@@ -509,25 +509,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.send_control_packet(cx, socket, header)
     }
 
-    fn send_challenge_ack(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T, Env>,
-    ) -> anyhow::Result<bool> {
-        if self.this_poll.now < self.timers.challenge_ack_timer {
-            return Ok(false);
-        }
-
-        // Rate-limit to 1 per second max.
-        if self.send_ack(cx, socket)? {
-            trace!("sending challenge ACK");
-            self.timers.challenge_ack_timer = self.this_poll.now + CHALLENGE_ACK_RATELIMIT;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
     fn maybe_send_fin(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -806,7 +787,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         %self.last_consumed_remote_seq_nr,
                         "dropping message, we already ACKed it"
                     );
-                    self.send_challenge_ack(cx, socket)?;
                     return Ok(());
                 }
 
@@ -1157,7 +1137,6 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             timers: Timers {
                 retransmit: RetransmitTimer::new(),
                 sleep: Box::pin(tokio::time::sleep(Duration::from_secs(0))),
-                challenge_ack_timer: now - CHALLENGE_ACK_RATELIMIT,
                 ack_delay_timer: AckDelayTimer::Idle,
             },
             last_remote_timestamp,
@@ -1235,9 +1214,6 @@ struct Timers {
     sleep: Pin<Box<Sleep>>,
     retransmit: RetransmitTimer,
     ack_delay_timer: AckDelayTimer,
-
-    /// Used for rate-limiting: No more challenge ACKs will be sent until this instant.
-    challenge_ack_timer: Instant,
 }
 
 impl RetransmitTimer {

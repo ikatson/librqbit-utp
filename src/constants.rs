@@ -29,8 +29,6 @@ pub const DEFAULT_CONSERVATIVE_OUTGOING_MTU: usize = 1280;
 
 // Delayed ACK timer
 pub const ACK_DELAY: Duration = Duration::from_millis(10);
-// How often to send immediate ACKs for out of order packets.
-pub const CHALLENGE_ACK_RATELIMIT: Duration = Duration::from_secs(1);
 
 pub const IMMEDIATE_ACK_EVERY: isize = 5;
 
