@@ -1,4 +1,4 @@
-use std::{pin::Pin, task::Poll};
+use std::{net::SocketAddr, pin::Pin, task::Poll};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -9,11 +9,24 @@ pub type UtpStreamUdp = UtpStream;
 pub struct UtpStream {
     reader: UtpStreamReadHalf,
     writer: UtpStreamWriteHalf,
+    remote_addr: SocketAddr,
 }
 
 impl UtpStream {
-    pub(crate) fn new(reader: UtpStreamReadHalf, writer: UtpStreamWriteHalf) -> Self {
-        Self { reader, writer }
+    pub(crate) fn new(
+        reader: UtpStreamReadHalf,
+        writer: UtpStreamWriteHalf,
+        remote_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            reader,
+            writer,
+            remote_addr,
+        }
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.remote_addr
     }
 
     pub fn split(

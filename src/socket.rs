@@ -94,7 +94,7 @@ pub struct SocketOpts {
 
     pub congestion: CongestionConfig,
 
-    pub parent_span: Option<tracing::Span>,
+    pub parent_span: Option<tracing::Id>,
     pub cancellation_token: CancellationToken,
 }
 
@@ -666,12 +666,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     pub fn new_with_opts(transport: T, env: Env, opts: SocketOpts) -> anyhow::Result<Arc<Self>> {
         let parent_span = opts.parent_span.clone();
         let (sock, dispatcher) = Self::new_with_opts_and_dispatcher(transport, env, opts)?;
-        let span = match parent_span {
-            Some(parent) => {
-                error_span!(parent: parent, "utp_socket", addr=?sock.transport.bind_addr())
-            }
-            None => error_span!("utp_socket", addr=?sock.transport.bind_addr()),
-        };
+        let span = error_span!(parent: parent_span, "utp_socket", addr=?sock.transport.bind_addr());
         spawn_with_cancel(
             span,
             sock.cancellation_token.clone(),

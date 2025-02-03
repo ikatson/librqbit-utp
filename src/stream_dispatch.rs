@@ -1201,7 +1201,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             None
         };
 
-        let stream = UtpStream::new(read_half, write_half);
+        let stream = UtpStream::new(read_half, write_half, vsock.remote);
         UtpStreamStarter {
             stream,
             vsock,
