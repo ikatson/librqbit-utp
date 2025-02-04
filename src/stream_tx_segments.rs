@@ -9,8 +9,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tracing::debug;
-
 use crate::{raw::UtpHeader, seq_nr::SeqNr};
 
 #[derive(Clone, Copy)]
@@ -42,7 +40,9 @@ pub struct Segments {
     segments: VecDeque<Segment>,
     len_bytes: usize,
     capacity: usize,
-    first_seq_nr: Option<SeqNr>,
+
+    // Names are the same as in https://datatracker.ietf.org/doc/html/rfc9293#section-3.3.1
+    snd_una: SeqNr,
 }
 
 pub struct SegmentIterItem<'a> {
@@ -91,24 +91,24 @@ impl core::fmt::Debug for OnAckResult {
 }
 
 impl Segments {
-    pub fn new() -> Self {
+    pub fn new(snd_una: SeqNr) -> Self {
         Segments {
             segments: VecDeque::new(),
             len_bytes: 0,
             capacity: 64,
-            first_seq_nr: None,
+            snd_una,
         }
     }
 
-    pub fn first_seq_nr(&self) -> Option<SeqNr> {
-        self.first_seq_nr
+    pub fn snd_next(&self) -> SeqNr {
+        self.snd_una + self.segments.len() as u16
     }
 
-    pub fn last_seq_nr(&self) -> Option<SeqNr> {
-        match (self.first_seq_nr, self.segments.back()) {
-            (Some(first), Some(_)) => Some(first + (self.segments.len() as u16) - 1),
-            (None, None) => None,
-            _ => panic!("code is very bugged"),
+    pub fn first_seq_nr(&self) -> Option<SeqNr> {
+        if self.segments.is_empty() {
+            None
+        } else {
+            Some(self.snd_una)
         }
     }
 
@@ -139,17 +139,9 @@ impl Segments {
     }
 
     #[must_use]
-    pub fn enqueue(&mut self, seq_nr: SeqNr, payload_len: usize) -> bool {
+    pub fn enqueue(&mut self, payload_len: usize) -> bool {
         if self.segments.len() == self.capacity {
             return false;
-        }
-        if let Some(last) = self.last_seq_nr() {
-            if seq_nr - last != 1 {
-                debug!(?seq_nr, last_seq_nr=?seq_nr, "can only enqueue incresing sequence numbers");
-                return false;
-            }
-        } else {
-            self.first_seq_nr = Some(seq_nr);
         }
         self.segments.push_back(Segment {
             payload_size: payload_len,
@@ -166,15 +158,10 @@ impl Segments {
         format!("headers: {}/{}", self.segments.len(), self.capacity)
     }
 
-    fn pop_front(&mut self) -> Option<Segment> {
+    fn ack_front(&mut self) -> Option<Segment> {
         let frag = self.segments.pop_front()?;
         self.len_bytes -= frag.payload_size;
-        if self.segments.is_empty() {
-            self.first_seq_nr = None;
-        } else {
-            // if this fails, it's a big bug
-            self.first_seq_nr = Some(self.first_seq_nr.unwrap() + 1);
-        }
+        self.snd_una += 1;
         Some(frag)
     }
 
@@ -185,11 +172,11 @@ impl Segments {
 
         let mut new_rtt: Option<Duration> = None;
 
-        while let Some(seq_nr) = self.first_seq_nr {
+        while let Some(seq_nr) = self.first_seq_nr() {
             if ack_header.ack_nr < seq_nr {
                 break;
             }
-            let segment = self.pop_front().unwrap();
+            let segment = self.ack_front().unwrap();
             segment.update_rtt(now, &mut new_rtt);
             removed += 1;
             payload_size += segment.payload_size;
@@ -233,7 +220,7 @@ impl Segments {
                     }
                     removed += 1;
                     payload_size += segment.payload_size;
-                    self.pop_front().unwrap();
+                    self.ack_front().unwrap();
                 }
             }
             _ => {}
@@ -254,7 +241,7 @@ impl Segments {
         }
         self.segments.iter_mut().scan(
             State {
-                seq_nr: self.first_seq_nr.unwrap_or(0.into()),
+                seq_nr: self.snd_una,
                 payload_offset: 0,
             },
             |state, segment| {
@@ -276,20 +263,14 @@ impl Segments {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use crate::{
-        raw::{selective_ack::SelectiveAck, UtpHeader},
-        seq_nr::SeqNr,
-    };
+    use crate::raw::{selective_ack::SelectiveAck, UtpHeader};
 
     use super::Segments;
 
     fn make_segmented_tx(start_seq_nr: u16, count: u16) -> Segments {
-        let mut ftx = Segments::new();
-
-        let start: SeqNr = start_seq_nr.into();
-        let end = start + count;
-        for seq_nr in start.0..end.0 {
-            assert!(ftx.enqueue(seq_nr.into(), 1));
+        let mut ftx = Segments::new(start_seq_nr.into());
+        for _ in 0..count {
+            assert!(ftx.enqueue(1));
         }
 
         ftx

@@ -200,9 +200,6 @@ struct VirtualSocket<T, Env> {
     last_remote_timestamp_instant: Instant,
     last_remote_window: u32,
 
-    // Next sequence number to use when segmenting user input.
-    next_seq_nr: SeqNr,
-
     // The last seq_nr we told the other end about.
     last_sent_seq_nr: SeqNr,
 
@@ -564,7 +561,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     "state",
                     &mut self.state,
                     |s| *s,
-                    |s| s.transition_to_fin_sent(self.next_seq_nr),
+                    |s| s.transition_to_fin_sent(self.user_tx_segments.snd_next()),
                     |_, _| Level::DEBUG,
                 );
                 if changed {
@@ -615,16 +612,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
-            if !self
-                .user_tx_segments
-                .enqueue(self.next_seq_nr, payload_size)
-            {
+            if !self.user_tx_segments.enqueue(payload_size) {
                 bail!("bug, can't enqueue next segment")
             }
             remaining -= payload_size;
             remote_window_remaining -= payload_size;
             trace!(bytes = payload_size, "segmented");
-            self.next_seq_nr += 1;
         }
 
         Ok(())
@@ -675,7 +668,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     //    receive any messages!
 
                     trace!("no more data. transitioning to FINISHED");
-                    self.state.transition_to_fin_sent(self.next_seq_nr);
+                    self.state
+                        .transition_to_fin_sent(self.user_tx_segments.snd_next());
                     self.maybe_send_fin(cx, socket)?;
                     self.state = VirtualSocketState::Finished;
                     return Ok(());
@@ -1153,13 +1147,12 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_remote_timestamp,
             last_remote_timestamp_instant: now,
             last_remote_window: remote_window,
-            next_seq_nr,
             last_sent_seq_nr,
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
             consumed_but_unacked_bytes: 0,
             rx,
-            user_tx_segments: Segments::new(),
+            user_tx_segments: Segments::new(next_seq_nr),
             local_rx_last_ack: None,
             local_rx_dup_acks: 0,
             user_tx,
@@ -2463,7 +2456,7 @@ mod tests {
 
         // Verify total data sent matches original write
         assert_eq!(
-            t.vsock.next_seq_nr.0 - first_seq_nr.0,
+            t.vsock.user_tx_segments.snd_next().0 - first_seq_nr.0,
             3, // 3 packets total
             "Should have split data into correct number of packets"
         );
