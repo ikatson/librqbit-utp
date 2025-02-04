@@ -210,6 +210,8 @@ struct VirtualSocket<T, Env> {
     // every packet. This must be <= last_consumed_remote_seq_nr.
     last_sent_ack_nr: SeqNr,
 
+    last_sent_window: u32,
+
     // How many bytes we have consumed but not sent an ACK yet.
     // Used for immediate ACKs on 2 * RMSS threshold.
     consumed_but_unacked_bytes: usize,
@@ -464,6 +466,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         // Each packet sent can act as ACK so update related state.
         self.last_sent_seq_nr = header.seq_nr;
         self.last_sent_ack_nr = header.ack_nr;
+        self.last_sent_window = header.wnd_size;
         self.consumed_but_unacked_bytes = 0;
         self.timers.reset_delayed_ack_timer();
     }
@@ -922,6 +925,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     /// Return whether to send ACK immediately due to the amount of unacknowledged data.
     /// https://datatracker.ietf.org/doc/html/rfc9293#section-3.8.6.3
     fn immediate_ack_to_transmit(&self) -> bool {
+        // if we need to send a window update, also send immediately.
+        // TODO: this is clumsy, but should do the job in case the reader was fully flow controlled.
+        if self.last_sent_window as usize <= self.socket_opts.max_incoming_payload_size.get()
+            && self.rx_window() > self.last_sent_window
+        {
+            trace!("need to send a window update");
+            return true;
+        }
+
         self.consumed_but_unacked_bytes >= 2 * self.socket_opts.max_incoming_payload_size.get()
     }
 
@@ -1160,6 +1172,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 &socket.control_requests,
             ),
             user_rx,
+            last_sent_window: 0,
         };
 
         let first_packet = if !is_outgoing {
@@ -3285,6 +3298,54 @@ mod tests {
             sent[0].header.seq_nr.0,
             data_seq_nr.0 + 1,
             "FIN should use next sequence number"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_window_update_ack_after_read() {
+        setup_test_logging();
+
+        // Configure socket with very small receive buffer to test flow control
+        let opts = SocketOpts {
+            rx_bufsize: Some(10), // Very small receive buffer
+            ..Default::default()
+        };
+
+        let mut t = make_test_vsock(opts);
+
+        // Fill up the receive buffer
+        t.send_data(1, "first");
+        t.send_data(2, "second");
+        t.poll_once_assert_pending().await;
+
+        // Verify window is now 0
+        assert_eq!(t.vsock.rx_window(), 0);
+
+        // At least as part of delayed ACK, ensure we send back 0 window
+        t.env.increment_now(Duration::from_secs(1));
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert!(!sent.is_empty(), "Should have sent ACKs");
+        let last_window = sent.last().unwrap().header.wnd_size;
+        assert_eq!(last_window, 0, "Window should be zero when buffer full");
+
+        // Now read some data to free up buffer space
+        let mut buf = vec![0u8; 5];
+        t.stream
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut buf)
+            .await
+            .unwrap();
+        t.poll_once_assert_pending().await;
+
+        // Should send window update ACK
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "Should send window update ACK");
+        assert_eq!(sent[0].header.get_type(), Type::ST_STATE);
+        assert!(
+            sent[0].header.wnd_size > 0,
+            "Window size should be non-zero after reading"
         );
     }
 }
