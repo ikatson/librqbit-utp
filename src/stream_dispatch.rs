@@ -3264,7 +3264,7 @@ mod tests {
         );
         t.poll_once_assert_pending().await;
 
-        // Remote sends some data - should be ignored since reader is dead
+        // Remote sends some data - it should accumulate in OOQ.
         t.send_data(1, "ignored data");
         t.poll_once_assert_pending().await;
 

@@ -194,6 +194,9 @@ impl UserRx {
     }
 
     pub fn window(&self) -> usize {
+        if self.tx.is_closed() {
+            return 0;
+        }
         let cap = self.shared.capacity;
         let len = self.shared.len_bytes.load(Relaxed);
         cap.saturating_sub(len)
