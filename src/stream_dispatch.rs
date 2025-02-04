@@ -1308,7 +1308,7 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
             };
         }
 
-        macro_rules! bail_if_cannot_send {
+        macro_rules! pending_if_cannot_send {
             ($e:expr) => {{
                 let val = bail_if_err!($e);
                 if this.this_poll.transport_pending {
@@ -1335,16 +1335,16 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
             // Read incoming stream.
             bail_if_err!(this.process_all_incoming_messages(cx, socket));
 
-            bail_if_cannot_send!(this.maybe_send_ack(cx, socket));
+            pending_if_cannot_send!(this.maybe_send_ack(cx, socket));
 
             this.maybe_prepare_for_retransmission();
 
-            bail_if_cannot_send!(this.split_tx_queue_into_segments(cx));
+            pending_if_cannot_send!(this.split_tx_queue_into_segments(cx));
 
             // (Re)send tx queue.
-            bail_if_cannot_send!(this.send_tx_queue(cx, socket));
+            pending_if_cannot_send!(this.send_tx_queue(cx, socket));
 
-            bail_if_cannot_send!(this.maybe_send_fin(cx, socket));
+            pending_if_cannot_send!(this.maybe_send_fin(cx, socket));
 
             if this.state.is_done() {
                 this.just_before_death(None);
