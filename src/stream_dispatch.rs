@@ -209,8 +209,8 @@ struct VirtualSocket<T, Env> {
     // Last remote sequence number that we fully processed.
     last_consumed_remote_seq_nr: SeqNr,
 
-    // Last ACK that we sent out. This is different from "ack_nr" because we don't ACK
-    // every packet. This must be <= ack_nr.
+    // Last ACK that we sent out. This is different from "last_consumed_remote_seq_nr" because we don't ACK
+    // every packet. This must be <= last_consumed_remote_seq_nr.
     last_sent_ack_nr: SeqNr,
 
     // How many bytes we have consumed but not sent an ACK yet.
