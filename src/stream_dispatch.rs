@@ -308,7 +308,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     // TODO: implement this better
     // https://datatracker.ietf.org/doc/html/rfc9293#section-3.8.6.2.2
     fn rx_window(&self) -> u32 {
-        self.user_rx.window() as u32
+        self.user_rx.remaining_rx_window() as u32
     }
 
     // Returns true if UDP socket is full
@@ -924,10 +924,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn should_send_window_update(&self) -> bool {
         // if we need to send a window update, also send immediately.
         // TODO: this is clumsy, but should do the job in case the reader was fully flow controlled.
-        if self.last_sent_window as usize <= self.socket_opts.max_incoming_payload_size.get()
-            && self.rx_window() > self.last_sent_window
-        {
-            trace!("need to send a window update");
+        let rmss = self.socket_opts.max_incoming_payload_size.get() as u32;
+        if self.last_sent_window < rmss && self.rx_window() >= rmss {
+            trace!(
+                self.last_sent_window,
+                rmss,
+                current = self.rx_window(),
+                "need to send a window update"
+            );
             return true;
         }
         false
@@ -1037,7 +1041,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let socket = bail_if_err!(self.socket.upgrade().context("device dead"));
         let socket = &*socket;
 
-        // Track if UDP socket is full this poll, and don't send to it if so.
         self.this_poll.transport_pending = false;
         self.this_poll.now = self.env.now();
 
@@ -1235,6 +1238,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
         let (user_rx, read_half) = UserRx::build(
             socket.opts().max_user_rx_buffered_bytes,
             socket.opts().max_rx_out_of_order_packets,
+            socket.opts().max_incoming_payload_size,
         );
 
         let user_tx = UserTx::new(socket.opts().virtual_socket_tx_bytes);
@@ -1253,7 +1257,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 .opts()
                 .congestion
                 .create(now, socket.opts().max_incoming_payload_size.get()),
-            socket: Arc::downgrade(socket),
+
             socket_created: socket.created,
             remote,
             conn_id_send,
@@ -1299,6 +1303,8 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             } else {
                 0
             },
+
+            socket: Arc::downgrade(socket),
         };
 
         let stream = UtpStream::new(read_half, write_half, vsock.remote);
@@ -1603,7 +1609,6 @@ mod tests {
         let sent = t.take_sent();
         assert_eq!(sent.len(), 0);
     }
-
     #[tokio::test]
     async fn test_doesnt_send_until_window_updated() {
         setup_test_logging();
@@ -1639,7 +1644,6 @@ mod tests {
         assert_eq!(sent[0].header.ack_nr.0, 0);
         assert_eq!(sent[0].payload(), b"hello");
     }
-
     #[tokio::test]
     async fn test_sends_up_to_remote_window_only_single_msg() {
         setup_test_logging();
@@ -1679,7 +1683,6 @@ mod tests {
         t.poll_once_assert_pending().await;
         assert_eq!(t.take_sent().len(), 0);
     }
-
     #[tokio::test]
     async fn test_sends_up_to_remote_window_only_multi_msg() {
         setup_test_logging();
@@ -1725,7 +1728,6 @@ mod tests {
         let sent = t.take_sent();
         assert_eq!(sent.len(), 0);
     }
-
     #[tokio::test]
     async fn test_basic_retransmission() {
         setup_test_logging();
@@ -1778,7 +1780,6 @@ mod tests {
             "Retransmitted packet should have same sequence number"
         );
     }
-
     #[tokio::test]
     async fn test_fast_retransmit() {
         setup_test_logging();
@@ -1852,7 +1853,6 @@ mod tests {
             "Should have retransmitted correct data"
         );
     }
-
     #[tokio::test]
     async fn test_fin_shutdown_sequence_initiated_by_explicit_shutdown() {
         setup_test_logging();
@@ -1949,7 +1949,6 @@ mod tests {
             "Connection should complete cleanly"
         );
     }
-
     #[tokio::test]
     async fn test_fin_sent_when_writer_dropped() {
         setup_test_logging();
@@ -2010,7 +2009,6 @@ mod tests {
             "FIN should use next sequence number after data"
         );
     }
-
     #[tokio::test]
     async fn test_flush_works() {
         setup_test_logging();
@@ -2085,7 +2083,6 @@ mod tests {
             Poll::Pending => panic!("flush should have completed"),
         };
     }
-
     #[tokio::test]
     async fn test_out_of_order_delivery() {
         setup_test_logging();
@@ -2171,7 +2168,6 @@ mod tests {
         assert_eq!(acks[0].header.get_type(), Type::ST_STATE);
         assert_eq!(acks[0].header.ack_nr.0, 3); // Should acknowledge up to last packet
     }
-
     #[tokio::test]
     async fn test_nagle_algorithm() {
         setup_test_logging();
@@ -2268,7 +2264,6 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].payload(), b"e");
     }
-
     #[tokio::test]
     async fn test_resource_cleanup_both_sides_dropped_normally() {
         setup_test_logging();
@@ -2337,7 +2332,6 @@ mod tests {
             "Poll should complete after both halves are dropped"
         );
     }
-
     #[tokio::test]
     async fn test_resource_cleanup_both_sides_dropped_abruptly() {
         setup_test_logging();
@@ -2362,7 +2356,6 @@ mod tests {
             "Poll should complete after both halves are dropped"
         );
     }
-
     #[tokio::test]
     async fn test_resource_cleanup_with_pending_data() {
         setup_test_logging();
@@ -2420,7 +2413,6 @@ mod tests {
         assert_eq!(sent[0].header.seq_nr.0, data_seq_nr.0 + 1);
         assert!(matches!(result, Poll::Ready(Ok(()))));
     }
-
     #[tokio::test]
     async fn test_sender_flow_control() {
         setup_test_logging();
@@ -2501,7 +2493,6 @@ mod tests {
             "Should have split data into correct number of packets"
         );
     }
-
     #[tokio::test]
     async fn test_zero_window_handling() {
         setup_test_logging();
@@ -2568,7 +2559,6 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].payload(), b" world");
     }
-
     #[tokio::test]
     async fn test_congestion_control_basics() {
         setup_test_logging();
@@ -2700,7 +2690,6 @@ mod tests {
             "Window should decrease or stay same after timeout"
         );
     }
-
     #[tokio::test]
     async fn test_duplicate_ack_only_on_st_state() {
         setup_test_logging();
@@ -2805,7 +2794,6 @@ mod tests {
             "Should have retransmitted correct packet"
         );
     }
-
     #[tokio::test]
     async fn test_finack_not_sent_until_all_data_consumed() {
         setup_test_logging();
@@ -2853,7 +2841,6 @@ mod tests {
         assert_eq!(sent.len(), 1, "we should sent FIN ACK");
         assert_eq!(sent[0].header.ack_nr, 3.into());
     }
-
     #[tokio::test]
     async fn test_flow_control() {
         setup_test_logging();
@@ -2924,7 +2911,6 @@ mod tests {
         let read = String::from_utf8(t.read_all_available().await.unwrap()).unwrap();
         assert!(!read.contains("dropped"));
     }
-
     #[tokio::test]
     async fn test_data_integrity_manual_packets() {
         setup_test_logging();
@@ -2979,7 +2965,6 @@ mod tests {
         );
         assert_eq!(received_data, test_data, "Data corruption detected");
     }
-
     #[tokio::test]
     async fn test_retransmission_behavior() {
         setup_test_logging();
@@ -3084,7 +3069,6 @@ mod tests {
             "New packet should use next sequence number"
         );
     }
-
     #[tokio::test]
     async fn test_selective_ack_retransmission() {
         setup_test_logging();
@@ -3179,7 +3163,6 @@ mod tests {
             "Should not retransmit after both packets acknowledged"
         );
     }
-
     #[tokio::test]
     async fn test_st_reset_error_propagation() {
         setup_test_logging();
@@ -3213,7 +3196,6 @@ mod tests {
             "Error should mention ST_RESET: {err}"
         );
     }
-
     #[tokio::test]
     async fn test_fin_sent_when_both_halves_dropped() {
         setup_test_logging();
@@ -3277,7 +3259,6 @@ mod tests {
             "FIN should use next sequence number"
         );
     }
-
     #[tokio::test]
     async fn test_fin_sent_when_reader_dead_first() {
         setup_test_logging();
@@ -3347,7 +3328,6 @@ mod tests {
             "FIN should use next sequence number"
         );
     }
-
     #[tokio::test]
     async fn test_window_update_ack_after_read() {
         setup_test_logging();
@@ -3394,5 +3374,54 @@ mod tests {
             sent[0].header.wnd_size > 0,
             "Window size should be non-zero after reading"
         );
+    }
+
+    #[tokio::test]
+    async fn test_window_update_sent_when_window_less_than_mss() {
+        setup_test_logging();
+
+        // Configure socket with small but non-zero receive buffer
+        let mss = 5;
+        let opts = SocketOpts {
+            rx_bufsize: Some(mss * 2),
+            mtu: Some(mss + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
+            ..Default::default()
+        };
+
+        let mut t = make_test_vsock(opts, false);
+        assert_eq!(t.vsock.socket_opts.max_incoming_payload_size.get(), mss);
+
+        // Fill buffer to just under MSS to get a small window
+        t.send_data(1, "aaaaa");
+        t.poll_once_assert_pending().await;
+        // We shouldn't have registered the flush waker yet.
+        assert!(!t.vsock.user_rx.is_flush_waker_registered());
+        assert_eq!(t.take_sent(), vec![]);
+
+        // Now the window should be less than MSS.
+        t.send_data(2, "b");
+        t.poll_once_assert_pending().await;
+        assert!(t.vsock.user_rx.is_flush_waker_registered());
+        // Verify window is now less than MSS
+        let sent = t.take_sent();
+        assert!(!sent.is_empty(), "Should have sent ACKs");
+        let last_window = sent.last().unwrap().header.wnd_size;
+        assert_eq!(last_window, 4);
+
+        // Read some data to free up more than MSS worth of buffer space
+        let mut buf = vec![0u8; mss];
+        t.stream
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut buf)
+            .await
+            .unwrap();
+        t.poll_once_assert_pending().await;
+
+        // Should send window update ACK
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "Should send window update ACK");
+        assert_eq!(sent[0].header.get_type(), Type::ST_STATE);
+        assert_eq!(sent[0].header.wnd_size, 9);
     }
 }

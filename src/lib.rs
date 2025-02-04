@@ -1,3 +1,5 @@
+// TODO: send window updates. If we send 0 or a small number (< MSS), the sender might get stuck.
+
 // RTT, RTO, congestion
 // Recent RFCs that we might try to implement exactly to make everyting super explicit
 // RFC 9293 https://datatracker.ietf.org/doc/html/rfc9293 (TCP) (2022, standard)
