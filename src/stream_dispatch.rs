@@ -846,10 +846,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 // Per RFC 5681, we should send an immediate ACK when either:
                 //  1) an out-of-order segment is received, or
                 //  2) a segment arrives that fills in all or part of a gap in sequence space.
-                if !self.user_rx.assembler_empty()
-                    || !assembler_was_empty
-                    || self.immediate_ack_to_transmit()
-                {
+                if !self.user_rx.assembler_empty() || !assembler_was_empty {
                     trace!(
                         assembler_not_empty = !self.user_rx.assembler_empty(),
                         assembler_was_empty,
@@ -922,18 +919,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(on_ack_result)
     }
 
-    /// TODO: implement this better
-    ///
     /// Return whether to send ACK immediately due to the amount of unacknowledged data.
-    ///
-    /// RFC 9293 states "An ACK SHOULD be generated for at least every second full-sized segment or
-    /// 2*RMSS bytes of new data (where RMSS is the MSS specified by the TCP endpoint receiving the
-    /// segments to be acknowledged, or the default value if not specified) (SHLD-19)."
-    ///
-    /// Note that the RFC above only says "at least 2*RMSS bytes", which is not a hard requirement.
-    /// In practice, we follow the Linux kernel's empirical value of sending an ACK for every RMSS
-    /// byte of new data. For details, see
-    /// <https://elixir.bootlin.com/linux/v6.11.4/source/net/ipv4/tcp_input.c#L5747>.
+    /// https://datatracker.ietf.org/doc/html/rfc9293#section-3.8.6.3
     fn immediate_ack_to_transmit(&self) -> bool {
         self.consumed_but_unacked_bytes >= 2 * self.socket_opts.max_incoming_payload_size.get()
     }
