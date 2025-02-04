@@ -3217,4 +3217,74 @@ mod tests {
             "FIN should use next sequence number"
         );
     }
+
+    #[tokio::test]
+    async fn test_fin_sent_when_reader_dead_first() {
+        setup_test_logging();
+        let mut t = make_test_vsock(Default::default());
+
+        // Allow sending by setting window size
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        let (reader, mut writer) = t.stream.take().unwrap().split();
+
+        // Drop the reader first
+        drop(reader);
+
+        // Write some data - should still work
+        writer.write_all(b"hello").await.unwrap();
+        t.poll_once_assert_pending().await;
+
+        // Data should be sent
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
+        assert_eq!(sent[0].payload(), b"hello");
+        let data_seq_nr = sent[0].header.seq_nr;
+
+        // Acknowledge the data
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: data_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+
+        // Remote sends some data - should be ignored since reader is dead
+        t.send_data(1, "ignored data");
+        t.poll_once_assert_pending().await;
+
+        // Now drop the writer
+        drop(writer);
+
+        // Next poll should send FIN and complete
+        let result = t.poll_once().await;
+        assert!(
+            matches!(result, Poll::Ready(Ok(()))),
+            "Socket should complete immediately after both halves dropped"
+        );
+
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "Should send FIN after writer dropped");
+        assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
+        assert_eq!(
+            sent[0].header.seq_nr.0,
+            data_seq_nr.0 + 1,
+            "FIN should use next sequence number"
+        );
+    }
 }

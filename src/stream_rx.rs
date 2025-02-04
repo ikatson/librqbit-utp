@@ -216,39 +216,44 @@ impl UserRx {
         }
 
         // Flush as many items as possible from the beginning of out of order queue to the user RX
-        let mut total_bytes = 0;
-        let mut total_packets = 0;
-        let mut window = self.shared.window(SeqCst)?;
+        let mut flushed_bytes = 0;
+        let mut flushed_packets = 0;
+        let mut remaining_rx_window = self.shared.window(SeqCst)?;
 
-        while let Some(msg) = self.ooq.pop_front_if_fits(window) {
-            let len = msg.payload().len();
-            total_bytes += len;
-            window -= len;
-            total_packets += 1;
+        while let Some(len) = self.ooq.send_front_if_fits(remaining_rx_window, |msg| {
+            self.tx.send(UserRxMessage::Payload(msg)).map_err(|e| {
+                debug_every_ms!(200, "reader is dead, could not send UtpMesage to it");
+                match e.0 {
+                    UserRxMessage::Payload(msg) => msg,
+                    _ => unreachable!(),
+                }
+            })
+        }) {
+            flushed_bytes += len;
+            remaining_rx_window -= len;
+            flushed_packets += 1;
             self.shared.len_bytes.fetch_add(len, SeqCst);
-            self.tx
-                .send(UserRxMessage::Payload(msg))
-                .context("reader dead")?;
         }
 
-        if total_bytes > 0 {
+        if flushed_bytes > 0 {
             trace!(
-                packets = total_packets,
-                bytes = total_bytes,
+                packets = flushed_packets,
+                bytes = flushed_bytes,
                 "flushed from out-of-order user RX"
             );
         }
 
         if self.ooq.filled_front > 0 {
             trace!(
-                total_bytes,
-                self.ooq.filled_front,
-                window,
-                "did not flush everything, we still got stuff, but RX window was exhausted"
+                flushed_bytes,
+                flushed_packets,
+                out_of_order_filled_front = self.ooq.filled_front,
+                remaining_rx_window,
+                "did not flush everything"
             );
         }
 
-        Ok(total_bytes)
+        Ok(flushed_bytes)
     }
 
     pub fn enqueue_last_message(&self, msg: UserRxMessage) {
@@ -347,7 +352,11 @@ impl OutOfOrderQueue {
         }
     }
 
-    pub fn pop_front_if_fits(&mut self, window: usize) -> Option<UtpMessage> {
+    pub fn send_front_if_fits(
+        &mut self,
+        window: usize,
+        send_fn: impl FnOnce(UtpMessage) -> Result<(), UtpMessage>,
+    ) -> Option<usize> {
         if self.filled_front == 0 {
             return None;
         }
@@ -356,11 +365,18 @@ impl OutOfOrderQueue {
         }
         let msg = self.data.pop_front()?;
         let len = msg.payload().len();
+        match send_fn(msg) {
+            Ok(()) => {}
+            Err(msg) => {
+                self.data.push_front(msg);
+                return None;
+            }
+        }
         self.filled_front -= 1;
         self.len -= 1;
         self.len_bytes -= len;
         self.data.push_back(Default::default());
-        Some(msg)
+        Some(len)
     }
 
     pub fn is_empty(&self) -> bool {
