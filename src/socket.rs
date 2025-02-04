@@ -54,7 +54,7 @@ pub struct CongestionConfig {
 }
 
 impl CongestionConfig {
-    pub(crate) fn create(&self, now: Instant) -> Box<dyn CongestionController> {
+    pub(crate) fn create(&self, now: Instant, rmss: usize) -> Box<dyn CongestionController> {
         use crate::congestion::cubic::Cubic;
         use crate::congestion::reno::Reno;
         use crate::congestion::tracing::TracingController;
@@ -63,9 +63,9 @@ impl CongestionConfig {
             (CongestionControllerKind::Reno, true) => Box::new(TracingController::new(Reno::new())),
             (CongestionControllerKind::Reno, false) => Box::new(Reno::new()),
             (CongestionControllerKind::Cubic, true) => {
-                Box::new(TracingController::new(Cubic::new(now)))
+                Box::new(TracingController::new(Cubic::new(now, rmss)))
             }
-            (CongestionControllerKind::Cubic, false) => Box::new(Cubic::new(now)),
+            (CongestionControllerKind::Cubic, false) => Box::new(Cubic::new(now, rmss)),
         }
     }
 }
@@ -168,6 +168,7 @@ impl SocketOpts {
 
         Ok(ValidatedSocketOpts {
             max_incoming_packet_size: incoming.max_packet_size,
+            max_incoming_payload_size: incoming.max_payload_size,
             max_outgoing_payload_size: outgoing.max_payload_size,
             max_user_rx_buffered_bytes,
             max_rx_out_of_order_packets,
@@ -181,6 +182,7 @@ impl SocketOpts {
 #[derive(Clone)]
 pub(crate) struct ValidatedSocketOpts {
     pub max_incoming_packet_size: NonZeroUsize,
+    pub max_incoming_payload_size: NonZeroUsize,
     pub max_outgoing_payload_size: NonZeroUsize,
     pub max_user_rx_buffered_bytes: NonZeroUsize,
 

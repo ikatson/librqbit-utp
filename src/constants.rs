@@ -27,11 +27,10 @@ pub const DEFAULT_MTU_AUTODETECT_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 
 // This MTU is used in case it can't be autodetected. Very conservative to support VPNs / tunneling etc.
 pub const DEFAULT_CONSERVATIVE_OUTGOING_MTU: usize = 1280;
 
-// Delayed ACK timer
-pub const ACK_DELAY: Duration = Duration::from_millis(10);
+// Delayed ACK timer. Linux has 40ms, so we set to it too.
+pub const ACK_DELAY: Duration = Duration::from_millis(40);
 
-pub const IMMEDIATE_ACK_EVERY: isize = 5;
-
+// u16 SeqNrs wrap around. If they are too far apart, this is used to detect if they wrapped or not.
 pub const WRAP_TOLERANCE: u16 = 1024;
 
 pub const CONGESTION_TRACING_LOG_LEVEL: Level = Level::TRACE;

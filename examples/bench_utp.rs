@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use librqbit_utp::{SocketOpts, UtpSocket, UtpStreamUdp};
+use librqbit_utp::{CongestionConfig, SocketOpts, UtpSocket, UtpStreamUdp};
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -64,6 +64,10 @@ async fn main() -> anyhow::Result<()> {
     let opts = SocketOpts {
         // mtu: Some(8192),
         // mtu_autodetect_host: Some(Ipv4Addr::LOCALHOST.into()),
+        congestion: CongestionConfig {
+            // tracing: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
 

@@ -37,11 +37,11 @@ impl PartialEq for Cubic {
 }
 
 impl Cubic {
-    pub fn new(now: Instant) -> Cubic {
+    pub fn new(now: Instant, rmss: usize) -> Cubic {
         Cubic {
-            cwnd: 1024 * 2,
-            min_cwnd: 1024 * 2,
-            w_max: 1024 * 2,
+            cwnd: rmss * 2,
+            min_cwnd: rmss * 2,
+            w_max: rmss * 2,
             recovery_start: None,
             rwnd: 64 * 1024,
             last_update: now,
@@ -185,7 +185,7 @@ mod test {
 
         for i in 0..10 {
             for j in 0..9 {
-                let mut cubic = Cubic::new(now);
+                let mut cubic = Cubic::new(now, 1024);
                 // Set remote window.
                 cubic.set_remote_window(remote_window);
 
@@ -219,7 +219,7 @@ mod test {
     #[test]
     fn cubic_time_inversion() {
         let now = Instant::now();
-        let mut cubic = Cubic::new(now);
+        let mut cubic = Cubic::new(now, 1024);
 
         let t1 = now;
         let t2 = t1 + Duration::from_secs(1);
@@ -237,7 +237,7 @@ mod test {
     #[test]
     fn cubic_long_elapsed_time() {
         let now = Instant::now();
-        let mut cubic = Cubic::new(now);
+        let mut cubic = Cubic::new(now, 1024);
 
         let t1 = Instant::now();
         let t2 = t1 + Duration::from_secs(1024);
@@ -255,7 +255,7 @@ mod test {
     #[test]
     fn cubic_last_update() {
         let now = Instant::now();
-        let mut cubic = Cubic::new(now);
+        let mut cubic = Cubic::new(now, 1024);
 
         let t1 = Duration::from_millis(0);
         let t2 = Duration::from_millis(100);
@@ -285,7 +285,7 @@ mod test {
     #[test]
     fn cubic_slow_start() {
         let now = Instant::now();
-        let mut cubic = Cubic::new(now);
+        let mut cubic = Cubic::new(now, 1024);
 
         let t1 = Duration::from_micros(0);
 
@@ -312,7 +312,7 @@ mod test {
     #[test]
     fn cubic_pre_transmit() {
         let now = Instant::now();
-        let mut cubic = Cubic::new(now);
+        let mut cubic = Cubic::new(now, 1024);
         cubic.pre_transmit(now + Duration::from_micros(2000));
     }
 

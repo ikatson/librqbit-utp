@@ -14,10 +14,7 @@ use tracing::{debug, error_span, trace, warn, Level};
 
 use crate::{
     congestion::CongestionController,
-    constants::{
-        ACK_DELAY, CONGESTION_TRACING_LOG_LEVEL, IMMEDIATE_ACK_EVERY, RTTE_TRACING_LOG_LEVEL,
-        UTP_HEADER_SIZE,
-    },
+    constants::{ACK_DELAY, CONGESTION_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL, UTP_HEADER_SIZE},
     message::UtpMessage,
     raw::{Type, UtpHeader},
     rtte::RttEstimator,
@@ -216,6 +213,9 @@ struct VirtualSocket<T, Env> {
     // every packet. This must be <= ack_nr.
     last_sent_ack_nr: SeqNr,
 
+    // How many bytes we have consumed but not sent an ACK yet.
+    consumed_but_unacked_bytes: usize,
+
     // Incoming queue. The main UDP socket writes here, and we need to consume these
     // as fast as possible.
     //
@@ -299,6 +299,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         header
     }
 
+    // TODO: implement this better
+    // https://datatracker.ietf.org/doc/html/rfc9293#section-3.8.6.2.2
     fn rx_window(&self) -> u32 {
         self.user_rx.window() as u32
     }
@@ -380,9 +382,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             last_sent = Some(header);
         }
 
-        if recv_wnd > 0 {
-            trace!(recv_wnd, "remaining recv_wnd after sending");
-        }
+        trace!(recv_wnd, "remaining recv_wnd after sending");
 
         if let Some(header) = last_sent {
             self.on_packet_sent(&header);
@@ -399,11 +399,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(())
     }
 
-    fn maybe_send_delayed_ack(
+    fn maybe_send_ack(
         &mut self,
         cx: &mut std::task::Context<'_>,
         socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<bool> {
+        if self.immediate_ack_to_transmit() {
+            return self.send_ack(cx, socket);
+        }
         let expired = self.delayed_ack_expired();
         if expired && self.ack_to_transmit() {
             trace!("delayed ack expired, sending ACK");
@@ -463,6 +466,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         // Each packet sent can act as ACK so update related state.
         self.last_sent_seq_nr = header.seq_nr;
         self.last_sent_ack_nr = header.ack_nr;
+        self.consumed_but_unacked_bytes = 0;
         self.timers.reset_delayed_ack_timer();
     }
 
@@ -677,7 +681,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     return Ok(());
                 }
             };
-            self.process_incoming_message(cx, socket, msg)?;
+            self.process_incoming_message(cx, msg)?;
         }
         Ok(())
     }
@@ -691,7 +695,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn process_incoming_message(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T, Env>,
         msg: UtpMessage,
     ) -> anyhow::Result<()> {
         trace!("processing message");
@@ -803,14 +806,22 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     .add_remove(cx, msg, offset as usize)
                     .context("fatal error in assember")?
                 {
-                    AssemblerAddRemoveResult::ConsumedSequenceNumbers(count) => {
-                        if count > 0 {
-                            trace!(count, "acked messages, we have them stored in RX buffers");
+                    AssemblerAddRemoveResult::Consumed {
+                        sequence_numbers,
+                        bytes,
+                    } => {
+                        if sequence_numbers > 0 {
+                            trace!(
+                                sequence_numbers,
+                                "acked messages, we have them stored in RX buffers"
+                            );
                         } else {
                             trace!("out of order");
                         }
 
-                        self.last_consumed_remote_seq_nr += count as u16;
+                        self.last_consumed_remote_seq_nr += sequence_numbers as u16;
+                        self.consumed_but_unacked_bytes += bytes;
+                        trace!(self.consumed_but_unacked_bytes);
 
                         // If we got remote FIN, increase the last consumed sequence number, so that
                         // we (re)send the final ACK.
@@ -826,20 +837,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     }
                 }
 
-                if self.immediate_ack_to_transmit() {
-                    self.send_ack(cx, socket)?;
-                }
-
                 if self.ack_to_transmit() {
                     self.timers.ack_delay_timer = match self.timers.ack_delay_timer {
                         AckDelayTimer::Idle => {
                             trace!("starting delayed ack timer");
                             AckDelayTimer::Waiting(self.this_poll.now + ACK_DELAY)
                         }
-                        timer @ AckDelayTimer::Waiting(_) => {
-                            trace!("waiting until delayed ack timer expires");
-                            timer
-                        }
+                        timer @ AckDelayTimer::Waiting(_) => timer,
                     };
                 }
 
@@ -854,9 +858,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         assembler_not_empty = !self.user_rx.assembler_empty(),
                         assembler_was_empty,
                         immediate_ack_to_transmit = self.immediate_ack_to_transmit(),
-                        "sending immediate ACK"
+                        "forcing immediate ACK"
                     );
-                    self.send_ack(cx, socket)?;
+                    self.force_immedate_ack();
                 }
                 Ok(())
             }
@@ -938,7 +942,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     /// byte of new data. For details, see
     /// <https://elixir.bootlin.com/linux/v6.11.4/source/net/ipv4/tcp_input.c#L5747>.
     fn immediate_ack_to_transmit(&self) -> bool {
-        self.last_consumed_remote_seq_nr - self.last_sent_ack_nr >= IMMEDIATE_ACK_EVERY
+        self.consumed_but_unacked_bytes >= 2 * self.socket_opts.max_incoming_payload_size.get()
+    }
+
+    fn force_immedate_ack(&mut self) {
+        self.consumed_but_unacked_bytes = 2 * self.socket_opts.max_incoming_payload_size.get();
     }
 
     fn ack_to_transmit(&self) -> bool {
@@ -1129,7 +1137,10 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             state: VirtualSocketState::Established,
             env,
             socket_opts: socket.opts().clone(),
-            congestion_controller: socket.opts().congestion.create(now),
+            congestion_controller: socket
+                .opts()
+                .congestion
+                .create(now, socket.opts().max_incoming_payload_size.get()),
             socket: Arc::downgrade(socket),
             socket_created: socket.created,
             remote,
@@ -1146,6 +1157,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_sent_seq_nr,
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
+            consumed_but_unacked_bytes: 0,
             rx,
             user_tx_segments: Segments::new(),
             local_rx_last_ack: None,
@@ -1344,7 +1356,7 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
             // Read incoming stream.
             bail_if_err!(this.process_all_incoming_messages(cx, socket));
 
-            bail_if_cannot_send!(this.maybe_send_delayed_ack(cx, socket));
+            bail_if_cannot_send!(this.maybe_send_ack(cx, socket));
 
             this.maybe_prepare_for_retransmission();
 
@@ -2793,7 +2805,11 @@ mod tests {
         t.send_msg(header, "");
         t.poll_once_assert_pending().await;
         assert!(!t.vsock.user_rx.assembler_empty());
-        assert_eq!(t.take_sent().len(), 0, "nothing gets sent for out of order");
+        assert_eq!(
+            t.take_sent(),
+            vec![],
+            "nothing gets sent for out of order FIN"
+        );
 
         // send in-order. This should ACK the FIN
         header.set_type(Type::ST_DATA);

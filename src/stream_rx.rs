@@ -280,7 +280,9 @@ impl UserRx {
         offset: usize,
     ) -> anyhow::Result<AssemblerAddRemoveResult> {
         match self.ooq.add_remove(msg, offset)? {
-            res @ AssemblerAddRemoveResult::ConsumedSequenceNumbers(n) if n > 0 => {
+            res @ AssemblerAddRemoveResult::Consumed {
+                sequence_numbers, ..
+            } if sequence_numbers > 0 => {
                 // TODO: we shouldn't flush on every single message, but rather should do it after a certain threshold.
                 self.flush(cx)?;
                 Ok(res)
@@ -327,7 +329,10 @@ pub struct OutOfOrderQueue {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AssemblerAddRemoveResult {
-    ConsumedSequenceNumbers(usize),
+    Consumed {
+        sequence_numbers: usize,
+        bytes: usize,
+    },
     Unavailable(UtpMessage),
 }
 
@@ -471,15 +476,20 @@ impl OutOfOrderQueue {
 
         let range = self.filled_front..self.data.len();
         // Advance "filled" if a contiguous data range was found.
-        let contiguous = self
+        let (consumed_segments, consumed_bytes) = self
             .data
             .range(range)
             .take_while(|msg| !msg.payload().is_empty())
-            .count();
-        self.filled_front += contiguous;
-        Ok(AssemblerAddRemoveResult::ConsumedSequenceNumbers(
-            contiguous,
-        ))
+            .fold((0, 0), |mut state, msg| {
+                state.0 += 1;
+                state.1 += msg.payload().len();
+                state
+            });
+        self.filled_front += consumed_segments;
+        Ok(AssemblerAddRemoveResult::Consumed {
+            sequence_numbers: consumed_segments,
+            bytes: consumed_bytes,
+        })
     }
 }
 
@@ -525,7 +535,10 @@ mod tests {
         let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(2).unwrap());
         assert_eq!(
             asm.add_remove(msg(0, b"a"), 0).unwrap(),
-            AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 1,
+                bytes: 1
+            }
         );
         assert_eq!(asm.stored_packets(), 1);
         assert_eq!(asm.stored_bytes(), 1);
@@ -537,7 +550,10 @@ mod tests {
         let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(2).unwrap());
         assert_eq!(
             asm.add_remove(msg(100, b"a"), 1).unwrap(),
-            AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 0,
+                bytes: 0
+            }
         );
         assert_eq!(asm.stored_packets(), 1);
         assert_eq!(asm.stored_bytes(), 1);
@@ -557,7 +573,10 @@ mod tests {
 
         assert_eq!(
             user_rx.add_remove_test(msg.clone(), 0).await.unwrap(),
-            AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 1,
+                bytes: 1
+            }
         );
         assert_eq!(user_rx.ooq.stored_packets(), 1);
         assert_eq!(user_rx.ooq.stored_bytes(), 1);
@@ -574,7 +593,10 @@ mod tests {
 
         assert_eq!(
             user_rx.add_remove_test(msg.clone(), 1).await.unwrap(),
-            AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 0,
+                bytes: 0
+            }
         );
 
         assert_eq!(user_rx.ooq.stored_packets(), 1);
@@ -583,7 +605,10 @@ mod tests {
 
         assert_eq!(
             user_rx.add_remove_test(msg.clone(), 0).await.unwrap(),
-            AssemblerAddRemoveResult::ConsumedSequenceNumbers(2)
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 2,
+                bytes: 2
+            }
         );
         assert_eq!(user_rx.ooq.stored_packets(), 2);
         assert_eq!(user_rx.ooq.stored_bytes(), 2);
@@ -602,20 +627,29 @@ mod tests {
 
         assert_eq!(
             user_rx.add_remove_test(msg_1.clone(), 1).await.unwrap(),
-            AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 0,
+                bytes: 0
+            }
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
         assert_eq!(user_rx.ooq.stored_packets(), 1);
 
         assert_eq!(
             user_rx.add_remove_test(msg_2.clone(), 2).await.unwrap(),
-            AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 0,
+                bytes: 0
+            }
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
 
         assert_eq!(
             user_rx.add_remove_test(msg_0.clone(), 0).await.unwrap(),
-            AssemblerAddRemoveResult::ConsumedSequenceNumbers(3)
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 3,
+                bytes: 14
+            }
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
         assert_eq!(user_rx.ooq.stored_packets(), 0);
@@ -636,20 +670,29 @@ mod tests {
 
         assert_eq!(
             user_rx.add_remove_test(msg_0.clone(), 0).await.unwrap(),
-            AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 1,
+                bytes: 5
+            }
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
         assert_eq!(user_rx.ooq.stored_packets(), 0);
 
         assert_eq!(
             user_rx.add_remove_test(msg_1.clone(), 0).await.unwrap(),
-            AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 1,
+                bytes: 5
+            }
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
 
         assert_eq!(
             user_rx.add_remove_test(msg_2.clone(), 0).await.unwrap(),
-            AssemblerAddRemoveResult::ConsumedSequenceNumbers(1)
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 1,
+                bytes: 4
+            }
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
         assert_eq!(user_rx.ooq.stored_packets(), 0);
@@ -670,7 +713,10 @@ mod tests {
 
         assert_eq!(
             asm.add_remove(msg_2.clone(), 2).unwrap(),
-            AssemblerAddRemoveResult::ConsumedSequenceNumbers(0)
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 0,
+                bytes: 0
+            }
         );
         trace!(asm=%asm.debug_string(true));
         assert_eq!(asm.stored_packets(), 1);
