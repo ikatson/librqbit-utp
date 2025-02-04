@@ -552,7 +552,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     ) -> anyhow::Result<()> {
         let mut g = self.user_tx.locked.lock();
 
-        if g.buffer().is_empty() {
+        if g.is_empty() {
             update_optional_waker(&mut g.buffer_has_data, cx);
 
             if g.is_closed() {
@@ -578,15 +578,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .map(|item| item.payload_offset() + item.payload_size())
             .unwrap_or(0);
 
-        if g.buffer().len() < tx_offset {
+        if g.len() < tx_offset {
             bail!(
                 "bug in buffer computations: user_tx_buflen={} tx_offset={}",
-                g.buffer().len(),
+                g.len(),
                 tx_offset
             );
         }
 
-        let mut remaining = g.buffer().len() - tx_offset;
+        let mut remaining = g.len() - tx_offset;
         self.congestion_controller.pre_transmit(self.this_poll.now);
         let mut remote_window_remaining = self
             .effective_remote_receive_window()
@@ -721,12 +721,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if on_ack_result.acked_segments_count > 0 {
             {
                 let mut g = self.user_tx.locked.lock();
-                g.truncate_front(on_ack_result.acked_bytes);
+                g.truncate_front(on_ack_result.acked_bytes)?;
                 if let Some(w) = g.buffer_has_space.take() {
                     w.wake();
                 }
 
-                if g.buffer().is_empty() {
+                if g.is_empty() {
                     if let Some(w) = g.buffer_flushed.take() {
                         w.wake();
                     }

@@ -1,15 +1,16 @@
 use std::{
-    collections::VecDeque,
     num::NonZeroUsize,
     sync::Arc,
     task::{ready, Poll, Waker},
 };
 
+use anyhow::bail;
 use parking_lot::Mutex;
+use ringbuf::traits::{Consumer, Observer, Producer};
 use tokio::io::AsyncWrite;
 use tracing::trace;
 
-use crate::utils::{fill_buffer_from_rb, update_optional_waker};
+use crate::utils::{fill_buffer_from_slices, update_optional_waker};
 
 pub struct UserTxLocked {
     // Set when stream dies abruptly for writer to know about it.
@@ -17,8 +18,7 @@ pub struct UserTxLocked {
     // When the writer shuts down, or both reader and writer die, the stream is closed.
     closed: bool,
 
-    capacity: usize,
-    buffer: VecDeque<u8>,
+    buffer: ringbuf::HeapRb<u8>,
 
     // This is woken up by dispatcher when the buffer has space if it didn't have it previously.
     pub buffer_has_space: Option<Waker>,
@@ -30,17 +30,21 @@ pub struct UserTxLocked {
 }
 
 impl UserTxLocked {
-    pub fn truncate_front(&mut self, count: usize) {
-        drop(self.buffer.drain(..count))
+    pub fn truncate_front(&mut self, count: usize) -> anyhow::Result<()> {
+        let skipped = self.buffer.skip(count);
+        if skipped != count {
+            bail!("bug: truncate_front: skipped({skipped}) != count({count})")
+        }
+        Ok(())
     }
 
     pub fn is_closed(&self) -> bool {
         self.closed
     }
 
-    pub fn buffer(&self) -> &VecDeque<u8> {
-        &self.buffer
-    }
+    // pub fn buffer(&self) -> &VecDeque<u8> {
+    //     &self.buffer
+    // }
 
     pub fn fill_buffer_from_ring_buffer(
         &self,
@@ -48,19 +52,24 @@ impl UserTxLocked {
         offset: usize,
         len: usize,
     ) -> anyhow::Result<()> {
-        fill_buffer_from_rb(out_buf, &self.buffer, offset, len)
+        let (first, second) = self.buffer.as_slices();
+        fill_buffer_from_slices(out_buf, offset, len, first, second)
     }
 
     pub fn enqueue_slice(&mut self, bytes: &[u8]) -> usize {
-        // I really hope that gets optimized away
-        let len = (self.capacity - self.buffer.len()).min(bytes.len());
-        let it = bytes.iter().copied().take(len);
-        self.buffer.extend(it);
-        len
+        self.buffer.push_slice(bytes)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.buffer.occupied_len()
     }
 
     pub fn is_full(&self) -> bool {
-        self.buffer.len() == self.capacity
+        self.buffer.is_full()
     }
 
     // This will send FIN (if not yet).
@@ -90,8 +99,7 @@ impl UserTx {
     pub fn new(capacity: NonZeroUsize) -> Arc<Self> {
         Arc::new(UserTx {
             locked: Mutex::new(UserTxLocked {
-                buffer: VecDeque::new(),
-                capacity: capacity.get(),
+                buffer: ringbuf::HeapRb::new(capacity.get()),
                 buffer_has_space: None,
                 buffer_has_data: None,
                 buffer_flushed: None,
@@ -184,7 +192,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
             return Poll::Ready(Err(std::io::Error::other("socket died")));
         }
 
-        if g.buffer().is_empty() {
+        if g.buffer.is_empty() {
             return Poll::Ready(Ok(()));
         }
 

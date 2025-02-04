@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::VecDeque, task::Waker};
+use std::{cmp::Ordering, task::Waker};
 
 use anyhow::bail;
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
@@ -38,7 +38,7 @@ pub fn seq_nr_offset(new: u16, old: u16, wrap_tolerance: u16) -> isize {
     }
 }
 
-fn fill_buffer_from_slices(
+pub fn fill_buffer_from_slices(
     out_buf: &mut [u8],
     offset: usize,
     len: usize,
@@ -81,16 +81,6 @@ fn fill_buffer_from_slices(
     }
 
     Ok(())
-}
-
-pub fn fill_buffer_from_rb(
-    out_buf: &mut [u8],
-    rb: &VecDeque<u8>,
-    offset: usize,
-    len: usize,
-) -> anyhow::Result<()> {
-    let (first, second) = rb.as_slices();
-    fill_buffer_from_slices(out_buf, offset, len, first, second)
 }
 
 pub(crate) struct DropGuardSendBeforeDeath<Msg> {
