@@ -211,6 +211,7 @@ struct VirtualSocket<T, Env> {
     last_sent_ack_nr: SeqNr,
 
     // How many bytes we have consumed but not sent an ACK yet.
+    // Used for immediate ACKs on 2 * RMSS threshold.
     consumed_but_unacked_bytes: usize,
 
     // Incoming queue. The main UDP socket writes here, and we need to consume these
@@ -561,7 +562,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     "state",
                     &mut self.state,
                     |s| *s,
-                    |s| s.transition_to_fin_sent(self.user_tx_segments.snd_next()),
+                    |s| s.transition_to_fin_sent(self.user_tx_segments.next_seq_nr()),
                     |_, _| Level::DEBUG,
                 );
                 if changed {
@@ -669,7 +670,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                     trace!("no more data. transitioning to FINISHED");
                     self.state
-                        .transition_to_fin_sent(self.user_tx_segments.snd_next());
+                        .transition_to_fin_sent(self.user_tx_segments.next_seq_nr());
                     self.maybe_send_fin(cx, socket)?;
                     self.state = VirtualSocketState::Finished;
                     return Ok(());
@@ -2456,7 +2457,7 @@ mod tests {
 
         // Verify total data sent matches original write
         assert_eq!(
-            t.vsock.user_tx_segments.snd_next().0 - first_seq_nr.0,
+            t.vsock.user_tx_segments.next_seq_nr().0 - first_seq_nr.0,
             3, // 3 packets total
             "Should have split data into correct number of packets"
         );

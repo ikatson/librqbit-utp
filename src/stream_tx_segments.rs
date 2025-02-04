@@ -41,7 +41,9 @@ pub struct Segments {
     len_bytes: usize,
     capacity: usize,
 
-    // Names are the same as in https://datatracker.ietf.org/doc/html/rfc9293#section-3.3.1
+    // SND.UNA - the sequence number of first unacknowledged segment.
+    // If all acknowledged, this is the same as SND.NEXT.
+    // Name is the same as in https://datatracker.ietf.org/doc/html/rfc9293#section-3.3.1
     snd_una: SeqNr,
 }
 
@@ -100,7 +102,8 @@ impl Segments {
         }
     }
 
-    pub fn snd_next(&self) -> SeqNr {
+    // Named like in rfc9293 SND.NEXT
+    pub fn next_seq_nr(&self) -> SeqNr {
         self.snd_una + self.segments.len() as u16
     }
 
