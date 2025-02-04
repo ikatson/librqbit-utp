@@ -161,13 +161,6 @@ impl Segments {
         format!("headers: {}/{}", self.segments.len(), self.capacity)
     }
 
-    fn ack_front(&mut self) -> Option<Segment> {
-        let frag = self.segments.pop_front()?;
-        self.len_bytes -= frag.payload_size;
-        self.snd_una += 1;
-        Some(frag)
-    }
-
     // Returns number of removed headers, and their comibined payload size.
     pub fn remove_up_to_ack(&mut self, now: Instant, ack_header: &UtpHeader) -> OnAckResult {
         let mut removed = 0;
@@ -175,14 +168,16 @@ impl Segments {
 
         let mut new_rtt: Option<Duration> = None;
 
-        while let Some(seq_nr) = self.first_seq_nr() {
-            if ack_header.ack_nr < seq_nr {
-                break;
+        let offset = ack_header.ack_nr - self.snd_una;
+        if offset >= 0 {
+            let drain_count = (offset as usize + 1).min(self.segments.len());
+            for segment in self.segments.drain(0..drain_count) {
+                segment.update_rtt(now, &mut new_rtt);
+                removed += 1;
+                payload_size += segment.payload_size;
+                self.snd_una += 1;
+                self.len_bytes -= segment.payload_size;
             }
-            let segment = self.ack_front().unwrap();
-            segment.update_rtt(now, &mut new_rtt);
-            removed += 1;
-            payload_size += segment.payload_size;
         }
 
         // If TX start matches with header ACK and it's a selective ACK, mark all segments delivered.
@@ -223,7 +218,9 @@ impl Segments {
                     }
                     removed += 1;
                     payload_size += segment.payload_size;
-                    self.ack_front().unwrap();
+                    self.len_bytes -= segment.payload_size;
+                    self.snd_una += 1;
+                    self.segments.pop_front().unwrap();
                 }
             }
             _ => {}
