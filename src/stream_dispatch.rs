@@ -24,7 +24,7 @@ use crate::{
     stream::UtpStream,
     stream_rx::{AssemblerAddRemoveResult, UserRx},
     stream_tx::{UserTx, UtpStreamWriteHalf},
-    stream_tx_segments::Segments,
+    stream_tx_segments::{OnAckResult, Segments},
     traits::{Transport, UtpEnvironment},
     utils::{log_before_and_after_if_changed, update_optional_waker, DropGuardSendBeforeDeath},
     UtpSocket,
@@ -653,6 +653,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         cx: &mut std::task::Context<'_>,
         socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<()> {
+        let mut on_ack_result = OnAckResult::default();
         while let Poll::Ready(msg) = self.rx.poll_recv(cx) {
             let msg = match msg {
                 Some(msg) => msg,
@@ -676,8 +677,58 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     return Ok(());
                 }
             };
-            self.process_incoming_message(cx, msg)?;
+            on_ack_result.update(&self.process_incoming_message(cx, msg)?);
         }
+
+        if on_ack_result.acked_segments_count > 0 {
+            // Cleanup user side of TX queue, remove the ACKed bytes from the front of it,
+            // and notify the writer.
+            {
+                let mut g = self.user_tx.locked.lock();
+                g.truncate_front(on_ack_result.acked_bytes)?;
+                if let Some(w) = g.buffer_has_space.take() {
+                    w.wake();
+                }
+
+                if g.is_empty() {
+                    if let Some(w) = g.buffer_flushed.take() {
+                        w.wake();
+                    }
+                }
+            }
+
+            trace!(?on_ack_result, "removed ACKed tx messages");
+
+            // Update RTO and congestion controller.
+            if let Some(rtt) = on_ack_result.new_rtt {
+                log_before_and_after_if_changed(
+                    "rtte:sample",
+                    self,
+                    |s| s.rtte.retransmission_timeout(),
+                    |s| s.rtte.sample(rtt),
+                    |_, _| RTTE_TRACING_LOG_LEVEL,
+                );
+            }
+            self.congestion_controller.on_ack(
+                self.this_poll.now,
+                on_ack_result.acked_bytes,
+                &self.rtte,
+            );
+
+            // Reset retransmit timer.
+            if self.user_tx_segments.is_empty() {
+                // rfc6298 5.2
+                self.timers.retransmit.set_for_idle();
+            } else {
+                // rfc6298 5.3
+                self.timers.retransmit.set_for_retransmit(
+                    self.this_poll.now,
+                    self.rtte.retransmission_timeout(),
+                    true,
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -691,7 +742,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         &mut self,
         cx: &mut std::task::Context<'_>,
         msg: UtpMessage,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<OnAckResult> {
         trace!("processing message");
 
         log_before_and_after_if_changed(
@@ -711,51 +762,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             |_, _| Level::DEBUG,
         );
 
-        // Remove everything from tx_buffer that was acked by this message.
         let on_ack_result = self
             .user_tx_segments
             .remove_up_to_ack(self.this_poll.now, &msg.header);
-
-        if on_ack_result.acked_segments_count > 0 {
-            {
-                let mut g = self.user_tx.locked.lock();
-                g.truncate_front(on_ack_result.acked_bytes)?;
-                if let Some(w) = g.buffer_has_space.take() {
-                    w.wake();
-                }
-
-                if g.is_empty() {
-                    if let Some(w) = g.buffer_flushed.take() {
-                        w.wake();
-                    }
-                }
-            }
-
-            trace!(?on_ack_result, "removed ACKed tx messages");
-
-            // Update RTO
-            if let Some(rtt) = on_ack_result.new_rtt {
-                log_before_and_after_if_changed(
-                    "rtte:sample",
-                    self,
-                    |s| s.rtte.retransmission_timeout(),
-                    |s| s.rtte.sample(rtt),
-                    |_, _| RTTE_TRACING_LOG_LEVEL,
-                );
-            }
-
-            if self.user_tx_segments.is_empty() {
-                // rfc6298 5.2
-                self.timers.retransmit.set_for_idle();
-            } else {
-                // rfc6298 5.3
-                self.timers.retransmit.set_for_retransmit(
-                    self.this_poll.now,
-                    self.rtte.retransmission_timeout(),
-                    true,
-                );
-            }
-        }
 
         self.last_remote_timestamp = msg.header.timestamp_microseconds;
         self.last_remote_timestamp_instant = self.this_poll.now;
@@ -764,14 +773,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.last_remote_window = msg.header.wnd_size;
         self.congestion_controller
             .set_remote_window(msg.header.wnd_size as usize);
-
-        if on_ack_result.acked_bytes > 0 {
-            self.congestion_controller.on_ack(
-                self.this_poll.now,
-                on_ack_result.acked_bytes,
-                &self.rtte,
-            );
-        }
 
         match msg.header.get_type() {
             Type::ST_DATA => {
@@ -785,7 +786,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         %self.last_consumed_remote_seq_nr,
                         "dropping message, we already ACKed it"
                     );
-                    return Ok(());
+                    return Ok(on_ack_result);
                 }
 
                 trace!(
@@ -857,7 +858,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     );
                     self.force_immedate_ack();
                 }
-                Ok(())
             }
             Type::ST_STATE => {
                 // Fast retransmit in case of duplicate ACKs
@@ -902,7 +902,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         self.local_rx_last_ack = Some(msg.header.ack_nr);
                     }
                 };
-                Ok(())
             }
             Type::ST_RESET => bail!("ST_RESET received"),
             Type::ST_FIN => {
@@ -915,13 +914,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     self.last_consumed_remote_seq_nr += 1;
                     self.try_send_last_message_to_user_rx(UserRxMessage::Eof);
                 }
-                Ok(())
             }
             Type::ST_SYN => {
                 warn!("ignoring unexpected ST_SYN packet: {:?}", msg.header);
-                Ok(())
             }
         }
+        Ok(on_ack_result)
     }
 
     /// TODO: implement this better

@@ -24,13 +24,21 @@ struct Segment {
     rtt: RttMeasurement,
 }
 
+pub fn rtt_min(rtt1: Option<Duration>, rtt2: Option<Duration>) -> Option<Duration> {
+    match (rtt1, rtt2) {
+        (None, None) => None,
+        (None, Some(r)) | (Some(r), None) => Some(r),
+        (Some(r1), Some(r2)) => Some(r1.min(r2)),
+    }
+}
+
 impl Segment {
     fn update_rtt(&self, now: Instant, rtt: &mut Option<Duration>) {
         match self.rtt {
             // This should not happen.
             RttMeasurement::NotSent | RttMeasurement::Retransmitted => {}
             RttMeasurement::SentTime(sent_ts) => {
-                *rtt = Some(now - sent_ts);
+                *rtt = rtt_min(*rtt, Some(now - sent_ts));
             }
         }
     }
@@ -76,10 +84,19 @@ impl SegmentIterItem<'_> {
     }
 }
 
+#[derive(Default)]
 pub struct OnAckResult {
     pub acked_segments_count: usize,
     pub acked_bytes: usize,
     pub new_rtt: Option<Duration>,
+}
+
+impl OnAckResult {
+    pub(crate) fn update(&mut self, other: &OnAckResult) {
+        self.acked_segments_count += other.acked_segments_count;
+        self.acked_bytes += other.acked_bytes;
+        self.new_rtt = rtt_min(self.new_rtt, other.new_rtt);
+    }
 }
 
 impl core::fmt::Debug for OnAckResult {
