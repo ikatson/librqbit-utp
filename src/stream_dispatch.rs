@@ -1160,8 +1160,7 @@ pub struct StreamArgs {
     last_consumed_remote_seq_nr: SeqNr,
     last_sent_ack_nr: SeqNr,
 
-    syn_sent_ts: Option<Instant>,
-    ack_received_ts: Option<Instant>,
+    rtt: Option<Duration>,
     remote_window: u32,
 
     state: VirtualSocketState,
@@ -1190,9 +1189,7 @@ impl StreamArgs {
             last_sent_ack_nr: remote_ack.seq_nr - 1,
             last_consumed_remote_seq_nr: remote_ack.seq_nr - 1,
 
-            // For RTTE
-            syn_sent_ts: Some(syn_sent_ts),
-            ack_received_ts: Some(ack_received_ts),
+            rtt: Some(ack_received_ts - syn_sent_ts),
 
             state: VirtualSocketState::Established,
 
@@ -1214,8 +1211,7 @@ impl StreamArgs {
             last_sent_ack_nr: remote_syn.seq_nr,
 
             // For RTTE
-            syn_sent_ts: None,
-            ack_received_ts: None,
+            rtt: None,
 
             state: VirtualSocketState::SynReceived,
             parent_span: None,
@@ -1266,8 +1262,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_sent_seq_nr,
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
-            syn_sent_ts,
-            ack_received_ts,
+            rtt,
             remote_window,
             parent_span,
             state,
@@ -1317,11 +1312,11 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             local_rx_dup_acks: 0,
             user_tx,
             rtte: {
-                let mut rtt = RttEstimator::default();
-                if let (Some(sent), Some(recv)) = (syn_sent_ts, ack_received_ts) {
-                    rtt.sample(recv - sent);
+                let mut rtte = RttEstimator::default();
+                if let Some(rtt) = rtt {
+                    rtte.sample(rtt);
                 }
-                rtt
+                rtte
             },
             this_poll: ThisPoll {
                 now,
