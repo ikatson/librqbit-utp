@@ -197,7 +197,8 @@ pub(crate) enum UserRxMessage {
 }
 
 impl UserRxMessage {
-    pub fn len_bytes(&self) -> usize {
+    #[cfg(test)]
+    pub fn len_bytes_test(&self) -> usize {
         match &self {
             UserRxMessage::Payload(buf) => buf.payload().len(),
             _ => 0,

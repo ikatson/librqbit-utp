@@ -7,62 +7,9 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use msgq::MsgQueue;
 use parking_lot::Mutex;
 use tokio::io::AsyncRead;
 use tracing::{trace, warn};
-
-mod msgq {
-    use std::collections::VecDeque;
-
-    use crate::stream_dispatch::UserRxMessage;
-
-    pub struct MsgQueue {
-        queue: VecDeque<UserRxMessage>,
-        len_bytes: usize,
-        capacity: usize,
-    }
-
-    impl MsgQueue {
-        pub fn new(capacity: usize) -> Self {
-            Self {
-                queue: Default::default(),
-                len_bytes: 0,
-                capacity,
-            }
-        }
-
-        #[cfg(test)]
-        pub fn len_bytes(&self) -> usize {
-            self.len_bytes
-        }
-
-        pub fn window(&self) -> usize {
-            self.capacity - self.len_bytes
-        }
-
-        #[cfg(test)]
-        pub fn is_full(&self) -> bool {
-            self.len_bytes == self.capacity
-        }
-
-        pub fn pop_front(&mut self) -> Option<UserRxMessage> {
-            let msg = self.queue.pop_front()?;
-            self.len_bytes -= msg.len_bytes();
-            Some(msg)
-        }
-
-        pub fn try_push_back(&mut self, msg: UserRxMessage) -> Result<(), UserRxMessage> {
-            let len = msg.len_bytes();
-            if self.capacity - self.len_bytes < len {
-                return Err(msg);
-            }
-            self.queue.push_back(msg);
-            self.len_bytes += len;
-            Ok(())
-        }
-    }
-}
 
 use crate::{
     message::UtpMessage, raw::selective_ack::SelectiveAck, stream_dispatch::UserRxMessage,
@@ -71,26 +18,44 @@ use crate::{
 
 pub struct UtpStreamReadHalf {
     current: Option<BeingRead>,
+    queue: tokio::sync::mpsc::UnboundedReceiver<UserRxMessage>,
     shared: Arc<UserRxShared>,
 }
 
 impl UtpStreamReadHalf {
     #[cfg(test)]
     pub async fn read_all_available(&mut self) -> std::io::Result<Vec<u8>> {
+        use std::{future::poll_fn, task::ready};
+
+        use futures::FutureExt;
+        use tokio::io::AsyncReadExt;
+
         let mut buf = vec![0u8; 2 * 1024 * 1024];
         let mut offset = 0;
-        let mut g = self.shared.locked.lock();
-        while let Some(m) = g.queue.pop_front() {
-            match m {
-                UserRxMessage::Payload(utp_message) => {
-                    buf[offset..offset + utp_message.payload().len()]
-                        .copy_from_slice(utp_message.payload());
-                    offset += utp_message.payload().len();
-                }
-                UserRxMessage::Error(e) => return Err(std::io::Error::other(e)),
-                UserRxMessage::Eof => break,
+        poll_fn(|cx| {
+            if self.queue.is_empty() {
+                buf.truncate(offset);
+                return Poll::Ready(Ok(()));
             }
-        }
+
+            loop {
+                let read = self.read(&mut buf[offset..]);
+                tokio::pin!(read);
+                match ready!(read.poll_unpin(cx)) {
+                    Ok(len) => {
+                        offset += len;
+
+                        if self.queue.is_empty() {
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                    Err(e) => {
+                        return Poll::Ready(Err(e));
+                    }
+                }
+            }
+        })
+        .await?;
         buf.truncate(offset);
         Ok(buf)
     }
@@ -108,7 +73,6 @@ impl AsyncRead for UtpStreamReadHalf {
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let mut written = 0usize;
-        let mut dispatcher_dead = false;
 
         while buf.remaining() > 0 {
             // If there was a previous message we haven't read till the end, do it.
@@ -131,38 +95,31 @@ impl AsyncRead for UtpStreamReadHalf {
                 continue;
             }
 
-            let mut g = self.shared.locked.lock();
-            if let Some(msg) = g.queue.pop_front() {
-                match msg {
-                    UserRxMessage::Payload(msg) => {
-                        drop(g);
-                        self.current = Some(BeingRead { msg, offset: 0 })
-                    }
-                    UserRxMessage::Error(msg) => {
-                        return Poll::Ready(Err(std::io::Error::other(msg)))
-                    }
-                    UserRxMessage::Eof => return Poll::Ready(Ok(())),
+            match self.queue.poll_recv(cx) {
+                Poll::Ready(Some(UserRxMessage::Payload(msg))) => {
+                    self.current = Some(BeingRead { msg, offset: 0 })
                 }
-            } else {
-                if g.writer_dead {
-                    dispatcher_dead = true;
-                } else {
-                    update_optional_waker(&mut g.reader_waker, cx);
+                Poll::Ready(Some(UserRxMessage::Error(msg))) => {
+                    return Poll::Ready(Err(std::io::Error::other(msg)))
                 }
-                break;
-            }
+                Poll::Ready(Some(UserRxMessage::Eof)) => return Poll::Ready(Ok(())),
+                Poll::Ready(None) => {
+                    // This can happen only if dispatcher died and didn't send anything to us.
+                    return Poll::Ready(Err(std::io::Error::other("dispatcher dead")));
+                }
+                Poll::Pending => {
+                    break;
+                }
+            };
         }
 
         if written > 0 {
             let mut g = self.shared.locked.lock();
-            if let Some(waker) = g.dispatcher_waker.take() {
+            g.len_bytes -= written;
+            if let Some(waker) = g.flush_waker.take() {
                 waker.wake();
             }
             return Poll::Ready(Ok(()));
-        }
-
-        if dispatcher_dead {
-            return Poll::Ready(Err(std::io::Error::other("dispatcher dead")));
         }
 
         Poll::Pending
@@ -175,46 +132,25 @@ struct BeingRead {
 }
 
 struct UserRxSharedLocked {
-    reader_dead: bool,
-    writer_dead: bool,
-    queue: MsgQueue,
-    dispatcher_waker: Option<Waker>,
-    reader_waker: Option<Waker>,
+    len_bytes: usize,
+    flush_waker: Option<Waker>,
 }
 
 struct UserRxShared {
     locked: Mutex<UserRxSharedLocked>,
-}
-
-impl Drop for UtpStreamReadHalf {
-    fn drop(&mut self) {
-        let mut g = self.shared.locked.lock();
-        g.reader_dead = true;
-        if let Some(waker) = g.dispatcher_waker.take() {
-            waker.wake();
-        }
-    }
-}
-
-impl Drop for UserRx {
-    fn drop(&mut self) {
-        let mut g = self.shared.locked.lock();
-        g.writer_dead = true;
-        if let Some(waker) = g.reader_waker.take() {
-            waker.wake();
-        }
-    }
+    capacity: usize,
 }
 
 impl UserRxShared {
     #[cfg(test)]
     pub fn is_full_test(&self) -> bool {
-        self.locked.lock().queue.is_full()
+        self.locked.lock().len_bytes >= self.capacity
     }
 }
 
 pub struct UserRx {
     shared: Arc<UserRxShared>,
+    tx: tokio::sync::mpsc::UnboundedSender<UserRxMessage>,
     ooq: OutOfOrderQueue,
     max_incoming_payload: NonZeroUsize,
     last_remaining_rx_window: usize,
@@ -226,22 +162,23 @@ impl UserRx {
         out_of_order_max_packets: NonZeroUsize,
         max_incoming_payload: NonZeroUsize,
     ) -> (UserRx, UtpStreamReadHalf) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = Arc::new(UserRxShared {
             locked: Mutex::new(UserRxSharedLocked {
-                dispatcher_waker: None,
-                reader_waker: None,
-                queue: MsgQueue::new(max_rx_bytes.get()),
-                reader_dead: false,
-                writer_dead: false,
+                len_bytes: 0,
+                flush_waker: None,
             }),
+            capacity: max_rx_bytes.get(),
         });
         let read_half = UtpStreamReadHalf {
             current: None,
+            queue: rx,
             shared: shared.clone(),
         };
         let out_of_order_queue = OutOfOrderQueue::new(out_of_order_max_packets);
         let write_half = UserRx {
             shared,
+            tx,
             ooq: out_of_order_queue,
             max_incoming_payload,
             last_remaining_rx_window: max_rx_bytes.get(),
@@ -250,11 +187,11 @@ impl UserRx {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.shared.locked.lock().reader_dead
+        self.tx.is_closed()
     }
 
     pub fn remaining_rx_window(&self) -> usize {
-        if self.is_closed() {
+        if self.tx.is_closed() {
             0
         } else {
             self.last_remaining_rx_window
@@ -271,10 +208,10 @@ impl UserRx {
         let filled_front_bytes: usize = self.ooq.filled_front_bytes();
         let mut remaining_rx_window = {
             let mut g = self.shared.locked.lock();
-            let remaining_window = g.queue.window();
+            let remaining_window = self.shared.capacity.saturating_sub(g.len_bytes);
             if remaining_window.saturating_sub(filled_front_bytes) < self.max_incoming_payload.get()
             {
-                update_optional_waker(&mut g.dispatcher_waker, cx);
+                update_optional_waker(&mut g.flush_waker, cx);
             }
             remaining_window
         };
@@ -284,13 +221,13 @@ impl UserRx {
         let mut flushed_packets = 0;
 
         while let Some(len) = self.ooq.send_front_if_fits(remaining_rx_window, |msg| {
-            let mut g = self.shared.locked.lock();
-            if g.reader_dead {
+            self.tx.send(UserRxMessage::Payload(msg)).map_err(|e| {
                 debug_every_ms!(200, "reader is dead, could not send UtpMesage to it");
-                return Err(msg);
-            }
-            g.queue.try_push_back(UserRxMessage::Payload(msg)).unwrap();
-            Ok(())
+                match e.0 {
+                    UserRxMessage::Payload(msg) => msg,
+                    _ => unreachable!(),
+                }
+            })
         }) {
             flushed_bytes += len;
             remaining_rx_window -= len;
@@ -298,9 +235,7 @@ impl UserRx {
         }
 
         if flushed_bytes > 0 {
-            if let Some(w) = self.shared.locked.lock().reader_waker.take() {
-                w.wake();
-            }
+            self.shared.locked.lock().len_bytes += flushed_bytes;
             trace!(
                 packets = flushed_packets,
                 bytes = flushed_bytes,
@@ -323,11 +258,7 @@ impl UserRx {
     }
 
     pub fn enqueue_last_message(&self, msg: UserRxMessage) {
-        let mut g = self.shared.locked.lock();
-        g.queue.try_push_back(msg).unwrap();
-        if let Some(waker) = g.reader_waker.take() {
-            waker.wake();
-        }
+        let _ = self.tx.send(msg);
     }
 
     pub fn selective_ack(&self) -> Option<SelectiveAck> {
@@ -336,7 +267,7 @@ impl UserRx {
 
     #[cfg(test)]
     pub fn len_test(&self) -> usize {
-        self.shared.locked.lock().queue.len_bytes()
+        self.shared.locked.lock().len_bytes
     }
 
     pub fn assembler_empty(&self) -> bool {
@@ -383,13 +314,20 @@ impl UserRx {
 
     #[cfg(test)]
     pub fn is_flush_waker_registered(&self) -> bool {
-        self.shared.locked.lock().dispatcher_waker.is_some()
+        self.shared.locked.lock().flush_waker.is_some()
     }
 
     #[cfg(test)]
     fn enqueue_test(&self, msg: UserRxMessage) {
         let mut g = self.shared.locked.lock();
-        g.queue.try_push_back(msg).unwrap();
+        let win = self.shared.capacity.saturating_sub(g.len_bytes);
+        let msglen = msg.len_bytes_test();
+        if msglen < win {
+            panic!("not enough space")
+        }
+
+        self.tx.send(msg).unwrap();
+        g.len_bytes += msglen;
     }
 }
 
