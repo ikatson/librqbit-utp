@@ -553,6 +553,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         };
 
         // Only send fin after all the outstanding data was sent.
+        // TODO: move last_sent_seq_nr even if packets were delivered previously
+        // in "send_tx_queue"
         if seq_nr - self.last_sent_seq_nr != 1 {
             return Ok(());
         }
@@ -1093,7 +1095,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             self.maybe_prepare_for_retransmission();
 
-            pending_if_cannot_send!(self.split_tx_queue_into_segments(cx));
+            bail_if_err!(self.split_tx_queue_into_segments(cx));
 
             // (Re)send tx queue.
             pending_if_cannot_send!(self.send_tx_queue(cx, socket));
