@@ -3342,56 +3342,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_window_update_ack_after_read() {
-        setup_test_logging();
-
-        // Configure socket with very small receive buffer to test flow control
-        let mss = 5;
-        let opts = SocketOpts {
-            rx_bufsize: Some(mss * 2),
-            mtu: Some(mss + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
-            ..Default::default()
-        };
-
-        let mut t = make_test_vsock(opts, true);
-        t.poll_once_assert_pending().await;
-        assert_eq!(t.take_sent().len(), 1); // syn ack
-
-        // Fill up the receive buffer
-        t.send_data(1, t.vsock.last_sent_seq_nr, "aaaaa");
-        t.send_data(2, t.vsock.last_sent_seq_nr, "bbbbb");
-        t.poll_once_assert_pending().await;
-
-        // Verify window is now 0
-        assert_eq!(t.vsock.rx_window(), 0);
-
-        // Ensure we send back 0 window
-        let sent = t.take_sent();
-        assert!(!sent.is_empty(), "Should have sent ACKs");
-        let last_window = sent.last().unwrap().header.wnd_size;
-        assert_eq!(last_window, 0, "Window should be zero when buffer full");
-
-        // Now read some data to free up buffer space
-        let mut buf = vec![0u8; 5];
-        t.stream
-            .as_mut()
-            .unwrap()
-            .read_exact(&mut buf)
-            .await
-            .unwrap();
-        t.poll_once_assert_pending().await;
-
-        // Should send window update ACK
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "Should send window update ACK");
-        assert_eq!(sent[0].header.get_type(), Type::ST_STATE);
-        assert!(
-            sent[0].header.wnd_size > 0,
-            "Window size should be non-zero after reading"
-        );
-    }
-
-    #[tokio::test]
     async fn test_window_update_sent_when_window_less_than_mss() {
         setup_test_logging();
 
@@ -3438,5 +3388,73 @@ mod tests {
         assert_eq!(sent.len(), 1, "Should send window update ACK");
         assert_eq!(sent[0].header.get_type(), Type::ST_STATE);
         assert_eq!(sent[0].header.wnd_size, 9);
+    }
+
+    #[tokio::test]
+    async fn test_window_update_ack_after_read_with_waking() {
+        setup_test_logging();
+
+        // Configure socket with very small receive buffer to test flow control
+        let mss = 5;
+        let opts = SocketOpts {
+            rx_bufsize: Some(mss * 2),
+            mtu: Some(mss + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
+            ..Default::default()
+        };
+
+        let mut t = make_test_vsock(opts, true);
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 1); // syn ack
+
+        let ack_nr = t.vsock.last_sent_seq_nr;
+        let connection_id = t.vsock.conn_id_send + 1;
+        let make_msg = |seq_nr, payload| {
+            make_msg(
+                UtpHeader {
+                    htype: Type::ST_DATA,
+                    connection_id,
+                    wnd_size: 1024 * 1024,
+                    seq_nr,
+                    ack_nr,
+                    ..Default::default()
+                },
+                payload,
+            )
+        };
+
+        tokio::spawn(t.vsock);
+
+        // Fill up the receive buffer
+        t.tx.send(make_msg(1.into(), "aaaaa")).unwrap();
+        t.tx.send(make_msg(2.into(), "bbbbb")).unwrap();
+
+        tokio::task::yield_now().await;
+
+        // Ensure we send back 0 window
+        let sent = t.transport.take_sent_utpmessages();
+        assert!(!sent.is_empty(), "Should have sent ACKs");
+        let last_window = sent.last().unwrap().header.wnd_size;
+        assert_eq!(last_window, 0, "Window should be zero when buffer full");
+
+        // Now read some data to free up buffer space
+        let mut buf = vec![0u8; 5];
+        t.stream
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut buf)
+            .await
+            .unwrap();
+
+        // Reading should wake up the vsock. On yield, it should get polled.
+        tokio::task::yield_now().await;
+
+        // Should send window update ACK
+        let sent = t.transport.take_sent_utpmessages();
+        assert_eq!(sent.len(), 1, "Should send window update ACK");
+        assert_eq!(sent[0].header.get_type(), Type::ST_STATE);
+        assert!(
+            sent[0].header.wnd_size > 0,
+            "Window size should be non-zero after reading"
+        );
     }
 }
