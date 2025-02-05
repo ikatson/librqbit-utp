@@ -234,8 +234,6 @@ struct VirtualSocket<T, Env> {
 
     // The last seen value of uTP's "last_remote_timestamp"
     last_remote_timestamp: u32,
-    /// The timestamp of the last packet received.
-    last_remote_timestamp_instant: Instant,
     last_remote_window: u32,
 
     // The last seq_nr we told the other end about.
@@ -803,7 +801,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .remove_up_to_ack(self.this_poll.now, &msg.header);
 
         self.last_remote_timestamp = msg.header.timestamp_microseconds;
-        self.last_remote_timestamp_instant = self.this_poll.now;
 
         let is_window_update = self.last_remote_window != msg.header.wnd_size;
         self.last_remote_window = msg.header.wnd_size;
@@ -1300,7 +1297,6 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 ack_delay_timer: AckDelayTimer::Idle,
             },
             last_remote_timestamp,
-            last_remote_timestamp_instant: now,
             last_remote_window: remote_window,
             last_sent_seq_nr,
             last_consumed_remote_seq_nr,
