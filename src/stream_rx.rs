@@ -1,14 +1,19 @@
 use std::{
     collections::VecDeque,
+    intrinsics::unreachable,
     num::NonZeroUsize,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering::SeqCst},
+        Arc,
+    },
     task::{Poll, Waker},
 };
 
 use anyhow::{bail, Context};
+use futures::task::AtomicWaker;
 use parking_lot::Mutex;
-use tokio::io::AsyncRead;
+use tokio::{io::AsyncRead, sync::mpsc::error::SendError};
 use tracing::{trace, warn};
 
 use crate::{
@@ -97,7 +102,8 @@ impl AsyncRead for UtpStreamReadHalf {
 
             match self.queue.poll_recv(cx) {
                 Poll::Ready(Some(UserRxMessage::Payload(msg))) => {
-                    self.current = Some(BeingRead { msg, offset: 0 })
+                    self.shared.len_bytes.fetch_sub(msg.data.len(), SeqCst);
+                    self.current = Some(BeingRead { msg, offset: 0 });
                 }
                 Poll::Ready(Some(UserRxMessage::Error(msg))) => {
                     return Poll::Ready(Err(std::io::Error::other(msg)))
@@ -114,11 +120,7 @@ impl AsyncRead for UtpStreamReadHalf {
         }
 
         if written > 0 {
-            let mut g = self.shared.locked.lock();
-            g.len_bytes -= written;
-            if let Some(waker) = g.flush_waker.take() {
-                waker.wake();
-            }
+            self.shared.dispatcher_waker.wake();
             return Poll::Ready(Ok(()));
         }
 
@@ -131,20 +133,16 @@ struct BeingRead {
     offset: usize,
 }
 
-struct UserRxSharedLocked {
-    len_bytes: usize,
-    flush_waker: Option<Waker>,
-}
-
 struct UserRxShared {
-    locked: Mutex<UserRxSharedLocked>,
+    len_bytes: AtomicUsize,
+    dispatcher_waker: AtomicWaker,
     capacity: usize,
 }
 
 impl UserRxShared {
     #[cfg(test)]
     pub fn is_full_test(&self) -> bool {
-        self.locked.lock().len_bytes >= self.capacity
+        self.len_bytes.load(SeqCst) >= self.capacity
     }
 }
 
@@ -164,11 +162,9 @@ impl UserRx {
     ) -> (UserRx, UtpStreamReadHalf) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = Arc::new(UserRxShared {
-            locked: Mutex::new(UserRxSharedLocked {
-                len_bytes: 0,
-                flush_waker: None,
-            }),
             capacity: max_rx_bytes.get(),
+            len_bytes: AtomicUsize::new(0),
+            dispatcher_waker: Default::default(),
         });
         let read_half = UtpStreamReadHalf {
             current: None,
@@ -205,37 +201,44 @@ impl UserRx {
     }
 
     pub fn flush(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<usize> {
-        let filled_front_bytes: usize = self.ooq.filled_front_bytes();
-        let mut remaining_rx_window = {
-            let mut g = self.shared.locked.lock();
-            let remaining_window = self.shared.capacity.saturating_sub(g.len_bytes);
-            if remaining_window.saturating_sub(filled_front_bytes) < self.max_incoming_payload.get()
-            {
-                update_optional_waker(&mut g.flush_waker, cx);
+        let mut flushed_bytes = 0usize;
+        let mut flushed_packets = 0usize;
+
+        while let Some(msg) = self.ooq.pop_front() {
+            let len = msg.data.len();
+            // Lengths increase need to happen before we push to the queue.
+            let prev_len = self.shared.len_bytes.fetch_add(len, SeqCst);
+            if prev_len > self.shared.capacity {
+                self.shared.len_bytes.fetch_sub(len, SeqCst);
+
+                // Register needs to happen before it's woken up.
+                // TODO: how to guarantee that? We need to loop a couple times and ensure this still holds.
+                // We need to prevent the following bad sequence:
+                // 1. we check here if queue is full
+                // 2. the other thread cleans it up and updates len_bytes.
+                // 3. the other thread wakes
+                // 4. we register the waker
+                self.shared.dispatcher_waker.register(cx.waker());
+                self.ooq.undo_pop_front(msg);
+
+                // Break ONLY if we know wake couldn't happen before we registered the waker.
+                break;
             }
-            remaining_window
-        };
-
-        // Flush as many items as possible from the beginning of out of order queue to the user RX
-        let mut flushed_bytes = 0;
-        let mut flushed_packets = 0;
-
-        while let Some(len) = self.ooq.send_front_if_fits(remaining_rx_window, |msg| {
-            self.tx.send(UserRxMessage::Payload(msg)).map_err(|e| {
-                debug_every_ms!(200, "reader is dead, could not send UtpMesage to it");
-                match e.0 {
-                    UserRxMessage::Payload(msg) => msg,
-                    _ => unreachable!(),
+            match self.tx.send(UserRxMessage::Payload(msg)) {
+                Ok(()) => {
+                    flushed_bytes += len;
+                    flushed_packets += 1;
                 }
-            })
-        }) {
-            flushed_bytes += len;
-            remaining_rx_window -= len;
-            flushed_packets += 1;
+                Err(SendError(UserRxMessage::Payload(msg))) => {
+                    // Reader is dead. TODO: remember this somewhere in UserRx.
+                    self.shared.len_bytes.fetch_sub(msg.data.len(), SeqCst);
+                    self.ooq.undo_pop_front(msg);
+                }
+                _ => unreachable!(),
+            }
         }
 
         if flushed_bytes > 0 {
-            self.shared.locked.lock().len_bytes += flushed_bytes;
             trace!(
                 packets = flushed_packets,
                 bytes = flushed_bytes,
@@ -267,7 +270,7 @@ impl UserRx {
 
     #[cfg(test)]
     pub fn len_test(&self) -> usize {
-        self.shared.locked.lock().len_bytes
+        self.shared.len_bytes.load(SeqCst)
     }
 
     pub fn assembler_empty(&self) -> bool {
@@ -314,20 +317,20 @@ impl UserRx {
 
     #[cfg(test)]
     pub fn is_flush_waker_registered(&self) -> bool {
-        self.shared.locked.lock().flush_waker.is_some()
+        let w = self.shared.dispatcher_waker.take();
+        if let Some(w) = w {
+            self.shared.dispatcher_waker.register(&w);
+            true
+        } else {
+            false
+        }
     }
 
     #[cfg(test)]
     fn enqueue_test(&self, msg: UserRxMessage) {
-        let mut g = self.shared.locked.lock();
-        let win = self.shared.capacity.saturating_sub(g.len_bytes);
         let msglen = msg.len_bytes_test();
-        if msglen < win {
-            panic!("not enough space")
-        }
-
         self.tx.send(msg).unwrap();
-        g.len_bytes += msglen;
+        self.shared.len_bytes.fetch_add(msglen, SeqCst);
     }
 }
 
@@ -367,32 +370,54 @@ impl OutOfOrderQueue {
             .sum()
     }
 
-    pub fn send_front_if_fits(
-        &mut self,
-        window: usize,
-        send_fn: impl FnOnce(UtpMessage) -> Result<(), UtpMessage>,
-    ) -> Option<usize> {
+    pub fn pop_front(&mut self) -> Option<UtpMessage> {
         if self.filled_front == 0 {
-            return None;
-        }
-        if self.data[0].payload().len() > window {
             return None;
         }
         let msg = self.data.pop_front()?;
         let len = msg.payload().len();
-        match send_fn(msg) {
-            Ok(()) => {}
-            Err(msg) => {
-                self.data.push_front(msg);
-                return None;
-            }
-        }
         self.filled_front -= 1;
         self.len -= 1;
         self.len_bytes -= len;
         self.data.push_back(Default::default());
-        Some(len)
+        Some(msg)
     }
+
+    pub fn undo_pop_front(&mut self, msg: UtpMessage) {
+        let len = msg.data.len();
+        self.data.push_front(msg);
+        self.len += 1;
+        self.len_bytes += len;
+        self.filled_front += 1;
+        self.data.pop_back();
+    }
+
+    // pub fn send_front_if_fits(
+    //     &mut self,
+    //     window: usize,
+    //     send_fn: impl FnOnce(UtpMessage) -> Result<(), UtpMessage>,
+    // ) -> Option<usize> {
+    //     if self.filled_front == 0 {
+    //         return None;
+    //     }
+    //     if self.data[0].payload().len() > window {
+    //         return None;
+    //     }
+    //     let msg = self.data.pop_front()?;
+    //     let len = msg.payload().len();
+    //     match send_fn(msg) {
+    //         Ok(()) => {}
+    //         Err(msg) => {
+    //             self.data.push_front(msg);
+    //             return None;
+    //         }
+    //     }
+    //     self.filled_front -= 1;
+    //     self.len -= 1;
+    //     self.len_bytes -= len;
+    //     self.data.push_back(Default::default());
+    //     Some(len)
+    // }
 
     pub fn is_empty(&self) -> bool {
         self.filled_front == self.len
