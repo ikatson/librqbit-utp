@@ -199,7 +199,7 @@ pub(crate) struct RequestWithSpan<V> {
     tx: oneshot::Sender<V>,
 }
 
-type ConnectRequest = RequestWithSpan<UtpStream>;
+type ConnectRequest = RequestWithSpan<anyhow::Result<UtpStream>>;
 type Acceptor<T, E> = RequestWithSpan<UtpStreamStarter<T, E>>;
 
 impl<V> RequestWithSpan<V> {
@@ -241,7 +241,7 @@ struct Connecting {
     token: ConnectToken,
     start: Instant,
     seq_nr: SeqNr,
-    requester: RequestWithSpan<UtpStream>,
+    requester: ConnectRequest,
 }
 
 const MAX_CONNECTING_PER_ADDR: usize = 4;
@@ -449,7 +449,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                         return;
                     }
                     Err(e) => {
-                        debug!(?addr, "error sending, dropping connect(): {e:#}");
+                        let _ = sender.tx.send(Err(e).context("error sending SYN"));
                         return;
                     }
                 }
@@ -512,7 +512,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
 
         let stream = UtpStreamStarter::new(&self.socket, addr, rx, args).start();
-        if conn.requester.tx.send(stream).is_ok() {
+        if conn.requester.tx.send(Ok(stream)).is_ok() {
             trace!(?recv_key, "created stream and passed to connector");
         } else {
             debug!(?recv_key, "connecting receiver is dead. dropping");
@@ -757,11 +757,9 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             &self.control_requests,
         );
 
-        let stream = rx.await.context("dispatcher dead")?;
+        let stream_or_err = rx.await.context("dispatcher dead")?;
         guard.disarm();
-
-        trace!("connected");
-        Ok(stream)
+        stream_or_err
     }
 
     /// Returns true if saw Poll::Pending
