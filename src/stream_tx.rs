@@ -6,7 +6,10 @@ use std::{
 
 use anyhow::bail;
 use parking_lot::Mutex;
-use ringbuf::traits::{Consumer, Observer, Producer};
+use ringbuf::{
+    storage::Heap,
+    traits::{Consumer, Observer, Producer},
+};
 use tokio::io::AsyncWrite;
 use tracing::trace;
 
@@ -18,7 +21,7 @@ pub struct UserTxLocked {
     // When the writer shuts down, or both reader and writer die, the stream is closed.
     closed: bool,
 
-    buffer: ringbuf::HeapRb<u8>,
+    buffer: ringbuf::LocalRb<Heap<u8>>,
 
     // This is woken up by dispatcher when the buffer has space if it didn't have it previously.
     pub buffer_has_space: Option<Waker>,
@@ -99,7 +102,7 @@ impl UserTx {
     pub fn new(capacity: NonZeroUsize) -> Arc<Self> {
         Arc::new(UserTx {
             locked: Mutex::new(UserTxLocked {
-                buffer: ringbuf::HeapRb::new(capacity.get()),
+                buffer: ringbuf::LocalRb::new(capacity.get()),
                 buffer_has_space: None,
                 buffer_has_data: None,
                 buffer_flushed: None,
