@@ -2940,6 +2940,7 @@ mod tests {
         let mut t = make_test_vsock(
             SocketOpts {
                 rx_bufsize: Some(DATA_SIZE),
+                mtu: Some(CHUNK_SIZE + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
                 ..Default::default()
             },
             false,
