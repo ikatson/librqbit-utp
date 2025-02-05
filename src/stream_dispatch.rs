@@ -566,6 +566,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if g.is_empty() {
             update_optional_waker(&mut g.buffer_has_data, cx);
 
+            // TODO: we need to have some kind of a timer here in case the other end doesn't answer.
+            // Otherwise, we'll just keep retransmitting forever.
             if g.is_closed() {
                 let changed = log_before_and_after_if_changed(
                     "state",
