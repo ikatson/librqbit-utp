@@ -1597,8 +1597,9 @@ mod tests {
     #[tokio::test]
     async fn test_doesnt_send_until_window_updated() {
         setup_test_logging();
-        let mut t = make_test_vsock(Default::default(), false);
-
+        let mut t = make_test_vsock(Default::default(), true);
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 1); // intial SYN_ACK
         assert_eq!(t.vsock.last_remote_window, 0);
 
         t.stream
@@ -1632,8 +1633,9 @@ mod tests {
     #[tokio::test]
     async fn test_sends_up_to_remote_window_only_single_msg() {
         setup_test_logging();
-        let mut t = make_test_vsock(Default::default(), false);
-
+        let mut t = make_test_vsock(Default::default(), true);
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 1); // syn ack
         assert_eq!(t.vsock.last_remote_window, 0);
 
         t.stream
@@ -1671,9 +1673,10 @@ mod tests {
     #[tokio::test]
     async fn test_sends_up_to_remote_window_only_multi_msg() {
         setup_test_logging();
-        let mut t = make_test_vsock(Default::default(), false);
+        let mut t = make_test_vsock(Default::default(), true);
         t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(2).unwrap();
-
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 1); // syn ack
         assert_eq!(t.vsock.last_remote_window, 0);
 
         t.stream
