@@ -921,20 +921,24 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(on_ack_result)
     }
 
+    fn should_send_window_update(&self) -> bool {
+        // if we need to send a window update, also send immediately.
+        // TODO: this is clumsy, but should do the job in case the reader was fully flow controlled.
+        if self.last_sent_window as usize <= self.socket_opts.max_incoming_payload_size.get()
+            && self.rx_window() > self.last_sent_window
+        {
+            trace!("need to send a window update");
+            return true;
+        }
+        false
+    }
+
     /// Return whether to send ACK immediately due to the amount of unacknowledged data.
     /// https://datatracker.ietf.org/doc/html/rfc9293#section-3.8.6.3
     fn immediate_ack_to_transmit(&self) -> bool {
-        // if we need to send a window update, also send immediately.
-        // TODO: this is clumsy, but should do the job in case the reader was fully flow controlled.
-
-        // if self.last_sent_window as usize <= self.socket_opts.max_incoming_payload_size.get()
-        //     && self.rx_window() > self.last_sent_window
-        // {
-        //     trace!("need to send a window update");
-        //     return true;
-        // }
-
-        self.consumed_but_unacked_bytes >= 2 * self.socket_opts.max_incoming_payload_size.get()
+        self.should_send_window_update()
+            || self.consumed_but_unacked_bytes
+                >= 2 * self.socket_opts.max_incoming_payload_size.get()
     }
 
     fn force_immedate_ack(&mut self) {
@@ -1288,7 +1292,13 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 &socket.control_requests,
             ),
             user_rx,
-            last_sent_window: 0,
+            last_sent_window: if matches!(state, VirtualSocketState::Established) {
+                // Pretend we sent the window so that it doesn't trigger a window update packet
+                // without any data sent.
+                socket.opts().max_user_rx_buffered_bytes.get() as u32
+            } else {
+                0
+            },
         };
 
         let stream = UtpStream::new(read_half, write_half, vsock.remote);
