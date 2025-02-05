@@ -1,4 +1,6 @@
-// TODO: in case the other end doesn't answer we need to stop the dispatcher. Otherwise it'll leak memory.
+// TODO: When someone connects to us and doesn't send anything - we keep sending STATE every 200ms forever. But need to die.
+
+// (Done) TODO: in case the other end doesn't answer we need to stop the dispatcher. Otherwise it'll leak memory.
 // currently, only if we send the whole tx queue we check if it's dead or not and transition to FIN.
 
 // RTT, RTO, congestion

@@ -35,7 +35,11 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VirtualSocketState {
     SynReceived,
-    SynAckSent { seq_nr: SeqNr, expires_at: Instant },
+    SynAckSent {
+        seq_nr: SeqNr,
+        expires_at: Instant,
+        count: usize,
+    },
 
     Established,
 
@@ -43,20 +47,30 @@ enum VirtualSocketState {
     Finished,
 
     // We sent FIN, not yet ACKed
-    FinWait1 { our_fin: SeqNr },
+    FinWait1 {
+        our_fin: SeqNr,
+    },
 
     // Our fin was ACKed
     FinWait2,
 
     // We received a FIN, but we may still send data.
-    CloseWait { remote_fin: SeqNr },
+    CloseWait {
+        remote_fin: SeqNr,
+    },
 
     // We and remote sent FINs, but none were ACKed
-    Closing { our_fin: SeqNr, remote_fin: SeqNr },
+    Closing {
+        our_fin: SeqNr,
+        remote_fin: SeqNr,
+    },
 
     // Both sides closed, we are waiting for final ACK.
     // After this we just kill the socket.
-    LastAck { our_fin: SeqNr, remote_fin: SeqNr },
+    LastAck {
+        our_fin: SeqNr,
+        remote_fin: SeqNr,
+    },
 }
 
 impl VirtualSocketState {
@@ -1008,15 +1022,18 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         cx: &mut std::task::Context<'_>,
         socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<()> {
-        let synack_seq_nr = match self.state {
-            VirtualSocketState::SynReceived => self.user_tx_segments.next_seq_nr(),
-            VirtualSocketState::SynAckSent { seq_nr, expires_at }
-                if expires_at < self.this_poll.now =>
-            {
-                seq_nr
-            }
+        let (synack_seq_nr, count) = match self.state {
+            VirtualSocketState::SynReceived => (self.user_tx_segments.next_seq_nr(), 0),
+            VirtualSocketState::SynAckSent {
+                seq_nr,
+                expires_at,
+                count,
+            } if expires_at < self.this_poll.now => (seq_nr, count),
             _ => return Ok(()),
         };
+        if count == self.socket_opts.max_segment_retransmissions.get() {
+            bail!("too many syn-acks sent")
+        }
         let mut syn_ack = self.outgoing_header();
         let last_sent_seq_nr = self.last_sent_seq_nr;
         syn_ack.seq_nr = synack_seq_nr;
@@ -1024,6 +1041,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.state = VirtualSocketState::SynAckSent {
                 seq_nr: synack_seq_nr,
                 expires_at: self.this_poll.now + SYNACK_RESEND_INTERNAL,
+                count: count + 1,
             };
             // restore last_sent_seq_nr
             self.last_sent_seq_nr = last_sent_seq_nr;
