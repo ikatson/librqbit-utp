@@ -12,16 +12,16 @@ use std::{
 use crate::{raw::UtpHeader, seq_nr::SeqNr};
 
 #[derive(Clone, Copy)]
-enum RttMeasurement {
+enum SentStatus {
     NotSent,
     SentTime(Instant),
-    Retransmitted,
+    Retransmitted { count: usize },
 }
 
 struct Segment {
     payload_size: usize,
     is_delivered: bool,
-    rtt: RttMeasurement,
+    sent: SentStatus,
 }
 
 pub fn rtt_min(rtt1: Option<Duration>, rtt2: Option<Duration>) -> Option<Duration> {
@@ -34,10 +34,10 @@ pub fn rtt_min(rtt1: Option<Duration>, rtt2: Option<Duration>) -> Option<Duratio
 
 impl Segment {
     fn update_rtt(&self, now: Instant, rtt: &mut Option<Duration>) {
-        match self.rtt {
+        match self.sent {
             // This should not happen.
-            RttMeasurement::NotSent | RttMeasurement::Retransmitted => {}
-            RttMeasurement::SentTime(sent_ts) => {
+            SentStatus::NotSent | SentStatus::Retransmitted { .. } => {}
+            SentStatus::SentTime(sent_ts) => {
                 *rtt = rtt_min(*rtt, Some(now - sent_ts));
             }
         }
@@ -75,11 +75,19 @@ impl SegmentIterItem<'_> {
         self.payload_offset
     }
 
+    pub fn retransmit_count(&self) -> usize {
+        match self.segment.sent {
+            SentStatus::NotSent => 0,
+            SentStatus::SentTime(..) => 0,
+            SentStatus::Retransmitted { count } => count,
+        }
+    }
+
     pub fn on_sent(&mut self, now: Instant) {
-        self.segment.rtt = match self.segment.rtt {
-            RttMeasurement::NotSent => RttMeasurement::SentTime(now),
-            RttMeasurement::SentTime(_) => RttMeasurement::Retransmitted,
-            RttMeasurement::Retransmitted => RttMeasurement::Retransmitted,
+        self.segment.sent = match self.segment.sent {
+            SentStatus::NotSent => SentStatus::SentTime(now),
+            SentStatus::SentTime(_) => SentStatus::Retransmitted { count: 1 },
+            SentStatus::Retransmitted { count } => SentStatus::Retransmitted { count: count + 1 },
         };
     }
 }
@@ -166,7 +174,7 @@ impl Segments {
         self.segments.push_back(Segment {
             payload_size: payload_len,
             is_delivered: false,
-            rtt: RttMeasurement::NotSent,
+            sent: SentStatus::NotSent,
         });
         self.len_bytes += payload_len;
         true

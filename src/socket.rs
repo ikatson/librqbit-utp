@@ -95,6 +95,8 @@ pub struct SocketOpts {
 
     pub parent_span: Option<tracing::Id>,
     pub cancellation_token: CancellationToken,
+
+    pub max_segment_retransmissions: Option<NonZeroUsize>,
 }
 
 impl SocketOpts {
@@ -175,6 +177,9 @@ impl SocketOpts {
             virtual_socket_tx_bytes,
             nagle: !self.disable_nagle,
             congestion: self.congestion,
+            max_segment_retransmissions: self
+                .max_segment_retransmissions
+                .unwrap_or(NonZeroUsize::new(5).unwrap()),
         })
     }
 }
@@ -188,10 +193,9 @@ pub(crate) struct ValidatedSocketOpts {
 
     pub max_rx_out_of_order_packets: NonZeroUsize,
     pub virtual_socket_tx_bytes: NonZeroUsize,
-
     pub nagle: bool,
-
     pub congestion: CongestionConfig,
+    pub max_segment_retransmissions: NonZeroUsize,
 }
 
 pub(crate) struct RequestWithSpan<V> {

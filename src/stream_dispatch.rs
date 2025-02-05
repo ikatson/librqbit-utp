@@ -345,6 +345,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 continue;
             }
 
+            if item.retransmit_count() == self.socket_opts.max_segment_retransmissions.get() {
+                anyhow::bail!("max number of retransmissions reached");
+            }
+
             if recv_wnd < item.payload_size() {
                 debug!("remote recv window exhausted, not sending anything");
                 break;
@@ -639,9 +643,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.user_rx.enqueue_last_message(msg);
     }
 
-    fn just_before_death(&mut self, error: Option<&anyhow::Error>) {
-        // TODO: send ST_REST or FIN, or FIN ACK etc?
-
+    fn just_before_death(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        error: Option<&anyhow::Error>,
+    ) {
         if let Some(err) = error {
             trace!("just_before_death: {err:#}");
         } else {
@@ -659,6 +665,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         // This will close the writer.
         self.user_tx.locked.lock().mark_stream_dead();
+
+        if error.is_some() && !self.state.is_local_fin_or_later() {
+            let mut rst = self.outgoing_header();
+            rst.set_type(Type::ST_RESET);
+            if let Some(socket) = self.socket.upgrade() {
+                if let Err(e) = self.send_control_packet(cx, &socket, rst) {
+                    debug!("error sending RST: {e:#}")
+                }
+            }
+        }
     }
 
     fn process_all_incoming_messages(
@@ -1022,7 +1038,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 match $e {
                     Ok(val) => val,
                     Err(e) => {
-                        self.just_before_death(Some(&e));
+                        self.just_before_death(cx, Some(&e));
                         return Poll::Ready(Err(e));
                     }
                 }
@@ -1069,14 +1085,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             pending_if_cannot_send!(self.maybe_send_ack(cx, socket));
 
             if self.state.is_done() {
-                self.just_before_death(None);
+                self.just_before_death(cx, None);
                 return Poll::Ready(Ok(()));
             }
 
             if self.user_rx_is_closed() && self.state.is_local_fin_or_later() {
                 // TODO: run a little bit more to send the final ACK to remote FIN?
                 trace!(current_state=?self.state, "both halves are dead, no reason to continue");
-                self.just_before_death(None);
+                self.just_before_death(cx, None);
                 return Poll::Ready(Ok(()));
             }
 

@@ -1,5 +1,5 @@
 // TODO: in case the other end doesn't answer we need to stop the dispatcher. Otherwise it'll leak memory.
-// currently, only if we send the whole tx queue we check if it's dead or not.
+// currently, only if we send the whole tx queue we check if it's dead or not and transition to FIN.
 
 // RTT, RTO, congestion
 // Recent RFCs that we might try to implement exactly to make everyting super explicit
