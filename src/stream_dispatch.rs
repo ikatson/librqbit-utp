@@ -490,6 +490,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         trace!(
             seq_nr = %header.seq_nr,
             ack_nr = %header.ack_nr,
+            wnd_size = %header.wnd_size,
             type = ?header.get_type(),
             "sending"
         );
@@ -809,10 +810,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         bytes,
                     } => {
                         if sequence_numbers > 0 {
-                            trace!(
-                                sequence_numbers,
-                                "acked messages, we have them stored in RX buffers"
-                            );
+                            trace!(sequence_numbers, "consumed messages");
                         } else {
                             trace!("out of order");
                         }
@@ -925,7 +923,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         // if we need to send a window update, also send immediately.
         // TODO: this is clumsy, but should do the job in case the reader was fully flow controlled.
         let rmss = self.socket_opts.max_incoming_payload_size.get() as u32;
-        if self.last_sent_window < rmss && self.rx_window() >= rmss {
+        let current = self.rx_window();
+        if current < rmss && self.last_sent_window >= rmss
+            || self.last_sent_window < rmss && current >= rmss
+        {
             trace!(
                 self.last_sent_window,
                 rmss,
@@ -1055,8 +1056,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // Read incoming stream.
             bail_if_err!(self.process_all_incoming_messages(cx, socket));
 
-            pending_if_cannot_send!(self.maybe_send_ack(cx, socket));
-
             self.maybe_prepare_for_retransmission();
 
             pending_if_cannot_send!(self.split_tx_queue_into_segments(cx));
@@ -1065,6 +1064,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             pending_if_cannot_send!(self.send_tx_queue(cx, socket));
 
             pending_if_cannot_send!(self.maybe_send_fin(cx, socket));
+
+            pending_if_cannot_send!(self.maybe_send_ack(cx, socket));
 
             if self.state.is_done() {
                 self.just_before_death(None);
@@ -1461,6 +1462,7 @@ mod tests {
         constants::{IPV4_HEADER, MIN_UDP_HEADER, UTP_HEADER_SIZE},
         message::UtpMessage,
         raw::{selective_ack::SelectiveAck, Type, UtpHeader},
+        seq_nr::SeqNr,
         stream_dispatch::VirtualSocketState,
         test_util::{
             env::MockUtpEnvironment, setup_test_logging, transport::RememberingTransport, ADDR_1,
@@ -1490,10 +1492,17 @@ mod tests {
             self.tx.send(make_msg(header, payload)).unwrap()
         }
 
-        fn send_data(&mut self, seq_nr: u16, payload: &str) {
-            let mut header = self.vsock.outgoing_header();
-            header.set_type(Type::ST_DATA);
-            header.seq_nr = seq_nr.into();
+        fn send_data(&mut self, seq_nr: impl Into<SeqNr>, ack_nr: impl Into<SeqNr>, payload: &str) {
+            let header = UtpHeader {
+                htype: Type::ST_DATA,
+                connection_id: self.vsock.conn_id_send + 1,
+                timestamp_microseconds: self.vsock.timestamp_microseconds(),
+                timestamp_difference_microseconds: 0,
+                wnd_size: 1024 * 1024,
+                seq_nr: seq_nr.into(),
+                ack_nr: ack_nr.into(),
+                extensions: Default::default(),
+            };
             self.send_msg(header, payload);
         }
 
@@ -1609,6 +1618,7 @@ mod tests {
         let sent = t.take_sent();
         assert_eq!(sent.len(), 0);
     }
+
     #[tokio::test]
     async fn test_doesnt_send_until_window_updated() {
         setup_test_logging();
@@ -1644,6 +1654,7 @@ mod tests {
         assert_eq!(sent[0].header.ack_nr.0, 0);
         assert_eq!(sent[0].payload(), b"hello");
     }
+
     #[tokio::test]
     async fn test_sends_up_to_remote_window_only_single_msg() {
         setup_test_logging();
@@ -1683,6 +1694,7 @@ mod tests {
         t.poll_once_assert_pending().await;
         assert_eq!(t.take_sent().len(), 0);
     }
+
     #[tokio::test]
     async fn test_sends_up_to_remote_window_only_multi_msg() {
         setup_test_logging();
@@ -1728,6 +1740,7 @@ mod tests {
         let sent = t.take_sent();
         assert_eq!(sent.len(), 0);
     }
+
     #[tokio::test]
     async fn test_basic_retransmission() {
         setup_test_logging();
@@ -1780,6 +1793,7 @@ mod tests {
             "Retransmitted packet should have same sequence number"
         );
     }
+
     #[tokio::test]
     async fn test_fast_retransmit() {
         setup_test_logging();
@@ -1853,6 +1867,7 @@ mod tests {
             "Should have retransmitted correct data"
         );
     }
+
     #[tokio::test]
     async fn test_fin_shutdown_sequence_initiated_by_explicit_shutdown() {
         setup_test_logging();
@@ -1949,6 +1964,7 @@ mod tests {
             "Connection should complete cleanly"
         );
     }
+
     #[tokio::test]
     async fn test_fin_sent_when_writer_dropped() {
         setup_test_logging();
@@ -2009,6 +2025,7 @@ mod tests {
             "FIN should use next sequence number after data"
         );
     }
+
     #[tokio::test]
     async fn test_flush_works() {
         setup_test_logging();
@@ -2083,6 +2100,7 @@ mod tests {
             Poll::Pending => panic!("flush should have completed"),
         };
     }
+
     #[tokio::test]
     async fn test_out_of_order_delivery() {
         setup_test_logging();
@@ -2168,6 +2186,7 @@ mod tests {
         assert_eq!(acks[0].header.get_type(), Type::ST_STATE);
         assert_eq!(acks[0].header.ack_nr.0, 3); // Should acknowledge up to last packet
     }
+
     #[tokio::test]
     async fn test_nagle_algorithm() {
         setup_test_logging();
@@ -2264,6 +2283,7 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].payload(), b"e");
     }
+
     #[tokio::test]
     async fn test_resource_cleanup_both_sides_dropped_normally() {
         setup_test_logging();
@@ -2332,6 +2352,7 @@ mod tests {
             "Poll should complete after both halves are dropped"
         );
     }
+
     #[tokio::test]
     async fn test_resource_cleanup_both_sides_dropped_abruptly() {
         setup_test_logging();
@@ -2356,6 +2377,7 @@ mod tests {
             "Poll should complete after both halves are dropped"
         );
     }
+
     #[tokio::test]
     async fn test_resource_cleanup_with_pending_data() {
         setup_test_logging();
@@ -2413,6 +2435,7 @@ mod tests {
         assert_eq!(sent[0].header.seq_nr.0, data_seq_nr.0 + 1);
         assert!(matches!(result, Poll::Ready(Ok(()))));
     }
+
     #[tokio::test]
     async fn test_sender_flow_control() {
         setup_test_logging();
@@ -2493,6 +2516,7 @@ mod tests {
             "Should have split data into correct number of packets"
         );
     }
+
     #[tokio::test]
     async fn test_zero_window_handling() {
         setup_test_logging();
@@ -2559,6 +2583,7 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].payload(), b" world");
     }
+
     #[tokio::test]
     async fn test_congestion_control_basics() {
         setup_test_logging();
@@ -2690,6 +2715,7 @@ mod tests {
             "Window should decrease or stay same after timeout"
         );
     }
+
     #[tokio::test]
     async fn test_duplicate_ack_only_on_st_state() {
         setup_test_logging();
@@ -2794,6 +2820,7 @@ mod tests {
             "Should have retransmitted correct packet"
         );
     }
+
     #[tokio::test]
     async fn test_finack_not_sent_until_all_data_consumed() {
         setup_test_logging();
@@ -2841,6 +2868,7 @@ mod tests {
         assert_eq!(sent.len(), 1, "we should sent FIN ACK");
         assert_eq!(sent[0].header.ack_nr, 3.into());
     }
+
     #[tokio::test]
     async fn test_flow_control() {
         setup_test_logging();
@@ -2853,25 +2881,15 @@ mod tests {
             ..Default::default()
         };
 
-        let mut t = make_test_vsock(opts, false);
-
-        // Allow sending by setting window size
-        t.send_msg(
-            UtpHeader {
-                htype: Type::ST_STATE,
-                seq_nr: 0.into(),
-                ack_nr: t.vsock.last_sent_seq_nr,
-                wnd_size: 1024,
-                ..Default::default()
-            },
-            "",
-        );
+        let mut t = make_test_vsock(opts, true);
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 1); // syn ack
 
         // Test assembly queue limit first
         // Send packets out of order to fill assembly queue
-        t.send_data(3, "third"); // Out of order
-        t.send_data(4, "fourth"); // Out of order
-        t.send_data(6, "sixth"); // Should be dropped - assembly queue full
+        t.send_data(3, t.vsock.last_sent_seq_nr, "third"); // Out of order
+        t.send_data(4, t.vsock.last_sent_seq_nr, "fourth"); // Out of order
+        t.send_data(6, t.vsock.last_sent_seq_nr, "sixth"); // Should be dropped - assembly queue full
 
         t.poll_once_assert_pending().await;
 
@@ -2879,7 +2897,7 @@ mod tests {
         assert_eq!(t.vsock.user_rx.assembler_packets(), 2);
 
         // Send in-order packet to trigger processing
-        t.send_data(1, "first");
+        t.send_data(1, t.vsock.last_sent_seq_nr, "first");
         t.poll_once_assert_pending().await;
 
         // Read available data
@@ -2889,7 +2907,7 @@ mod tests {
         // Now test user rx channel limit
         // Send several packets that exceed the rx buffer size
         for i in 6..15 {
-            t.send_data(i, "data!");
+            t.send_data(i, t.vsock.last_sent_seq_nr, "data!");
             t.poll_once_assert_pending().await;
         }
 
@@ -2904,13 +2922,14 @@ mod tests {
         assert!(window < 1024); // Window should be reduced
 
         // Send more data - should be dropped due to full rx buffer
-        t.send_data(15, "dropped");
+        t.send_data(15, t.vsock.last_sent_seq_nr, "dropped");
         t.poll_once_assert_pending().await;
 
         // Verify data was dropped
         let read = String::from_utf8(t.read_all_available().await.unwrap()).unwrap();
         assert!(!read.contains("dropped"));
     }
+
     #[tokio::test]
     async fn test_data_integrity_manual_packets() {
         setup_test_logging();
@@ -2965,6 +2984,7 @@ mod tests {
         );
         assert_eq!(received_data, test_data, "Data corruption detected");
     }
+
     #[tokio::test]
     async fn test_retransmission_behavior() {
         setup_test_logging();
@@ -3069,6 +3089,7 @@ mod tests {
             "New packet should use next sequence number"
         );
     }
+
     #[tokio::test]
     async fn test_selective_ack_retransmission() {
         setup_test_logging();
@@ -3163,6 +3184,7 @@ mod tests {
             "Should not retransmit after both packets acknowledged"
         );
     }
+
     #[tokio::test]
     async fn test_st_reset_error_propagation() {
         setup_test_logging();
@@ -3196,6 +3218,7 @@ mod tests {
             "Error should mention ST_RESET: {err}"
         );
     }
+
     #[tokio::test]
     async fn test_fin_sent_when_both_halves_dropped() {
         setup_test_logging();
@@ -3259,22 +3282,11 @@ mod tests {
             "FIN should use next sequence number"
         );
     }
+
     #[tokio::test]
     async fn test_fin_sent_when_reader_dead_first() {
         setup_test_logging();
         let mut t = make_test_vsock(Default::default(), false);
-
-        // Allow sending by setting window size
-        t.send_msg(
-            UtpHeader {
-                htype: Type::ST_STATE,
-                seq_nr: 0.into(),
-                ack_nr: t.vsock.last_sent_seq_nr,
-                wnd_size: 1024,
-                ..Default::default()
-            },
-            "",
-        );
 
         let (reader, mut writer) = t.stream.take().unwrap().split();
 
@@ -3306,7 +3318,7 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Remote sends some data - it should accumulate in OOQ.
-        t.send_data(1, "ignored data");
+        t.send_data(1, t.vsock.last_sent_seq_nr, "ignored data");
         t.poll_once_assert_pending().await;
 
         // Now drop the writer
@@ -3328,29 +3340,32 @@ mod tests {
             "FIN should use next sequence number"
         );
     }
+
     #[tokio::test]
     async fn test_window_update_ack_after_read() {
         setup_test_logging();
 
         // Configure socket with very small receive buffer to test flow control
+        let mss = 5;
         let opts = SocketOpts {
-            rx_bufsize: Some(10), // Very small receive buffer
+            rx_bufsize: Some(mss * 2),
+            mtu: Some(mss + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
             ..Default::default()
         };
 
-        let mut t = make_test_vsock(opts, false);
+        let mut t = make_test_vsock(opts, true);
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent().len(), 1); // syn ack
 
         // Fill up the receive buffer
-        t.send_data(1, "first");
-        t.send_data(2, "second");
+        t.send_data(1, t.vsock.last_sent_seq_nr, "aaaaa");
+        t.send_data(2, t.vsock.last_sent_seq_nr, "bbbbb");
         t.poll_once_assert_pending().await;
 
         // Verify window is now 0
         assert_eq!(t.vsock.rx_window(), 0);
 
-        // At least as part of delayed ACK, ensure we send back 0 window
-        t.env.increment_now(Duration::from_secs(1));
-        t.poll_once_assert_pending().await;
+        // Ensure we send back 0 window
         let sent = t.take_sent();
         assert!(!sent.is_empty(), "Should have sent ACKs");
         let last_window = sent.last().unwrap().header.wnd_size;
@@ -3392,14 +3407,14 @@ mod tests {
         assert_eq!(t.vsock.socket_opts.max_incoming_payload_size.get(), mss);
 
         // Fill buffer to just under MSS to get a small window
-        t.send_data(1, "aaaaa");
+        t.send_data(1, t.vsock.last_sent_seq_nr, "aaaaa");
         t.poll_once_assert_pending().await;
         // We shouldn't have registered the flush waker yet.
         assert!(!t.vsock.user_rx.is_flush_waker_registered());
         assert_eq!(t.take_sent(), vec![]);
 
         // Now the window should be less than MSS.
-        t.send_data(2, "b");
+        t.send_data(2, t.vsock.last_sent_seq_nr, "b");
         t.poll_once_assert_pending().await;
         assert!(t.vsock.user_rx.is_flush_waker_registered());
         // Verify window is now less than MSS
