@@ -30,6 +30,8 @@ pub const DEFAULT_CONSERVATIVE_OUTGOING_MTU: usize = 1280;
 // Delayed ACK timer. Linux has 40ms, so we set to it too.
 pub const ACK_DELAY: Duration = Duration::from_millis(40);
 
+pub const SYNACK_RESEND_INTERNAL: Duration = Duration::from_millis(200);
+
 // u16 SeqNrs wrap around. If they are too far apart, this is used to detect if they wrapped or not.
 pub const WRAP_TOLERANCE: u16 = 1024;
 

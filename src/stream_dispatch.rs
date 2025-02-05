@@ -14,7 +14,9 @@ use tracing::{debug, error_span, trace, warn, Level};
 
 use crate::{
     congestion::CongestionController,
-    constants::{ACK_DELAY, CONGESTION_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL, UTP_HEADER_SIZE},
+    constants::{
+        ACK_DELAY, CONGESTION_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL, SYNACK_RESEND_INTERNAL,
+    },
     message::UtpMessage,
     raw::{Type, UtpHeader},
     rtte::RttEstimator,
@@ -30,10 +32,11 @@ use crate::{
     UtpSocket,
 };
 
-// This contains more states than Rust could model with its enums, but I'm keeping
-// the names for 1:1 TCP mapping.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VirtualSocketState {
+    SynReceived,
+    SynAckSent { seq_nr: SeqNr, expires_at: Instant },
+
     Established,
 
     // We are fully done - both sides sent and acked FINs.
@@ -78,10 +81,13 @@ impl VirtualSocketState {
     // True if we are not sending any more data.
     fn is_local_fin_or_later(&self) -> bool {
         match self {
-            VirtualSocketState::Established | VirtualSocketState::CloseWait { .. } => false,
-            VirtualSocketState::Finished
+            VirtualSocketState::SynReceived { .. }
+            | VirtualSocketState::SynAckSent { .. }
+            | VirtualSocketState::Established { .. }
+            | VirtualSocketState::CloseWait { .. } => false,
+            VirtualSocketState::Finished { .. }
             | VirtualSocketState::FinWait1 { .. }
-            | VirtualSocketState::FinWait2
+            | VirtualSocketState::FinWait2 { .. }
             | VirtualSocketState::Closing { .. }
             | VirtualSocketState::LastAck { .. } => true,
         }
@@ -89,8 +95,10 @@ impl VirtualSocketState {
 
     fn remote_fin(&self) -> Option<SeqNr> {
         match *self {
-            VirtualSocketState::Established
-            | VirtualSocketState::Finished
+            VirtualSocketState::SynReceived { .. }
+            | VirtualSocketState::SynAckSent { .. }
+            | VirtualSocketState::Established { .. }
+            | VirtualSocketState::Finished { .. }
             | VirtualSocketState::FinWait1 { .. }
             | VirtualSocketState::FinWait2 => None,
             VirtualSocketState::CloseWait { remote_fin }
@@ -108,41 +116,57 @@ impl VirtualSocketState {
         }
     }
 
-    fn on_incoming_packet(&mut self, remote_fin_seq_nr: Option<SeqNr>, remote_ack_nr: SeqNr) {
-        // To decrease combinations, first process remote_ack_nr, then process "is_fin"
+    fn on_incoming_packet(&mut self, hdr: &UtpHeader) -> anyhow::Result<()> {
+        // Upgrade to ESTABLISHED if needed
+        if let VirtualSocketState::SynAckSent { seq_nr, .. } = self {
+            match hdr.get_type() {
+                Type::ST_DATA | Type::ST_FIN | Type::ST_STATE if hdr.ack_nr == *seq_nr - 1 => {
+                    *self = VirtualSocketState::Established;
+                }
+                Type::ST_RESET => bail!("reset received"),
+                // Probably just a duplicate SYN, ignore it
+                Type::ST_SYN => return Ok(()),
+                _ => {
+                    warn!(hdr=?hdr, our_syn_ack_seq_nr=?seq_nr, "unexpected packet in SynAckSent");
+                    bail!("invalid packet received");
+                }
+            }
+        }
 
         // Maybe ACK our fin
         match *self {
             VirtualSocketState::FinWait1 { our_fin } => {
-                if remote_ack_nr == our_fin {
+                if hdr.ack_nr == our_fin {
                     *self = VirtualSocketState::FinWait2;
                 }
             }
             VirtualSocketState::Closing { our_fin, .. } => {
                 // For simplicity, we don't need to wait until the last side receives our FIN.
                 // This would be smth like TimeWait, but it's not worth it.
-                if remote_ack_nr == our_fin {
+                if hdr.ack_nr == our_fin {
                     *self = VirtualSocketState::Finished;
-                    return;
+                    return Ok(());
                 }
             }
             VirtualSocketState::LastAck { our_fin, .. } => {
-                if our_fin == remote_ack_nr {
+                if our_fin == hdr.ack_nr {
                     *self = VirtualSocketState::Finished;
-                    return;
+                    return Ok(());
                 }
             }
             _ => {}
         }
 
-        let remote_fin = match remote_fin_seq_nr {
-            Some(n) => n,
-            None => return,
+        let remote_fin = match hdr.get_type() {
+            Type::ST_FIN => hdr.seq_nr,
+            _ => return Ok(()),
         };
 
         // Process remote FIN.
         match *self {
-            VirtualSocketState::Established => {
+            VirtualSocketState::SynReceived { .. }
+            | VirtualSocketState::SynAckSent { .. }
+            | VirtualSocketState::Established { .. } => {
                 *self = VirtualSocketState::CloseWait { remote_fin };
             }
             VirtualSocketState::Finished => {}
@@ -161,6 +185,7 @@ impl VirtualSocketState {
                 // fin retransmission, ignore
             }
         }
+        Ok(())
     }
 }
 
@@ -258,26 +283,7 @@ struct ThisPoll {
 }
 
 impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
-    async fn send_packet(&self, packet: UtpHeader) -> anyhow::Result<()> {
-        let mut buf = [0u8; UTP_HEADER_SIZE];
-        packet
-            .serialize(&mut buf)
-            .context("bug: can't serialize header")?;
-        self.socket
-            .upgrade()
-            .context("socket dead")?
-            .transport
-            .send_to(&buf, self.remote)
-            .await
-            .context("error sending")?;
-        Ok(())
-    }
-
-    async fn run_forever(self, first_packet: Option<UtpHeader>) -> anyhow::Result<()> {
-        if let Some(packet) = first_packet {
-            self.send_packet(packet).await?;
-        }
-
+    async fn run_forever(self) -> anyhow::Result<()> {
         self.await.context("error running utp stream event loop")
     }
 
@@ -752,18 +758,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             "state",
             self,
             |s| s.state,
-            |s| {
-                s.state.on_incoming_packet(
-                    if matches!(msg.header.get_type(), Type::ST_FIN) {
-                        Some(msg.header.seq_nr)
-                    } else {
-                        None
-                    },
-                    msg.header.ack_nr,
-                )
-            },
+            |s| s.state.on_incoming_packet(&msg.header),
             |_, _| Level::DEBUG,
-        );
+        )?;
 
         let on_ack_result = self
             .user_tx_segments
@@ -976,6 +973,122 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn user_rx_is_closed(&self) -> bool {
         self.user_rx.is_closed()
     }
+
+    fn maybe_send_syn_ack(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        socket: &UtpSocket<T, Env>,
+    ) -> anyhow::Result<()> {
+        let synack_seq_nr = match self.state {
+            VirtualSocketState::SynReceived => self.user_tx_segments.next_seq_nr(),
+            VirtualSocketState::SynAckSent { seq_nr, expires_at }
+                if expires_at < self.this_poll.now =>
+            {
+                seq_nr
+            }
+            _ => return Ok(()),
+        };
+        let mut syn_ack = self.outgoing_header();
+        syn_ack.seq_nr = synack_seq_nr;
+        if self.send_control_packet(cx, socket, syn_ack)? {
+            self.state = VirtualSocketState::SynAckSent {
+                seq_nr: synack_seq_nr,
+                expires_at: self.this_poll.now + SYNACK_RESEND_INTERNAL,
+            };
+            self.timers.arm_in(cx, SYNACK_RESEND_INTERNAL);
+        }
+        Ok(())
+    }
+
+    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> Poll<anyhow::Result<()>> {
+        macro_rules! bail_if_err {
+            ($e:expr) => {
+                match $e {
+                    Ok(val) => val,
+                    Err(e) => {
+                        self.just_before_death(Some(&e));
+                        return Poll::Ready(Err(e));
+                    }
+                }
+            };
+        }
+
+        macro_rules! pending_if_cannot_send {
+            ($e:expr) => {{
+                let val = bail_if_err!($e);
+                if self.this_poll.transport_pending {
+                    return Poll::Pending;
+                }
+                val
+            }};
+        }
+
+        // Doing this once here not to upgrade too often below.
+        let socket = bail_if_err!(self.socket.upgrade().context("device dead"));
+        let socket = &*socket;
+
+        // Track if UDP socket is full this poll, and don't send to it if so.
+        self.this_poll.transport_pending = false;
+        self.this_poll.now = self.env.now();
+
+        const MAX_ITERS: usize = 2;
+
+        for _ in 0..MAX_ITERS {
+            pending_if_cannot_send!(self.maybe_send_syn_ack(cx, socket));
+
+            // Flow control: flush as many out of order messages to user RX as possible.
+            bail_if_err!(self.user_rx.flush(cx));
+
+            // Read incoming stream.
+            bail_if_err!(self.process_all_incoming_messages(cx, socket));
+
+            pending_if_cannot_send!(self.maybe_send_ack(cx, socket));
+
+            self.maybe_prepare_for_retransmission();
+
+            pending_if_cannot_send!(self.split_tx_queue_into_segments(cx));
+
+            // (Re)send tx queue.
+            pending_if_cannot_send!(self.send_tx_queue(cx, socket));
+
+            pending_if_cannot_send!(self.maybe_send_fin(cx, socket));
+
+            if self.state.is_done() {
+                self.just_before_death(None);
+                return Poll::Ready(Ok(()));
+            }
+
+            if self.user_rx_is_closed() && self.state.is_local_fin_or_later() {
+                // TODO: run a little bit more to send the final ACK to remote FIN?
+                trace!(current_state=?self.state, "both halves are dead, no reason to continue");
+                self.just_before_death(None);
+                return Poll::Ready(Ok(()));
+            }
+
+            match self.next_poll_send_to_at() {
+                PollAt::Now => {
+                    return Poll::Ready(Err(anyhow::anyhow!(
+                        "bug: encountered PollAt::now after running poll()",
+                    )));
+                }
+                PollAt::Time(instant) => {
+                    let duration = instant - self.this_poll.now;
+                    trace!(sleep = ?duration, "arming timer");
+                    if self.timers.arm_in(cx, duration) {
+                        return Poll::Pending;
+                    } else {
+                        trace!(deadline = ?instant - self.this_poll.now, "failed arming timer, continuing poll loop");
+                        continue;
+                    }
+                }
+                PollAt::Ingress => return Poll::Pending,
+            }
+        }
+
+        Poll::Ready(Err(anyhow::anyhow!(
+            "bug: too many iterations in dispatcher",
+        )))
+    }
 }
 
 impl<T, E> Drop for VirtualSocket<T, E> {
@@ -1068,7 +1181,6 @@ impl StreamArgs {
 pub(crate) struct UtpStreamStarter<T, E> {
     stream: UtpStream,
     vsock: VirtualSocket<T, E>,
-    first_packet: Option<UtpHeader>,
     cancellation_token: CancellationToken,
 }
 
@@ -1077,7 +1189,6 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
         let Self {
             stream,
             vsock,
-            first_packet,
             cancellation_token,
         } = self;
 
@@ -1086,7 +1197,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             None => error_span!(parent: None, "utp_stream", conn_id_send = ?vsock.conn_id_send),
         };
 
-        spawn_with_cancel(span, cancellation_token, vsock.run_forever(first_packet));
+        spawn_with_cancel(span, cancellation_token, vsock.run_forever());
         stream
     }
 
@@ -1175,20 +1286,10 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_sent_window: 0,
         };
 
-        let first_packet = if !is_outgoing {
-            let mut hdr = vsock.outgoing_header();
-            // The initial "ACK" should be of the NEXT sequence, not the previous one.
-            hdr.seq_nr += 1;
-            Some(hdr)
-        } else {
-            None
-        };
-
         let stream = UtpStream::new(read_half, write_half, vsock.remote);
         UtpStreamStarter {
             stream,
             vsock,
-            first_packet,
             cancellation_token,
         }
     }
@@ -1307,93 +1408,7 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
     type Output = anyhow::Result<()>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-
-        macro_rules! bail_if_err {
-            ($e:expr) => {
-                match $e {
-                    Ok(val) => val,
-                    Err(e) => {
-                        this.just_before_death(Some(&e));
-                        return Poll::Ready(Err(e));
-                    }
-                }
-            };
-        }
-
-        macro_rules! pending_if_cannot_send {
-            ($e:expr) => {{
-                let val = bail_if_err!($e);
-                if this.this_poll.transport_pending {
-                    return Poll::Pending;
-                }
-                val
-            }};
-        }
-
-        // Doing this once here not to upgrade too often below.
-        let socket = bail_if_err!(this.socket.upgrade().context("device dead"));
-        let socket = &*socket;
-
-        // Track if UDP socket is full this poll, and don't send to it if so.
-        this.this_poll.transport_pending = false;
-        this.this_poll.now = this.env.now();
-
-        const MAX_ITERS: usize = 2;
-
-        for _ in 0..MAX_ITERS {
-            // Flow control: flush as many out of order messages to user RX as possible.
-            bail_if_err!(this.user_rx.flush(cx));
-
-            // Read incoming stream.
-            bail_if_err!(this.process_all_incoming_messages(cx, socket));
-
-            pending_if_cannot_send!(this.maybe_send_ack(cx, socket));
-
-            this.maybe_prepare_for_retransmission();
-
-            pending_if_cannot_send!(this.split_tx_queue_into_segments(cx));
-
-            // (Re)send tx queue.
-            pending_if_cannot_send!(this.send_tx_queue(cx, socket));
-
-            pending_if_cannot_send!(this.maybe_send_fin(cx, socket));
-
-            if this.state.is_done() {
-                this.just_before_death(None);
-                return Poll::Ready(Ok(()));
-            }
-
-            if this.user_rx_is_closed() && this.state.is_local_fin_or_later() {
-                // TODO: run a little bit more to send the final ACK to remote FIN?
-                trace!(current_state=?this.state, "both halves are dead, no reason to continue");
-                this.just_before_death(None);
-                return Poll::Ready(Ok(()));
-            }
-
-            match this.next_poll_send_to_at() {
-                PollAt::Now => {
-                    return Poll::Ready(Err(anyhow::anyhow!(
-                        "bug: encountered PollAt::now after running poll()",
-                    )));
-                }
-                PollAt::Time(instant) => {
-                    let duration = instant - this.this_poll.now;
-                    trace!(sleep = ?duration, "arming timer");
-                    if this.timers.arm_in(cx, duration) {
-                        return Poll::Pending;
-                    } else {
-                        trace!(deadline = ?instant - this.this_poll.now, "failed arming timer, continuing poll loop");
-                        continue;
-                    }
-                }
-                PollAt::Ingress => return Poll::Pending,
-            }
-        }
-
-        Poll::Ready(Err(anyhow::anyhow!(
-            "bug: too many iterations in dispatcher",
-        )))
+        self.get_mut().poll(cx)
     }
 }
 
