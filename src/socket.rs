@@ -498,7 +498,10 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let mut occ = match self.connecting.entry(addr) {
             Entry::Occupied(occ) => occ,
             Entry::Vacant(_) => {
-                debug!("dropping packet, noone is connecting, and no registered streams");
+                debug!(
+                    ?msg,
+                    "dropping packet, noone is connecting, and no registered streams"
+                );
                 return Ok(());
             }
         };
@@ -509,7 +512,10 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             }
             conn
         } else {
-            debug!("dropping packet. we are connecting to this addr, but ack_nr doens't match");
+            debug!(
+                ?msg,
+                "dropping packet. we are connecting to this addr, but ack_nr doens't match"
+            );
             return Ok(());
         };
 
@@ -628,7 +634,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 self.on_syn(addr, message)?;
             }
             _ => {
-                debug!("dropping packet");
+                debug!(?message, ?addr, "dropping packet");
             }
         }
         Ok(())

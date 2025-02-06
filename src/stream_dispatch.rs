@@ -80,7 +80,11 @@ impl VirtualSocketState {
 
     fn transition_to_fin_sent(&mut self, our_fin: SeqNr) -> bool {
         match *self {
-            VirtualSocketState::Established => *self = VirtualSocketState::FinWait1 { our_fin },
+            VirtualSocketState::Established
+            | VirtualSocketState::SynReceived
+            | VirtualSocketState::SynAckSent { .. } => {
+                *self = VirtualSocketState::FinWait1 { our_fin }
+            }
             VirtualSocketState::CloseWait { remote_fin } => {
                 *self = VirtualSocketState::LastAck {
                     our_fin,
@@ -504,8 +508,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if g.is_empty() {
             update_optional_waker(&mut g.buffer_has_data, cx);
 
-            // TODO: we need to have some kind of a timer here in case the other end doesn't answer.
-            // Otherwise, we'll just keep retransmitting forever.
             if g.is_closed() {
                 let changed = log_before_and_after_if_changed(
                     "state",
@@ -746,7 +748,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (SynAckSent { .. }, ST_FIN) => {
                 trace!("state: syn-ack-sent -> closed");
                 is_first_remote_fin = true;
-                let _ = self.send_finack(cx, socket, hdr.seq_nr);
                 self.state = Closed;
             }
 
@@ -787,6 +788,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (FinWait1 { .. }, ST_DATA | ST_STATE) => {}
             (FinWait2, Type::ST_FIN) => {
                 trace!("state: fin-wait-2 -> closed");
+                is_first_remote_fin = true;
                 self.timers.remote_inactivity_timer = None;
                 self.state = Closed;
             }
