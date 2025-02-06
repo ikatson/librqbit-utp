@@ -131,73 +131,73 @@ impl VirtualSocketState {
     }
 
     fn on_incoming_packet(&mut self, hdr: &UtpHeader) -> anyhow::Result<()> {
-        // Upgrade to ESTABLISHED if needed
-        if let VirtualSocketState::SynAckSent { seq_nr, .. } = self {
-            match hdr.get_type() {
-                Type::ST_DATA | Type::ST_FIN | Type::ST_STATE if hdr.ack_nr == *seq_nr - 1 => {
-                    *self = VirtualSocketState::Established;
-                }
-                Type::ST_RESET => bail!("reset received"),
-                // Probably just a duplicate SYN, ignore it
-                Type::ST_SYN => return Ok(()),
-                _ => {
-                    warn!(hdr=?hdr, our_syn_ack_seq_nr=?seq_nr, "unexpected packet in SynAckSent");
-                    bail!("invalid packet received");
-                }
+        use VirtualSocketState::*;
+        match (*self, hdr.get_type()) {
+            (_, Type::ST_RESET) => {
+                *self = Finished;
+                bail!("ST_RESET received")
             }
-        }
+            (_, Type::ST_SYN) => {
+                trace!("unexpected ST_SYN, ignoring");
+            }
+            (SynReceived, _) => {
+                *self = Finished;
+                bail!("unexpected packet in SynReceived state")
+            }
+            (SynAckSent { .. }, Type::ST_DATA | Type::ST_STATE) => {
+                // following code would validate sequence numbers etc.
+                *self = Established;
+            }
+            (SynAckSent { .. }, Type::ST_FIN) => {
+                // we can ignore cleanups in this case let's just die
+                *self = Finished;
+            }
 
-        // Maybe ACK our fin
-        match *self {
-            VirtualSocketState::FinWait1 { our_fin } => {
-                if hdr.ack_nr == our_fin {
-                    *self = VirtualSocketState::FinWait2;
-                }
-            }
-            VirtualSocketState::Closing { our_fin, .. } => {
-                // For simplicity, we don't need to wait until the last side receives our FIN.
-                // This would be smth like TimeWait, but it's not worth it.
-                if hdr.ack_nr == our_fin {
-                    *self = VirtualSocketState::Finished;
-                    return Ok(());
-                }
-            }
-            VirtualSocketState::LastAck { our_fin, .. } => {
-                if our_fin == hdr.ack_nr {
-                    *self = VirtualSocketState::Finished;
-                    return Ok(());
-                }
-            }
-            _ => {}
-        }
-
-        let remote_fin = match hdr.get_type() {
-            Type::ST_FIN => hdr.seq_nr,
-            _ => return Ok(()),
-        };
-
-        // Process remote FIN.
-        match *self {
-            VirtualSocketState::SynReceived { .. }
-            | VirtualSocketState::SynAckSent { .. }
-            | VirtualSocketState::Established { .. } => {
-                *self = VirtualSocketState::CloseWait { remote_fin };
-            }
-            VirtualSocketState::Finished => {}
-            VirtualSocketState::FinWait1 { our_fin } => {
-                *self = VirtualSocketState::Closing {
-                    our_fin,
-                    remote_fin,
+            (Established, Type::ST_DATA) => return Ok(()),
+            (Established, Type::ST_FIN) => {
+                *self = CloseWait {
+                    remote_fin: hdr.seq_nr,
                 };
             }
-            VirtualSocketState::FinWait2 { .. } => {
-                *self = VirtualSocketState::Finished;
+            (Established, Type::ST_STATE) => return Ok(()),
+
+            (Finished, _) => {
+                bail!("received a packet in Finished state, this should not have happened");
             }
-            VirtualSocketState::CloseWait { .. }
-            | VirtualSocketState::Closing { .. }
-            | VirtualSocketState::LastAck { .. } => {
-                // fin retransmission, ignore
+            (FinWait1 { our_fin }, Type::ST_FIN) if hdr.ack_nr == our_fin => {
+                // TODO: ensure we send final ACK (tests should cover this already anyway)
+                *self = Finished;
             }
+            (FinWait1 { our_fin }, Type::ST_FIN) => {
+                *self = Closing {
+                    our_fin,
+                    remote_fin: hdr.seq_nr,
+                };
+            }
+
+            (FinWait1 { our_fin }, Type::ST_DATA | Type::ST_STATE) if hdr.ack_nr == our_fin => {
+                *self = FinWait2;
+            }
+            (FinWait1 { .. }, Type::ST_DATA | Type::ST_STATE) => return Ok(()),
+            (FinWait2, Type::ST_FIN) => {
+                *self = Finished;
+            }
+            (FinWait2, Type::ST_DATA | Type::ST_STATE) => {}
+
+            // Data received after remote closed
+            (
+                CloseWait { remote_fin } | Closing { remote_fin, .. } | LastAck { remote_fin, .. },
+                _,
+            ) if hdr.seq_nr > remote_fin => {
+                // TODO: send RST or FIN or smth
+                bail!("received higher seq nr than remote FIN")
+            }
+
+            (Closing { our_fin, .. } | LastAck { our_fin, .. }, _) if hdr.ack_nr == our_fin => {
+                *self = Finished
+            }
+
+            (CloseWait { .. } | Closing { .. } | LastAck { .. }, _) => {}
         }
         Ok(())
     }
