@@ -3782,4 +3782,94 @@ mod tests {
             "Read should fail after inactivity timeout"
         );
     }
+
+    #[tokio::test]
+    async fn test_wait_for_remote_fin_both_halves_dropped_quick_reply() {
+        setup_test_logging();
+        let mut t = make_test_vsock(Default::default(), false);
+
+        let (reader, writer) = t.stream.take().unwrap().split();
+
+        // Drop both halves - this should trigger sending FIN
+        drop(reader);
+        drop(writer);
+
+        // Next poll should send FIN
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "Should send FIN after both halves dropped");
+        assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
+        let our_fin_seq_nr = sent[0].header.seq_nr;
+
+        // Remote acknowledges our FIN
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: our_fin_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+
+        // Wait a bit - connection should stay alive
+        t.env.increment_now(Duration::from_millis(500));
+        t.poll_once_assert_pending().await;
+
+        // Remote sends FIN
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_FIN,
+                seq_nr: 1.into(),
+                ack_nr: our_fin_seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+
+        // Should send ACK for remote's FIN and complete
+        let result = t.poll_once().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "Should send ACK for remote FIN");
+        assert_eq!(sent[0].header.get_type(), Type::ST_STATE);
+        assert_eq!(sent[0].header.ack_nr.0, 1, "Should ACK remote FIN");
+        assert!(
+            matches!(result, Poll::Ready(Ok(()))),
+            "Connection should complete after handling remote FIN"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_remote_fin_both_halves_dropped_slow_reply() {
+        setup_test_logging();
+        let mut t = make_test_vsock(Default::default(), false);
+
+        let (reader, writer) = t.stream.take().unwrap().split();
+
+        // Drop both halves - this should trigger sending FIN
+        drop(reader);
+        drop(writer);
+
+        // Next poll should send FIN and wait for reply.
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "Should send FIN after both halves dropped");
+        assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
+
+        // Wait a long time, we should die
+        t.env.increment_now(Duration::from_millis(3000));
+        let result = t.poll_once().await;
+        match result {
+            Poll::Ready(Err(e)) => {
+                assert!(
+                    e.to_string().contains("timeout"),
+                    "Error should mention timeout: {e}"
+                );
+            }
+            other => panic!("Expected inactivity error, got: {other:?}"),
+        }
+    }
 }
