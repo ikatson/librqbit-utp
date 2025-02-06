@@ -43,9 +43,6 @@ enum VirtualSocketState {
 
     Established,
 
-    // We are fully done - both sides sent and acked FINs.
-    Finished,
-
     // We sent FIN, not yet ACKed
     FinWait1 {
         our_fin: SeqNr,
@@ -71,11 +68,14 @@ enum VirtualSocketState {
         our_fin: SeqNr,
         remote_fin: SeqNr,
     },
+
+    // We are fully done, no more packets to be sent or received.
+    Closed,
 }
 
 impl VirtualSocketState {
     fn is_done(&self) -> bool {
-        matches!(self, VirtualSocketState::Finished)
+        matches!(self, VirtualSocketState::Closed)
     }
 
     fn transition_to_fin_sent(&mut self, our_fin: SeqNr) -> bool {
@@ -99,25 +99,11 @@ impl VirtualSocketState {
             | VirtualSocketState::SynAckSent { .. }
             | VirtualSocketState::Established { .. }
             | VirtualSocketState::CloseWait { .. } => false,
-            VirtualSocketState::Finished { .. }
+            VirtualSocketState::Closed { .. }
             | VirtualSocketState::FinWait1 { .. }
             | VirtualSocketState::FinWait2 { .. }
             | VirtualSocketState::Closing { .. }
             | VirtualSocketState::LastAck { .. } => true,
-        }
-    }
-
-    fn remote_fin(&self) -> Option<SeqNr> {
-        match *self {
-            VirtualSocketState::SynReceived { .. }
-            | VirtualSocketState::SynAckSent { .. }
-            | VirtualSocketState::Established { .. }
-            | VirtualSocketState::Finished { .. }
-            | VirtualSocketState::FinWait1 { .. }
-            | VirtualSocketState::FinWait2 => None,
-            VirtualSocketState::CloseWait { remote_fin }
-            | VirtualSocketState::Closing { remote_fin, .. }
-            | VirtualSocketState::LastAck { remote_fin, .. } => Some(remote_fin),
         }
     }
 
@@ -128,78 +114,6 @@ impl VirtualSocketState {
             | VirtualSocketState::LastAck { our_fin, .. } => Some(our_fin),
             _ => None,
         }
-    }
-
-    fn on_incoming_packet(&mut self, hdr: &UtpHeader) -> anyhow::Result<()> {
-        use VirtualSocketState::*;
-        match (*self, hdr.get_type()) {
-            (_, Type::ST_RESET) => {
-                *self = Finished;
-                bail!("ST_RESET received")
-            }
-            (_, Type::ST_SYN) => {
-                trace!("unexpected ST_SYN, ignoring");
-            }
-            (SynReceived, _) => {
-                *self = Finished;
-                bail!("unexpected packet in SynReceived state")
-            }
-            (SynAckSent { .. }, Type::ST_DATA | Type::ST_STATE) => {
-                // following code would validate sequence numbers etc.
-                *self = Established;
-            }
-            (SynAckSent { .. }, Type::ST_FIN) => {
-                // we can ignore cleanups in this case let's just die
-                *self = Finished;
-            }
-
-            (Established, Type::ST_DATA) => return Ok(()),
-            (Established, Type::ST_FIN) => {
-                *self = CloseWait {
-                    remote_fin: hdr.seq_nr,
-                };
-            }
-            (Established, Type::ST_STATE) => return Ok(()),
-
-            (Finished, _) => {
-                bail!("received a packet in Finished state, this should not have happened");
-            }
-            (FinWait1 { our_fin }, Type::ST_FIN) if hdr.ack_nr == our_fin => {
-                // TODO: ensure we send final ACK (tests should cover this already anyway)
-                *self = Finished;
-            }
-            (FinWait1 { our_fin }, Type::ST_FIN) => {
-                *self = Closing {
-                    our_fin,
-                    remote_fin: hdr.seq_nr,
-                };
-            }
-
-            (FinWait1 { our_fin }, Type::ST_DATA | Type::ST_STATE) if hdr.ack_nr == our_fin => {
-                *self = FinWait2;
-            }
-            (FinWait1 { .. }, Type::ST_DATA | Type::ST_STATE) => return Ok(()),
-            (FinWait2, Type::ST_FIN) => {
-                *self = Finished;
-            }
-            (FinWait2, Type::ST_DATA | Type::ST_STATE) => {}
-
-            // Data received after remote closed
-            (
-                CloseWait { remote_fin } | Closing { remote_fin, .. } | LastAck { remote_fin, .. },
-                _,
-            ) if hdr.seq_nr > remote_fin => {
-                // TODO: send RST or FIN or smth
-                bail!("received higher seq nr than remote FIN")
-            }
-
-            (Closing { our_fin, .. } | LastAck { our_fin, .. }, _) if hdr.ack_nr == our_fin => {
-                *self = Finished
-            }
-
-            (CloseWait { .. } | Closing { .. } | LastAck { .. }, _) => {}
-        }
-        Ok(())
     }
 }
 
@@ -716,11 +630,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     self.state
                         .transition_to_fin_sent(self.user_tx_segments.next_seq_nr());
                     self.maybe_send_fin(cx, socket)?;
-                    self.state = VirtualSocketState::Finished;
+                    self.state = VirtualSocketState::Closed;
                     return Ok(());
                 }
             };
-            on_ack_result.update(&self.process_incoming_message(cx, msg)?);
+            on_ack_result.update(&self.process_incoming_message(cx, socket, msg)?);
         }
 
         if on_ack_result.acked_segments_count > 0 {
@@ -779,22 +693,108 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         seq_nr=%msg.header.seq_nr,
         ack_nr=%msg.header.ack_nr,
         len=msg.payload().len(),
-        type=?msg.header.get_type()
+        msgtype=?msg.header.get_type()
     ))]
     fn process_incoming_message(
         &mut self,
         cx: &mut std::task::Context<'_>,
+        socket: &UtpSocket<T, Env>,
         msg: UtpMessage,
     ) -> anyhow::Result<OnAckResult> {
         trace!("processing message");
 
-        log_before_and_after_if_changed(
-            "state",
-            self,
-            |s| s.state,
-            |s| s.state.on_incoming_packet(&msg.header),
-            |_, _| Level::DEBUG,
-        )?;
+        // Process state changes and invalid packets.
+        use Type::*;
+        use VirtualSocketState::*;
+        let hdr = &msg.header;
+        match (self.state, msg.header.get_type()) {
+            (_, ST_RESET) => {
+                self.state = Closed;
+                bail!("ST_RESET received")
+            }
+            (_, ST_SYN) => {
+                trace!("unexpected ST_SYN, ignoring");
+                return Ok(Default::default());
+            }
+            (Closed, _) => {
+                bail!("bug: received a packet in Closed state, we shouldn't have reached here");
+            }
+            (SynReceived, _) => {
+                bail!("bug: unexpected packet in SynReceived state. We should have sent the SYN-ACK first.")
+            }
+            (SynAckSent { seq_nr, .. }, ST_DATA | ST_STATE) => {
+                if hdr.ack_nr != seq_nr - 1 {
+                    trace!("dropping packet, we expected a different ack_nr");
+                    return Ok(Default::default());
+                }
+
+                trace!("state: syn-ack-sent -> established");
+                self.state = Established;
+            }
+            (SynAckSent { .. }, ST_FIN) => {
+                // we can ignore cleanups in this weird case let's just die
+                trace!("state: syn-ack-sent -> closed");
+                let _ = self.send_finack(cx, socket, hdr.seq_nr);
+                self.state = Closed;
+                return Ok(Default::default());
+            }
+
+            (_, ST_FIN) if hdr.seq_nr != self.last_consumed_remote_seq_nr + 1 => {
+                debug!(
+                    "dropping FIN as duplicate or too early, expected seq_nr to be {}",
+                    self.last_consumed_remote_seq_nr + 1
+                );
+                return Ok(Default::default());
+            }
+
+            (Established, ST_DATA | ST_STATE) => {}
+            (Established, ST_FIN) => {
+                trace!("state: established -> close-wait");
+                self.state = CloseWait {
+                    remote_fin: hdr.seq_nr,
+                };
+            }
+
+            (FinWait1 { our_fin }, ST_FIN) if hdr.ack_nr == our_fin => {
+                // TODO: ensure we send final ACK
+                trace!("state: fin-wait-1 -> closed");
+                self.state = Closed;
+            }
+            (FinWait1 { our_fin }, ST_FIN) => {
+                trace!("state: fin-wait-1 -> closing");
+                self.state = Closing {
+                    our_fin,
+                    remote_fin: hdr.seq_nr,
+                };
+            }
+
+            (FinWait1 { our_fin }, ST_DATA | ST_STATE) if hdr.ack_nr == our_fin => {
+                trace!("state: fin-wait-1 -> fin-wait-2");
+                self.state = FinWait2;
+            }
+            (FinWait1 { .. }, ST_DATA | ST_STATE) => {}
+            (FinWait2, Type::ST_FIN) => {
+                trace!("state: fin-wait-2 -> closed");
+                self.state = Closed;
+            }
+            (FinWait2, ST_DATA | ST_STATE) => {}
+
+            // Data received after remote closed
+            (
+                CloseWait { remote_fin } | Closing { remote_fin, .. } | LastAck { remote_fin, .. },
+                _,
+            ) if hdr.seq_nr > remote_fin => {
+                warn!("received higher seq nr than remote FIN, dropping packet");
+                return Ok(Default::default());
+            }
+
+            (Closing { our_fin, .. } | LastAck { our_fin, .. }, _) if hdr.ack_nr == our_fin => {
+                trace!("state: closing -> closed");
+                self.state = Closed;
+            }
+
+            (CloseWait { .. } | Closing { .. } | LastAck { .. }, _) => {}
+        }
 
         let on_ack_result = self
             .user_tx_segments
@@ -808,7 +808,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .set_remote_window(msg.header.wnd_size as usize);
 
         match msg.header.get_type() {
-            Type::ST_DATA => {
+            ST_DATA => {
                 trace!(payload_size = msg.payload().len(), "received ST_DATA");
 
                 let msg_seq_nr = msg.header.seq_nr;
@@ -848,15 +848,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         self.last_consumed_remote_seq_nr += sequence_numbers as u16;
                         self.consumed_but_unacked_bytes += bytes;
                         trace!(self.consumed_but_unacked_bytes);
-
-                        // If we got remote FIN, increase the last consumed sequence number, so that
-                        // we (re)send the final ACK.
-                        if let Some(remote_fin) = self.state.remote_fin() {
-                            if remote_fin - self.last_consumed_remote_seq_nr == 1 {
-                                self.last_consumed_remote_seq_nr += 1;
-                                self.try_send_last_message_to_user_rx(UserRxMessage::Eof);
-                            }
-                        }
                     }
                     AssemblerAddRemoveResult::Unavailable(_) => {
                         trace!("cannot reassemble message, ignoring it");
@@ -886,7 +877,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     self.force_immedate_ack();
                 }
             }
-            Type::ST_STATE => {
+            ST_STATE => {
                 // Fast retransmit in case of duplicate ACKs
                 match self.local_rx_last_ack {
                     // Duplicate ACK if payload empty and ACK doesn't move send window ->
@@ -930,19 +921,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     }
                 };
             }
-            Type::ST_RESET => bail!("ST_RESET received"),
-            Type::ST_FIN => {
+            ST_RESET => bail!("ST_RESET received"),
+            ST_FIN => {
                 if let Some(close_reason) = msg.header.extensions.close_reason {
                     debug!("remote closed with {close_reason:?}");
                 }
 
-                // This will (re)send FINACK
-                if msg.header.seq_nr - self.last_consumed_remote_seq_nr == 1 {
-                    self.last_consumed_remote_seq_nr += 1;
-                    self.try_send_last_message_to_user_rx(UserRxMessage::Eof);
-                }
+                let _ = self.send_finack(cx, socket, hdr.seq_nr);
+                self.try_send_last_message_to_user_rx(UserRxMessage::Eof);
             }
-            Type::ST_SYN => {
+            ST_SYN => {
                 warn!("ignoring unexpected ST_SYN packet: {:?}", msg.header);
             }
         }
@@ -1014,6 +1002,17 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
     fn user_rx_is_closed(&self) -> bool {
         self.user_rx.is_closed()
+    }
+
+    fn send_finack(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        socket: &UtpSocket<T, Env>,
+        remote_fin: SeqNr,
+    ) -> anyhow::Result<bool> {
+        let mut hdr = self.outgoing_header();
+        hdr.ack_nr = remote_fin;
+        self.send_control_packet(cx, socket, hdr)
     }
 
     fn maybe_send_syn_ack(
@@ -2824,10 +2823,10 @@ mod tests {
         assert_eq!(t.vsock.local_rx_dup_acks, 0);
         assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
         let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "Should have ACKed the FIN");
         assert_eq!(
-            sent.len(),
-            0,
-            "Should not have sent anything, but sent this: {sent:?}"
+            sent[0].header.ack_nr, header.seq_nr,
+            "Should have ACKed the FIN"
         );
 
         // Now send three ST_STATE duplicates
@@ -2887,14 +2886,33 @@ mod tests {
             "nothing gets sent for out of order FIN"
         );
 
-        // send in-order. This should ACK the FIN
+        // send in-order. This should ACK the DATA
         header.set_type(Type::ST_DATA);
         header.seq_nr = 1.into();
         t.send_msg(header, "a");
+
         t.poll_once_assert_pending().await;
         let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "we should sent FIN ACK");
-        assert_eq!(sent[0].header.ack_nr, 3.into());
+        assert_eq!(
+            sent.len(),
+            1,
+            "we should sent DATA ack as it was out of order"
+        );
+        assert_eq!(
+            sent[0].header.ack_nr,
+            2.into(),
+            "we should sent DATA ack as it was out of order"
+        );
+
+        // send in-order. This should ACK the DATA
+        header.set_type(Type::ST_FIN);
+        header.seq_nr = 3.into();
+        t.send_msg(header, "");
+
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "we should ACK the FIN");
+        assert_eq!(sent[0].header.ack_nr, 3.into(), "we should ACK the FIN");
     }
 
     #[tokio::test]
