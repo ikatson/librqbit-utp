@@ -16,7 +16,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     congestion::CongestionController,
     constants::{
-        DEFAULT_CONSERVATIVE_OUTGOING_MTU, DEFAULT_INCOMING_MTU, DEFAULT_MAX_OUT_OF_ORDER_PACKETS,
+        DEFAULT_CONSERVATIVE_OUTGOING_MTU, DEFAULT_INCOMING_MTU,
+        DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET, DEFAULT_MAX_OUT_OF_ORDER_PACKETS,
         DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK, DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK,
         DEFAULT_MTU_AUTODETECT_IP, DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IPV4_HEADER, MIN_UDP_HEADER,
         UTP_HEADER_SIZE,
@@ -100,6 +101,8 @@ pub struct SocketOpts {
     pub max_segment_retransmissions: Option<NonZeroUsize>,
 
     pub remote_inactivity_timeout: Option<Duration>,
+
+    pub max_active_streams: Option<usize>,
 }
 
 impl SocketOpts {
@@ -186,6 +189,9 @@ impl SocketOpts {
             remote_inactivity_timeout: self
                 .remote_inactivity_timeout
                 .unwrap_or(DEFAULT_REMOTE_INACTIVITY_TIMEOUT),
+            max_active_streams: self
+                .max_active_streams
+                .unwrap_or(DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET),
         })
     }
 }
@@ -204,6 +210,7 @@ pub(crate) struct ValidatedSocketOpts {
     pub max_segment_retransmissions: NonZeroUsize,
 
     pub remote_inactivity_timeout: Duration,
+    pub max_active_streams: usize,
 }
 
 pub(crate) struct RequestWithSpan<V> {
@@ -316,6 +323,7 @@ struct Syn {
 
 enum MatchSynWithAccept<T, E> {
     Matched,
+    Full(Syn, Acceptor<T, E>),
     SynInvalid(Acceptor<T, E>),
     ReceiverDead(Syn),
 }
@@ -327,10 +335,6 @@ struct AcceptQueue<T, E> {
 }
 
 impl<T, E> AcceptQueue<T, E> {
-    fn syn_queue_empty(&mut self) -> bool {
-        self.syns.is_empty()
-    }
-
     fn try_next_acceptor(&mut self) -> Option<Acceptor<T, E>> {
         if let Some(next) = self.next_available_acceptor.take() {
             return Some(next);
@@ -370,13 +374,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     async fn run_once(&mut self, read_buf: &mut [u8]) -> anyhow::Result<()> {
-        // This should get us into a state where either there's no SYNs or no accepts available.
         self.cleanup_accept_queue()?;
 
         tokio::select! {
-            accept = self.accept_queue.rx.recv(), if !self.accept_queue.syn_queue_empty() => {
+            accept = self.accept_queue.rx.recv(), if self.accept_queue.next_available_acceptor.is_none() => {
                 let accept = accept.unwrap();
-                assert!(self.accept_queue.next_available_acceptor.is_none());
                 self.accept_queue.next_available_acceptor = Some(accept);
             }
             control_request = self.control_rx.recv() => {
@@ -403,12 +405,14 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
     // Get into a state where we can't match acceptors with cached SYNs anymore.
     fn cleanup_accept_queue(&mut self) -> anyhow::Result<()> {
-        while !self.accept_queue.syns.is_empty() {
+        while let Some(syn) = self.accept_queue.syns.pop_front() {
             let acceptor = match self.accept_queue.try_next_acceptor() {
                 Some(acc) => acc,
-                None => return Ok(()),
+                None => {
+                    self.accept_queue.syns.push_front(syn);
+                    return Ok(());
+                }
             };
-            let syn = self.accept_queue.syns.pop_front().unwrap();
             match self.match_syn_with_accept(syn, acceptor) {
                 MatchSynWithAccept::Matched => continue,
                 MatchSynWithAccept::SynInvalid(sender) => {
@@ -416,6 +420,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 }
                 MatchSynWithAccept::ReceiverDead(syn) => {
                     self.accept_queue.syns.push_front(syn);
+                }
+                MatchSynWithAccept::Full(syn, acceptor) => {
+                    self.accept_queue.syns.push_front(syn);
+                    self.accept_queue.next_available_acceptor = Some(acceptor);
+                    return Ok(());
                 }
             }
         }
@@ -435,6 +444,13 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     async fn on_control(&mut self, msg: ControlRequest) {
         match msg {
             ControlRequest::ConnectRequest(addr, token, sender) => {
+                if self.streams_full() {
+                    debug!(?addr, "too many connections, dropping connect request");
+                    let _ = sender
+                        .tx
+                        .send(Err(anyhow::anyhow!("too many active connections")));
+                    return;
+                }
                 let conn_id = self.get_next_free_conn_id(addr);
                 let header = UtpHeader {
                     htype: Type::ST_SYN,
@@ -493,8 +509,21 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
 
+    fn streams_full(&self) -> bool {
+        self.streams.len() >= self.socket.opts.max_active_streams
+    }
+
     #[tracing::instrument(level = "trace", skip_all, fields(addr, seq_nr=?msg.header.seq_nr, ack_nr=?msg.header.ack_nr))]
     fn on_maybe_connect_ack(&mut self, addr: SocketAddr, msg: UtpMessage) -> anyhow::Result<()> {
+        if self.streams_full() {
+            debug!(
+                active_streams = self.streams.len(),
+                ?msg,
+                "dropping potential SYN-ACK packet, too many active streams"
+            );
+            return Ok(());
+        }
+
         let mut occ = match self.connecting.entry(addr) {
             Entry::Occupied(occ) => occ,
             Entry::Vacant(_) => {
@@ -545,12 +574,14 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         syn: Syn,
         accept: Acceptor<T, E>,
     ) -> MatchSynWithAccept<T, E> {
+        if self.streams_full() {
+            debug!("too many connections, can't match SYN with accept");
+            return MatchSynWithAccept::Full(syn, accept);
+        }
+
         let recv_key = (syn.remote, syn.header.connection_id + 1);
         if self.streams.contains_key(&recv_key) {
-            // This could happen only if someone connected to us with the same connection id
-            // we used to connect to them ourselves. This must be so impossibly rare that this message is
-            // "warn".
-            warn!(?recv_key, "SYN clashes with an existing stream, dropping");
+            debug!(?recv_key, "SYN clashes with an existing stream, ignoring");
             return MatchSynWithAccept::SynInvalid(accept);
         }
 
@@ -587,6 +618,10 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     return Ok(());
                 }
                 MatchSynWithAccept::ReceiverDead(s) => syn = s,
+                MatchSynWithAccept::Full(s, acceptor) => {
+                    self.accept_queue.next_available_acceptor = Some(acceptor);
+                    syn = s;
+                }
             }
         }
         match self.accept_queue.try_cache_syn(syn) {
