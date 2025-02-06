@@ -2419,7 +2419,7 @@ mod tests {
             )],
         );
 
-        // Drop the writer - this should trigger sending FIN.
+        // Drop the writer - this should NOT trigger sending FIN until data is ACKed.
         drop(writer);
         t.poll_once_assert_pending().await;
 
@@ -2436,11 +2436,11 @@ mod tests {
             "",
         );
 
-        // Should see the FIN
         t.poll_once_assert_pending().await;
         assert_eq!(
             t.take_sent(),
             vec![cmphead!(htype = Type::ST_FIN, seq_nr = 102, ack_nr = 0)],
+            "Should send FIN"
         );
 
         assert_eq!(
@@ -2453,10 +2453,7 @@ mod tests {
         // Drop the reader - this should cause the stream to complete in 1 second.
         drop(reader);
         t.poll_once_assert_pending().await;
-        // TODO: t.assert_sent_empty();
-
         t.env.increment_now(Duration::from_secs(1));
-        // TODO: t.assert_sent_empty();
         let result = t.poll_once().await;
         assert!(
             !matches!(result, Poll::Pending),
