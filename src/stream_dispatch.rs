@@ -1140,10 +1140,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             if self.user_rx_is_closed() && self.state.is_local_fin_or_later() {
-                // TODO: run a little bit more to send the final ACK to remote FIN?
-                trace!(current_state=?self.state, "both halves are dead, no reason to continue");
-                self.just_before_death(cx, None);
-                return Poll::Ready(Ok(()));
+                // Give the remote 1 second to send FIN so that we can ACK it.
+                let next_exp = self.this_poll.now + Duration::from_secs(1);
+                match self.timers.remote_inactivity_timer {
+                    Some(time) if time < next_exp => {}
+                    _ => {
+                        debug!("both halves are dead, arming inactivity timer in 1 second");
+                        self.timers.remote_inactivity_timer = Some(next_exp)
+                    }
+                }
             }
 
             match self.next_poll_send_to_at() {
@@ -2409,13 +2414,14 @@ mod tests {
             VirtualSocketState::FinWait1 { our_fin: fin_nr }
         );
 
-        // Drop the reader - this should cause the stream to complete without waiting for FIN ACK
+        // Drop the reader - this should cause the stream to complete in 1 second.
         drop(reader);
+        t.poll_once_assert_pending().await;
 
-        // Poll should complete immediately even though we never got ACKs
+        t.env.increment_now(Duration::from_secs(1));
         let result = t.poll_once().await;
         assert!(
-            matches!(result, Poll::Ready(Ok(()))),
+            !matches!(result, Poll::Pending),
             "Poll should complete after both halves are dropped"
         );
     }
@@ -2438,10 +2444,12 @@ mod tests {
         );
 
         drop(t.stream.take());
+        t.poll_once_assert_pending().await;
+        t.env.increment_now(Duration::from_secs(1));
         let result = t.poll_once().await;
         assert!(
-            matches!(result, Poll::Ready(Ok(()))),
-            "Poll should complete after both halves are dropped"
+            !matches!(result, Poll::Pending),
+            "Poll should complete in 1 second after both halves are dropped"
         );
     }
 
@@ -2478,7 +2486,7 @@ mod tests {
         assert_eq!(sent[0].payload(), b"hello");
         let data_seq_nr = sent[0].header.seq_nr;
 
-        // Nothing else whould be sent before ACK.
+        // Nothing else should be sent before ACK.
         t.poll_once_assert_pending().await;
         assert_eq!(t.take_sent().len(), 0);
 
@@ -2494,13 +2502,15 @@ mod tests {
             "",
         );
 
-        // Next poll should send FIN and die.
-        let result = t.poll_once().await;
+        // Next poll should send FIN and die in 1 second.
+        t.poll_once_assert_pending().await;
         let sent = t.take_sent();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
         assert_eq!(sent[0].header.seq_nr.0, data_seq_nr.0 + 1);
-        assert!(matches!(result, Poll::Ready(Ok(()))));
+
+        t.env.increment_now(Duration::from_secs(1));
+        assert!(!matches!(t.poll_once().await, Poll::Pending));
     }
 
     #[tokio::test]
@@ -3353,12 +3363,7 @@ mod tests {
         drop(writer);
 
         // Next poll should send FIN
-        let result = t.poll_once().await;
-        assert!(
-            matches!(result, Poll::Ready(Ok(()))),
-            "Socket should complete immediately after both halves dropped"
-        );
-
+        t.poll_once_assert_pending().await;
         let sent = t.take_sent();
         assert_eq!(sent.len(), 1, "Should send FIN after both halves dropped");
         assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
@@ -3410,13 +3415,8 @@ mod tests {
         // Now drop the writer
         drop(writer);
 
-        // Next poll should send FIN and complete
-        let result = t.poll_once().await;
-        assert!(
-            matches!(result, Poll::Ready(Ok(()))),
-            "Socket should complete immediately after both halves dropped"
-        );
-
+        // Next poll should send FIN
+        t.poll_once_assert_pending().await;
         let sent = t.take_sent();
         assert_eq!(sent.len(), 1, "Should send FIN after writer dropped");
         assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
@@ -3865,8 +3865,8 @@ mod tests {
         match result {
             Poll::Ready(Err(e)) => {
                 assert!(
-                    e.to_string().contains("timeout"),
-                    "Error should mention timeout: {e}"
+                    e.to_string().contains("inactive"),
+                    "Error should mention inactivity: {e}"
                 );
             }
             other => panic!("Expected inactivity error, got: {other:?}"),
