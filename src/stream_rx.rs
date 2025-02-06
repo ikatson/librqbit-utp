@@ -155,7 +155,9 @@ impl AsyncRead for UtpStreamReadHalf {
 
         if written > 0 {
             let mut g = self.shared.locked.lock();
-            if let Some(waker) = g.dispatcher_waker.take() {
+            let waker = g.dispatcher_waker.take();
+            drop(g);
+            if let Some(waker) = waker {
                 waker.wake();
             }
             return Poll::Ready(Ok(()));
@@ -190,7 +192,9 @@ impl Drop for UtpStreamReadHalf {
     fn drop(&mut self) {
         let mut g = self.shared.locked.lock();
         g.reader_dead = true;
-        if let Some(waker) = g.dispatcher_waker.take() {
+        let waker = g.dispatcher_waker.take();
+        drop(g);
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
@@ -200,7 +204,9 @@ impl Drop for UserRx {
     fn drop(&mut self) {
         let mut g = self.shared.locked.lock();
         g.writer_dead = true;
-        if let Some(waker) = g.reader_waker.take() {
+        let waker = g.reader_waker.take();
+        drop(g);
+        if let Some(waker) = waker {
             waker.wake();
         }
     }
@@ -298,7 +304,8 @@ impl UserRx {
         }
 
         if flushed_bytes > 0 {
-            if let Some(w) = self.shared.locked.lock().reader_waker.take() {
+            let waker = self.shared.locked.lock().reader_waker.take();
+            if let Some(w) = waker {
                 w.wake();
             }
             trace!(
@@ -325,7 +332,9 @@ impl UserRx {
     pub fn enqueue_last_message(&self, msg: UserRxMessage) {
         let mut g = self.shared.locked.lock();
         g.queue.try_push_back(msg).unwrap();
-        if let Some(waker) = g.reader_waker.take() {
+        let waker = g.reader_waker.take();
+        if let Some(waker) = waker {
+            drop(g);
             waker.wake();
         }
     }

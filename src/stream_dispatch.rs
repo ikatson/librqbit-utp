@@ -599,7 +599,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.user_rx.mark_stream_dead();
 
         // This will close the writer.
-        self.user_tx.locked.lock().mark_stream_dead();
+        self.user_tx.mark_stream_dead();
 
         if error.is_some() && !self.state.is_local_fin_or_later() {
             let mut fin = self.outgoing_header();
@@ -655,15 +655,23 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             {
                 let mut g = self.user_tx.locked.lock();
                 g.truncate_front(on_ack_result.acked_bytes)?;
-                if let Some(w) = g.buffer_has_space.take() {
+
+                let waker_1 = g.buffer_has_space.take();
+                let waker_2 = if g.is_empty() {
+                    self.timers.remote_inactivity_timer = None;
+                    g.buffer_flushed.take()
+                } else {
+                    None
+                };
+                drop(g);
+
+                // Waking under lock slows things down.
+
+                if let Some(w) = waker_1 {
                     w.wake();
                 }
-
-                if g.is_empty() {
-                    self.timers.remote_inactivity_timer = None;
-                    if let Some(w) = g.buffer_flushed.take() {
-                        w.wake();
-                    }
+                if let Some(w) = waker_2 {
+                    w.wake();
                 }
             }
 

@@ -76,7 +76,7 @@ impl UserTxLocked {
     }
 
     // This will send FIN (if not yet).
-    pub fn mark_stream_dead(&mut self) {
+    fn mark_stream_dead(&mut self) {
         self.dead = true;
         if let Some(waker) = self.buffer_has_space.take() {
             waker.wake();
@@ -179,6 +179,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
         }
 
         if let Some(w) = g.buffer_has_data.take() {
+            drop(g);
             w.wake()
         }
 
