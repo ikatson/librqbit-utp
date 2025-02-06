@@ -1,3 +1,6 @@
+// TODO: redeliver FIN-ACKs if they were not received. Also may re-send the last control packet (or even the last packet) if
+// failed sending, but break the poll loop.
+
 // TODO: When someone connects to us and doesn't send anything - we keep sending STATE every 200ms forever. But need to die.
 
 // (Done) TODO: in case the other end doesn't answer we need to stop the dispatcher. Otherwise it'll leak memory.

@@ -74,7 +74,7 @@ enum VirtualSocketState {
 }
 
 impl VirtualSocketState {
-    fn is_done(&self) -> bool {
+    fn is_closed(&self) -> bool {
         matches!(self, VirtualSocketState::Closed)
     }
 
@@ -567,10 +567,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(())
     }
 
-    fn try_send_last_message_to_user_rx(&mut self, msg: UserRxMessage) {
-        self.user_rx.enqueue_last_message(msg);
-    }
-
     fn just_before_death(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -582,7 +578,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             trace!("just_before_death: no error");
         }
 
-        self.try_send_last_message_to_user_rx(
+        self.user_rx.enqueue_last_message(
             error
                 .map(|e| UserRxMessage::Error(format!("{e:#}")))
                 .unwrap_or(UserRxMessage::Eof),
@@ -595,11 +591,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.user_tx.locked.lock().mark_stream_dead();
 
         if error.is_some() && !self.state.is_local_fin_or_later() {
-            let mut rst = self.outgoing_header();
-            rst.set_type(Type::ST_RESET);
+            let mut fin = self.outgoing_header();
+            fin.set_type(Type::ST_FIN);
+            fin.seq_nr = self.user_tx_segments.next_seq_nr();
             if let Some(socket) = self.socket.upgrade() {
-                if let Err(e) = self.send_control_packet(cx, &socket, rst) {
-                    debug!("error sending RST: {e:#}")
+                if let Err(e) = self.send_control_packet(cx, &socket, fin) {
+                    debug!("error sending FIN: {e:#}")
                 }
             }
         }
@@ -635,6 +632,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             };
             on_ack_result.update(&self.process_incoming_message(cx, socket, msg)?);
+            if self.this_poll.transport_pending || matches!(self.state, VirtualSocketState::Closed)
+            {
+                break;
+            }
         }
 
         if on_ack_result.acked_segments_count > 0 {
@@ -707,7 +708,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         use Type::*;
         use VirtualSocketState::*;
         let hdr = &msg.header;
-        match (self.state, msg.header.get_type()) {
+
+        let mut is_first_remote_fin = false;
+
+        match (self.state, hdr.get_type()) {
             (_, ST_RESET) => {
                 self.state = Closed;
                 bail!("ST_RESET received")
@@ -732,22 +736,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.state = Established;
             }
             (SynAckSent { .. }, ST_FIN) => {
-                // we can ignore cleanups in this weird case let's just die
                 trace!("state: syn-ack-sent -> closed");
+                is_first_remote_fin = true;
                 let _ = self.send_finack(cx, socket, hdr.seq_nr);
                 self.state = Closed;
-                return Ok(Default::default());
             }
 
-            (_, ST_FIN) if hdr.seq_nr != self.last_consumed_remote_seq_nr + 1 => {
+            (Established, ST_DATA | ST_STATE) => {}
+            (Established, ST_FIN) if hdr.seq_nr != self.last_consumed_remote_seq_nr + 1 => {
                 debug!(
-                    "dropping FIN as duplicate or too early, expected seq_nr to be {}",
+                    "dropping FIN as too early, expected seq_nr to be {}",
                     self.last_consumed_remote_seq_nr + 1
                 );
                 return Ok(Default::default());
             }
-
-            (Established, ST_DATA | ST_STATE) => {}
             (Established, ST_FIN) => {
                 trace!("state: established -> close-wait");
                 self.state = CloseWait {
@@ -756,11 +758,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             (FinWait1 { our_fin }, ST_FIN) if hdr.ack_nr == our_fin => {
-                // TODO: ensure we send final ACK
+                is_first_remote_fin = true;
                 trace!("state: fin-wait-1 -> closed");
                 self.state = Closed;
             }
             (FinWait1 { our_fin }, ST_FIN) => {
+                is_first_remote_fin = true;
                 trace!("state: fin-wait-1 -> closing");
                 self.state = Closing {
                     our_fin,
@@ -779,7 +782,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
             (FinWait2, ST_DATA | ST_STATE) => {}
 
-            // Data received after remote closed
             (
                 CloseWait { remote_fin } | Closing { remote_fin, .. } | LastAck { remote_fin, .. },
                 _,
@@ -928,7 +930,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
 
                 let _ = self.send_finack(cx, socket, hdr.seq_nr);
-                self.try_send_last_message_to_user_rx(UserRxMessage::Eof);
+                if is_first_remote_fin {
+                    self.last_consumed_remote_seq_nr = hdr.seq_nr;
+                    self.user_rx.enqueue_last_message(UserRxMessage::Eof);
+                }
             }
             ST_SYN => {
                 warn!("ignoring unexpected ST_SYN packet: {:?}", msg.header);
@@ -1087,7 +1092,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             bail_if_err!(self.user_rx.flush(cx));
 
             // Read incoming stream.
-            bail_if_err!(self.process_all_incoming_messages(cx, socket));
+            pending_if_cannot_send!(self.process_all_incoming_messages(cx, socket));
 
             self.maybe_prepare_for_retransmission();
 
@@ -1100,7 +1105,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             pending_if_cannot_send!(self.maybe_send_ack(cx, socket));
 
-            if self.state.is_done() {
+            if self.state.is_closed() {
                 self.just_before_death(cx, None);
                 return Poll::Ready(Ok(()));
             }
