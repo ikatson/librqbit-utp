@@ -2483,8 +2483,15 @@ mod tests {
 
         drop(t.stream.take());
         t.poll_once_assert_pending().await;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_FIN, seq_nr = 101, ack_nr = 0)]
+        );
+
         t.env.increment_now(Duration::from_secs(1));
         let result = t.poll_once().await;
+        t.assert_sent_empty(); // todo: maybe there should be retransmission here?
+
         assert!(
             !matches!(result, Poll::Pending),
             "Poll should complete in 1 second after both halves are dropped"
@@ -2519,14 +2526,19 @@ mod tests {
 
         // First poll should send the pending data
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].payload(), b"hello");
-        let data_seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 101,
+                ack_nr = 0,
+                payload = "hello"
+            )]
+        );
 
         // Nothing else should be sent before ACK.
         t.poll_once_assert_pending().await;
-        assert_eq!(t.take_sent().len(), 0);
+        t.assert_sent_empty();
 
         // Send ACK
         t.send_msg(
@@ -2542,13 +2554,14 @@ mod tests {
 
         // Next poll should send FIN and die in 1 second.
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
-        assert_eq!(sent[0].header.seq_nr.0, data_seq_nr.0 + 1);
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_FIN, seq_nr = 102, ack_nr = 0)]
+        );
 
         t.env.increment_now(Duration::from_secs(1));
-        assert!(!matches!(t.poll_once().await, Poll::Pending));
+        let res = t.poll_once().await;
+        assert!(!matches!(res, Poll::Pending));
     }
 
     #[tokio::test]
@@ -2578,21 +2591,26 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Should only send up to window size
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].payload(), b"hello");
-        let first_seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 101,
+                ack_nr = 0,
+                payload = "hello"
+            )]
+        );
 
         // No more data should be sent until window updates
         t.poll_once_assert_pending().await;
-        assert_eq!(t.take_sent().len(), 0);
+        t.assert_sent_empty();
 
         // ACK first packet but keep window small
         t.send_msg(
             UtpHeader {
                 htype: Type::ST_STATE,
                 seq_nr: 0.into(),
-                ack_nr: first_seq_nr,
+                ack_nr: 101.into(),
                 wnd_size: 4, // Reduce window further
                 ..Default::default()
             },
@@ -2601,17 +2619,22 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Should send up to new window size
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].payload(), b" wor"); // Only 4 bytes
-        let second_seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 102,
+                ack_nr = 0,
+                payload = " wor"
+            )]
+        );
 
         // Remote increases window and ACKs
         t.send_msg(
             UtpHeader {
                 htype: Type::ST_STATE,
                 seq_nr: 0.into(),
-                ack_nr: second_seq_nr,
+                ack_nr: 102.into(),
                 wnd_size: 10, // Open window
                 ..Default::default()
             },
@@ -2620,14 +2643,20 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Should send remaining data
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].payload(), b"ld");
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 103,
+                ack_nr = 0,
+                payload = "ld"
+            )]
+        );
 
         // Verify total data sent matches original write
         assert_eq!(
-            t.vsock.user_tx_segments.next_seq_nr().0 - first_seq_nr.0,
-            3, // 3 packets total
+            t.vsock.user_tx_segments.next_seq_nr(),
+            104.into(),
             "Should have split data into correct number of packets"
         );
     }
@@ -2659,17 +2688,22 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // First chunk should be sent
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].payload(), b"hello");
-        let seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 101,
+                ack_nr = 0,
+                payload = "hello"
+            )]
+        );
 
         // ACK data but advertise zero window
         t.send_msg(
             UtpHeader {
                 htype: Type::ST_STATE,
                 seq_nr: 0.into(),
-                ack_nr: seq_nr,
+                ack_nr: 101.into(),
                 wnd_size: 0, // Zero window
                 ..Default::default()
             },
@@ -2678,14 +2712,14 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Nothing should be sent
-        assert_eq!(t.take_sent().len(), 0);
+        t.assert_sent_empty();
 
         // Remote sends window update
         t.send_msg(
             UtpHeader {
                 htype: Type::ST_STATE,
                 seq_nr: 0.into(),
-                ack_nr: seq_nr,
+                ack_nr: 101.into(),
                 wnd_size: 1024, // Open window
                 ..Default::default()
             },
@@ -2694,9 +2728,15 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Remaining data should now be sent
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].payload(), b" world");
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 102,
+                ack_nr = 0,
+                payload = " world"
+            )]
+        );
     }
 
     #[tokio::test]
@@ -2845,7 +2885,7 @@ mod tests {
             UtpHeader {
                 htype: Type::ST_STATE,
                 seq_nr: 0.into(),
-                ack_nr: t.vsock.last_sent_seq_nr,
+                ack_nr: 100.into(),
                 wnd_size: 1024,
                 ..Default::default()
             },
@@ -2862,19 +2902,30 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Should have sent the data
-        let sent = t.take_sent();
-        assert!(sent.len() == 2, "Should have sent 2 packets");
-        assert_eq!(sent[0].payload(), b"hello");
-        assert_eq!(sent[1].payload(), b"world");
+        assert_eq!(
+            t.take_sent(),
+            vec![
+                cmphead!(
+                    htype = Type::ST_DATA,
+                    seq_nr = 101,
+                    ack_nr = 0,
+                    payload = "hello"
+                ),
+                cmphead!(
+                    htype = Type::ST_DATA,
+                    seq_nr = 102,
+                    ack_nr = 0,
+                    payload = "world"
+                )
+            ]
+        );
         assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 2);
-
-        let first_seq_nr = sent[0].header.seq_nr;
 
         // Send three duplicate ACKs using different packet types
         let mut header = UtpHeader {
             htype: Type::ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: first_seq_nr,
+            ack_nr: 101.into(),
             wnd_size: 1024,
             ..Default::default()
         };
@@ -2910,10 +2961,9 @@ mod tests {
         // Duplicate ACK count should be 0 since non-ST_STATE packets don't count
         assert_eq!(t.vsock.local_rx_dup_acks, 0);
         assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "Should have ACKed the FIN");
         assert_eq!(
-            sent[0].header.ack_nr, header.seq_nr,
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_STATE, seq_nr = 102, ack_nr = 3)],
             "Should have ACKed the FIN"
         );
 
@@ -2927,12 +2977,15 @@ mod tests {
 
         // Now we should see duplicate ACKs counted and fast retransmit triggered
         assert_eq!(t.vsock.local_rx_dup_acks, 3);
-        let resent = t.take_sent();
-        assert_eq!(resent.len(), 1, "Should have triggered fast retransmit");
         assert_eq!(
-            resent[0].header.seq_nr,
-            first_seq_nr + 1,
-            "Should have retransmitted correct packet"
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 102,
+                // TODO: which? ack_nr = 3,
+                payload = "world"
+            )],
+            "Should have triggered fast retransmit"
         );
     }
 
@@ -2958,9 +3011,11 @@ mod tests {
         t.send_msg(header, "world");
         t.poll_once_assert_pending().await;
         assert!(!t.vsock.user_rx.assembler_empty());
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "immediate ACK should have been sent");
-        assert_eq!(sent[0].header.ack_nr, 0.into());
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_STATE, seq_nr = 100, ack_nr = 0)],
+            "immediate ACK should have been sent"
+        );
 
         // remote sends FIN
         header.set_type(Type::ST_FIN);
@@ -2968,11 +3023,7 @@ mod tests {
         t.send_msg(header, "");
         t.poll_once_assert_pending().await;
         assert!(!t.vsock.user_rx.assembler_empty());
-        assert_eq!(
-            t.take_sent(),
-            Vec::<UtpMessage>::new(),
-            "nothing gets sent for out of order FIN"
-        );
+        t.assert_sent_empty_msg("nothing gets sent for out of order FIN");
 
         // send in-order. This should ACK the DATA
         header.set_type(Type::ST_DATA);
@@ -2980,15 +3031,9 @@ mod tests {
         t.send_msg(header, "a");
 
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
         assert_eq!(
-            sent.len(),
-            1,
-            "we should sent DATA ack as it was out of order"
-        );
-        assert_eq!(
-            sent[0].header.ack_nr,
-            2.into(),
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_STATE, seq_nr = 100, ack_nr = 2)],
             "we should sent DATA ack as it was out of order"
         );
 
@@ -2998,9 +3043,11 @@ mod tests {
         t.send_msg(header, "");
 
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "we should ACK the FIN");
-        assert_eq!(sent[0].header.ack_nr, 3.into(), "we should ACK the FIN");
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_STATE, seq_nr = 100, ack_nr = 3)],
+            "we should ACK the FIN"
+        );
     }
 
     #[tokio::test]
@@ -3151,47 +3198,48 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Initial send
-        let initial_sent = t.take_sent();
-        assert_eq!(initial_sent.len(), 1, "Should send data initially");
-        assert_eq!(initial_sent[0].payload(), b"hello world");
-        let initial_seq_nr = initial_sent[0].header.seq_nr;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 101,
+                ack_nr = 0,
+                payload = "hello world"
+            )],
+            "should send data initially"
+        );
 
         // No retransmission should occur before timeout
         t.env.increment_now(Duration::from_millis(100));
         t.poll_once_assert_pending().await;
-        assert_eq!(
-            t.take_sent().len(),
-            0,
-            "Should not retransmit before timeout"
-        );
+        t.assert_sent_empty_msg("Should not retransmit before timeout");
 
         // After timeout, packet should be retransmitted
         t.env.increment_now(Duration::from_secs(1));
         t.poll_once_assert_pending().await;
-        let first_retransmit = t.take_sent();
-        assert_eq!(first_retransmit.len(), 1, "Should retransmit after timeout");
         assert_eq!(
-            first_retransmit[0].header.seq_nr, initial_seq_nr,
-            "Retransmitted packet should have same sequence number"
-        );
-        assert_eq!(
-            first_retransmit[0].payload(),
-            b"hello world",
-            "Retransmitted packet should have same payload"
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 101,
+                ack_nr = 0,
+                payload = "hello world"
+            )],
+            "should retransmit"
         );
 
         // Second timeout should trigger another retransmission with doubled timeout
         t.env.increment_now(Duration::from_secs(2));
         t.poll_once_assert_pending().await;
-        let second_retransmit = t.take_sent();
         assert_eq!(
-            second_retransmit.len(),
-            1,
-            "Should retransmit after second timeout"
-        );
-        assert_eq!(
-            second_retransmit[0].header.seq_nr, initial_seq_nr,
-            "Second retransmit should have same sequence number"
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 101,
+                ack_nr = 0,
+                payload = "hello world"
+            )],
+            "should retransmit after second timeout"
         );
 
         // Now ACK the packet - should stop retransmissions
@@ -3199,7 +3247,7 @@ mod tests {
             UtpHeader {
                 htype: Type::ST_STATE,
                 seq_nr: 0.into(),
-                ack_nr: initial_seq_nr,
+                ack_nr: 101.into(),
                 wnd_size: 1024,
                 ..Default::default()
             },
@@ -3210,17 +3258,19 @@ mod tests {
         // No more retransmissions should occur
         t.env.increment_now(Duration::from_secs(4));
         t.poll_once_assert_pending().await;
-        assert_eq!(t.take_sent().len(), 0, "Should not retransmit after ACK");
+        t.assert_sent_empty_msg("Should not retransmit after ACK");
 
         // Write new data - should use next sequence number
         t.stream.as_mut().unwrap().write_all(b"test").await.unwrap();
         t.poll_once_assert_pending().await;
-        let new_sent = t.take_sent();
-        assert_eq!(new_sent.len(), 1, "Should send new data");
         assert_eq!(
-            new_sent[0].header.seq_nr.0,
-            initial_seq_nr.0 + 1,
-            "New packet should use next sequence number"
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 102,
+                ack_nr = 0,
+                payload = "test"
+            )]
         );
     }
 
@@ -3255,17 +3305,29 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Should have sent two packets
-        let initial_sent = t.take_sent();
-        assert_eq!(initial_sent.len(), 2, "Should have sent 2 packets");
-        assert_eq!(initial_sent[0].payload(), b"hello");
-        assert_eq!(initial_sent[1].payload(), b"world");
-        let first_seq_nr = initial_sent[0].header.seq_nr;
+        assert_eq!(
+            t.take_sent(),
+            vec![
+                cmphead!(
+                    htype = Type::ST_DATA,
+                    seq_nr = 101,
+                    ack_nr = 0,
+                    payload = "hello"
+                ),
+                cmphead!(
+                    htype = Type::ST_DATA,
+                    seq_nr = 102,
+                    ack_nr = 0,
+                    payload = "world"
+                )
+            ]
+        );
 
         // Send selective ACK indicating second packet was received but first wasn't
         let header = UtpHeader {
             htype: Type::ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: first_seq_nr - 1, // ACK previous packet
+            ack_nr: 100.into(), // ACK previous packet
             wnd_size: 1024,
             extensions: crate::raw::Extensions {
                 selective_ack: SelectiveAck::new_test([0]),
@@ -3280,20 +3342,14 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Should only retransmit the first packet
-        let retransmitted = t.take_sent();
         assert_eq!(
-            retransmitted.len(),
-            1,
-            "Should only retransmit first packet"
-        );
-        assert_eq!(
-            retransmitted[0].header.seq_nr, first_seq_nr,
-            "Should retransmit first packet"
-        );
-        assert_eq!(
-            retransmitted[0].payload(),
-            b"hello",
-            "Should retransmit correct data"
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 101,
+                ack_nr = 0,
+                payload = "hello"
+            )]
         );
 
         // Send normal ACK for first packet
@@ -3301,7 +3357,7 @@ mod tests {
             UtpHeader {
                 htype: Type::ST_STATE,
                 seq_nr: 0.into(),
-                ack_nr: first_seq_nr,
+                ack_nr: 101.into(),
                 wnd_size: 1024,
                 ..Default::default()
             },
@@ -3312,11 +3368,7 @@ mod tests {
         // No more retransmissions should occur
         t.env.increment_now(Duration::from_secs(1));
         t.poll_once_assert_pending().await;
-        assert_eq!(
-            t.take_sent().len(),
-            0,
-            "Should not retransmit after both packets acknowledged"
-        );
+        t.assert_sent_empty_msg("Should not retransmit after both packets acknowledged");
     }
 
     #[tokio::test]
@@ -3377,18 +3429,22 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Data should be sent
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
-        assert_eq!(sent[0].payload(), b"hello");
-        let data_seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 101,
+                ack_nr = 0,
+                payload = "hello"
+            )]
+        );
 
         // Acknowledge the data
         t.send_msg(
             UtpHeader {
                 htype: Type::ST_STATE,
                 seq_nr: 0.into(),
-                ack_nr: data_seq_nr,
+                ack_nr: 101.into(),
                 wnd_size: 1024,
                 ..Default::default()
             },
@@ -3402,13 +3458,9 @@ mod tests {
 
         // Next poll should send FIN
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "Should send FIN after both halves dropped");
-        assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
         assert_eq!(
-            sent[0].header.seq_nr.0,
-            data_seq_nr.0 + 1,
-            "FIN should use next sequence number"
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_FIN, seq_nr = 102, ack_nr = 0)]
         );
     }
 
@@ -3427,18 +3479,22 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Data should be sent
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
-        assert_eq!(sent[0].payload(), b"hello");
-        let data_seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 101,
+                ack_nr = 0,
+                payload = "hello"
+            )]
+        );
 
         // Acknowledge the data
         t.send_msg(
             UtpHeader {
                 htype: Type::ST_STATE,
                 seq_nr: 0.into(),
-                ack_nr: data_seq_nr,
+                ack_nr: 101.into(),
                 wnd_size: 1024,
                 ..Default::default()
             },
@@ -3446,22 +3502,20 @@ mod tests {
         );
         t.poll_once_assert_pending().await;
 
-        // Remote sends some data - it should accumulate in OOQ.
+        // Remote sends some data - it should accumulate in OOQ, but be ACKed.
         t.send_data(1, t.vsock.last_sent_seq_nr, "ignored data");
         t.poll_once_assert_pending().await;
+        t.assert_sent_empty();
 
         // Now drop the writer
         drop(writer);
 
         // Next poll should send FIN
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "Should send FIN after writer dropped");
-        assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
         assert_eq!(
-            sent[0].header.seq_nr.0,
-            data_seq_nr.0 + 1,
-            "FIN should use next sequence number"
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_FIN, seq_nr = 102, ack_nr = 1)],
+            "Should send FIN after writer dropped"
         );
     }
 
@@ -3491,11 +3545,17 @@ mod tests {
         t.send_data(2, t.vsock.last_sent_seq_nr, "b");
         t.poll_once_assert_pending().await;
         assert!(t.vsock.user_rx.is_flush_waker_registered());
-        // Verify window is now less than MSS
-        let sent = t.take_sent();
-        assert!(!sent.is_empty(), "Should have sent ACKs");
-        let last_window = sent.last().unwrap().header.wnd_size;
-        assert_eq!(last_window, 4);
+
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_STATE,
+                seq_nr = 100,
+                ack_nr = 2,
+                wnd_size = 4u32
+            )],
+            "Should have sent an ACK with new window less than MSS"
+        );
 
         // Read some data to free up more than MSS worth of buffer space
         let mut buf = vec![0u8; mss];
@@ -3508,10 +3568,16 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Should send window update ACK
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "Should send window update ACK");
-        assert_eq!(sent[0].header.get_type(), Type::ST_STATE);
-        assert_eq!(sent[0].header.wnd_size, 9);
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_STATE,
+                seq_nr = 100,
+                ack_nr = 2,
+                wnd_size = 9u32
+            )],
+            "Should have sent an ACK with updated window"
+        );
     }
 
     #[tokio::test]
@@ -3528,9 +3594,13 @@ mod tests {
 
         let mut t = make_test_vsock(opts, true);
         t.poll_once_assert_pending().await;
-        assert_eq!(t.take_sent().len(), 1); // syn ack
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_STATE, seq_nr = 100, ack_nr = 0)],
+            "should have sent syn-ack"
+        );
 
-        let ack_nr = t.vsock.last_sent_seq_nr;
+        let ack_nr = 99.into();
         let connection_id = t.vsock.conn_id_send + 1;
         let make_msg = |seq_nr, payload| {
             make_msg(
@@ -3556,9 +3626,16 @@ mod tests {
 
         // Ensure we send back 0 window
         let sent = t.transport.take_sent_utpmessages();
-        assert!(!sent.is_empty(), "Should have sent ACKs");
-        let last_window = sent.last().unwrap().header.wnd_size;
-        assert_eq!(last_window, 0, "Window should be zero when buffer full");
+        assert_eq!(
+            sent,
+            vec![cmphead!(
+                htype = Type::ST_STATE,
+                seq_nr = 99,
+                ack_nr = 2,
+                wnd_size = 0u32
+            )],
+            "should have sent zero-window ACK"
+        );
 
         // Now read some data to free up buffer space
         let mut buf = vec![0u8; 5];
@@ -3574,11 +3651,15 @@ mod tests {
 
         // Should send window update ACK
         let sent = t.transport.take_sent_utpmessages();
-        assert_eq!(sent.len(), 1, "Should send window update ACK");
-        assert_eq!(sent[0].header.get_type(), Type::ST_STATE);
-        assert!(
-            sent[0].header.wnd_size > 0,
-            "Window size should be non-zero after reading"
+        assert_eq!(
+            sent,
+            vec![cmphead!(
+                htype = Type::ST_STATE,
+                seq_nr = 99,
+                ack_nr = 2,
+                wnd_size = 5u32
+            )],
+            "should have sent zero-window ACK"
         );
     }
 
@@ -3603,22 +3684,28 @@ mod tests {
         t.poll_once_assert_pending().await;
 
         // Initial data should be sent
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
-        assert_eq!(sent[0].payload(), b"hello");
-        let seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 101,
+                ack_nr = 0,
+                payload = "hello"
+            )],
+        );
 
         // Wait just under timeout - connection should still be alive, but we
         // should get a retransmission.
         t.env.increment_now(Duration::from_millis(900));
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
         assert_eq!(
-            sent[0].header.htype,
-            Type::ST_DATA,
-            "Expected a retransmission"
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 101,
+                ack_nr = 0,
+                payload = "hello"
+            )],
         );
 
         // Remote sends ACK - should reset inactivity timer
@@ -3626,32 +3713,24 @@ mod tests {
             UtpHeader {
                 htype: Type::ST_STATE,
                 seq_nr: 0.into(),
-                ack_nr: seq_nr,
+                ack_nr: 101.into(),
                 wnd_size: 1024,
                 ..Default::default()
             },
             "",
         );
         t.poll_once_assert_pending().await;
-        assert_eq!(t.take_sent(), Vec::<UtpMessage>::new());
+        t.assert_sent_empty();
 
         // Wait just under timeout again - connection should still be alive
         t.env.increment_now(Duration::from_millis(900));
         t.poll_once_assert_pending().await;
-        assert_eq!(
-            t.take_sent().len(),
-            0,
-            "Should not send anything before timeout"
-        );
+        t.assert_sent_empty_msg("Should not send anything before timeout");
 
         // Wait past timeout - connection should not error out as TX is empty.
         t.env.increment_now(Duration::from_millis(200));
         t.poll_once_assert_pending().await;
-        assert_eq!(
-            t.take_sent().len(),
-            0,
-            "Should not send anything before timeout"
-        );
+        t.assert_sent_empty_msg("Should not send anything before timeout");
 
         // Write more data
         t.stream
@@ -3661,10 +3740,15 @@ mod tests {
             .await
             .unwrap();
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
-        assert_eq!(sent[0].payload(), b"world");
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(
+                htype = Type::ST_DATA,
+                seq_nr = 102,
+                ack_nr = 0,
+                payload = "world"
+            )],
+        );
 
         // Wait past timeout - connection should error out as nothing received.
         t.env.increment_now(Duration::from_secs(1));
@@ -3698,8 +3782,11 @@ mod tests {
         };
         let mut t = make_test_vsock(opts, true);
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "Should send syn-ack");
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_STATE, seq_nr = 100, ack_nr = 0)],
+            "Should send syn-ack"
+        );
 
         // Wait past timeout.
         t.env.increment_now(Duration::from_secs(1));
@@ -3735,43 +3822,39 @@ mod tests {
         // At first nothing should happen past timeout
         t.env.increment_now(Duration::from_secs(1));
         t.poll_once_assert_pending().await;
-        assert_eq!(
-            t.take_sent(),
-            Vec::<UtpMessage>::new(),
-            "nothing should happen"
-        );
+        t.assert_sent_empty_msg("nothing should happen");
 
         let (_read, write) = t.stream.take().unwrap().split();
         drop(write);
 
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "we should send a FIN");
-        assert_eq!(sent[0].header.htype, Type::ST_FIN);
-        let fin_seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_FIN, seq_nr = 101, ack_nr = 0)],
+        );
         assert_eq!(
             t.vsock.state,
             VirtualSocketState::FinWait1 {
-                our_fin: fin_seq_nr
+                our_fin: 101.into()
             }
         );
 
         t.send_msg(
             UtpHeader {
                 htype: Type::ST_STATE,
-                ack_nr: fin_seq_nr,
+                ack_nr: 101.into(),
                 ..Default::default()
             },
             "",
         );
         t.poll_once_assert_pending().await;
-        assert_eq!(t.take_sent(), Vec::<UtpMessage>::new());
+        t.assert_sent_empty();
         assert_eq!(t.vsock.state, VirtualSocketState::FinWait2);
 
         // Nothing should happen as our FIN was acked.
         t.env.increment_now(Duration::from_secs(1));
         t.poll_once_assert_pending().await;
-        assert_eq!(t.take_sent(), Vec::<UtpMessage>::new());
+        t.assert_sent_empty();
     }
 
     #[tokio::test]
@@ -3785,24 +3868,20 @@ mod tests {
         // At first nothing should happen past timeout
         t.env.increment_now(Duration::from_secs(1));
         t.poll_once_assert_pending().await;
-        assert_eq!(
-            t.take_sent(),
-            Vec::<UtpMessage>::new(),
-            "nothing should happen"
-        );
+        t.assert_sent_empty_msg("nothing should happen");
 
         let (mut read, write) = t.stream.take().unwrap().split();
         drop(write);
 
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "we should send a FIN");
-        assert_eq!(sent[0].header.htype, Type::ST_FIN);
-        let fin_seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_FIN, seq_nr = 101, ack_nr = 0)],
+        );
         assert_eq!(
             t.vsock.state,
             VirtualSocketState::FinWait1 {
-                our_fin: fin_seq_nr
+                our_fin: 101.into()
             }
         );
 
@@ -3842,17 +3921,18 @@ mod tests {
 
         // Next poll should send FIN
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "Should send FIN after both halves dropped");
-        assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
-        let our_fin_seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_FIN, seq_nr = 101, ack_nr = 0)],
+            "Should send FIN after both halves dropped"
+        );
 
         // Remote acknowledges our FIN
         t.send_msg(
             UtpHeader {
                 htype: Type::ST_STATE,
                 seq_nr: 0.into(),
-                ack_nr: our_fin_seq_nr,
+                ack_nr: 101.into(),
                 wnd_size: 1024,
                 ..Default::default()
             },
@@ -3869,7 +3949,7 @@ mod tests {
             UtpHeader {
                 htype: Type::ST_FIN,
                 seq_nr: 1.into(),
-                ack_nr: our_fin_seq_nr,
+                ack_nr: 101.into(),
                 wnd_size: 1024,
                 ..Default::default()
             },
@@ -3878,10 +3958,11 @@ mod tests {
 
         // Should send ACK for remote's FIN and complete
         let result = t.poll_once().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "Should send ACK for remote FIN");
-        assert_eq!(sent[0].header.get_type(), Type::ST_STATE);
-        assert_eq!(sent[0].header.ack_nr.0, 1, "Should ACK remote FIN");
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_STATE, seq_nr = 101, ack_nr = 1)],
+            "Should ACK remote FIN"
+        );
         assert!(
             matches!(result, Poll::Ready(Ok(()))),
             "Connection should complete after handling remote FIN"
@@ -3901,9 +3982,11 @@ mod tests {
 
         // Next poll should send FIN and wait for reply.
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1, "Should send FIN after both halves dropped");
-        assert_eq!(sent[0].header.get_type(), Type::ST_FIN);
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_FIN, seq_nr = 101, ack_nr = 0)],
+            "Should send FIN after both halves dropped"
+        );
 
         // Wait a long time, we should die
         t.env.increment_now(Duration::from_millis(3000));
