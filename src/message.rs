@@ -15,12 +15,21 @@ impl std::fmt::Debug for UtpMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{:?}:seq_nr={}:ack_nr={}:payload={}",
+            "{:?}:seq_nr={}:ack_nr={}:wnd_size={}",
             self.header.get_type(),
             self.header.seq_nr,
             self.header.ack_nr,
-            self.payload().len()
-        )
+            self.header.wnd_size,
+        )?;
+        if cfg!(test) {
+            write!(
+                f,
+                ":payload={:?}",
+                std::str::from_utf8(self.payload()).unwrap()
+            )
+        } else {
+            write!(f, ":payload_len={}", self.payload().len())
+        }
     }
 }
 

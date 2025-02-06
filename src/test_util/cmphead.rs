@@ -6,7 +6,7 @@ use crate::{
 
 #[derive(Default)]
 pub struct CmpUtpHeader {
-    pub htype: Option<Type>,
+    pub htype: Type,
     pub wnd_size: Option<u32>,
     pub seq_nr: Option<SeqNr>,
     pub ack_nr: Option<SeqNr>,
@@ -18,11 +18,13 @@ impl std::fmt::Debug for CmpUtpHeader {
         macro_rules! w {
             ($name:ident) => {
                 if let Some(v) = self.$name.as_ref() {
-                    write!(f, "{}={:?};", stringify!($name), v)?;
+                    write!(f, ":{}={:?}", stringify!($name), v)?;
+                } else {
+                    write!(f, ":{}=***", stringify!($name))?;
                 }
             };
         }
-        w!(htype);
+        write!(f, "{:?}", self.htype)?;
         w!(seq_nr);
         w!(ack_nr);
         w!(wnd_size);
@@ -42,7 +44,9 @@ impl PartialEq<CmpUtpHeader> for UtpHeader {
                 }
             };
         }
-        cmp!(htype);
+        if self.htype != other.htype {
+            return false;
+        }
         cmp!(wnd_size);
         cmp!(seq_nr);
         cmp!(ack_nr);

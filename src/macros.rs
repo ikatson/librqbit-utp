@@ -48,7 +48,6 @@ macro_rules! warn_every_ms {
     };
 }
 
-// obj, calc, maybe_change, callback
 macro_rules! log_every_ms_if_changed {
     ($dur:expr, $level:expr, $name:expr, $obj:expr, $calc:expr, $maybe_change:expr) => {
         crate::utils::run_before_and_after_if_changed($obj, $calc, $maybe_change, |_, before, after| {
@@ -57,20 +56,13 @@ macro_rules! log_every_ms_if_changed {
     };
 }
 
+// Create a mock header that can be used to compare with others
 #[cfg(test)]
 macro_rules! cmphead {
-    // Base case - single field
-    ($name:ident=$value:expr) => {
-        crate::test_util::cmphead::CmpUtpHeader {
-            $name: Some($value.into()),
-            ..Default::default()
-        }
-    };
-
     // Recursive case - multiple fields
-    ($name:ident=$value:expr, $($rest_name:ident=$rest_value:expr),+) => {
+    ($htype:expr, $($rest_name:ident=$rest_value:expr),+) => {
         crate::test_util::cmphead::CmpUtpHeader {
-            $name: Some($value.into()),
+            htype: $htype,
             $($rest_name: Some($rest_value.into())),+,
             ..Default::default()
         }
