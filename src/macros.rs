@@ -58,6 +58,26 @@ macro_rules! log_every_ms_if_changed {
 }
 
 #[cfg(test)]
+macro_rules! cmphead {
+    // Base case - single field
+    ($name:ident=$value:expr) => {
+        crate::test_util::cmphead::CmpUtpHeader {
+            $name: Some($value.into()),
+            ..Default::default()
+        }
+    };
+
+    // Recursive case - multiple fields
+    ($name:ident=$value:expr, $($rest_name:ident=$rest_value:expr),+) => {
+        crate::test_util::cmphead::CmpUtpHeader {
+            $name: Some($value.into()),
+            $($rest_name: Some($rest_value.into())),+,
+            ..Default::default()
+        }
+    };
+}
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 

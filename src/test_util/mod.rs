@@ -5,6 +5,7 @@ use transport::MockUtpTransport;
 
 use crate::{socket::Dispatcher, UtpSocket, UtpStream};
 
+pub mod cmphead;
 pub mod env;
 pub mod transport;
 
