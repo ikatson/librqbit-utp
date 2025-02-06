@@ -3998,4 +3998,65 @@ mod tests {
             other => panic!("Expected inactivity error, got: {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn test_fin_retransmission() {
+        setup_test_logging();
+        let mut t = make_test_vsock(Default::default(), false);
+
+        // Set a specific retransmission timeout for predictable testing
+        let retransmit_timeout = Duration::from_millis(100);
+        t.vsock.rtte.force_timeout(retransmit_timeout);
+
+        // Drop writer immediately to trigger FIN
+        let (_reader, writer) = t.stream.take().unwrap().split();
+        drop(writer);
+
+        // Should send initial FIN
+        t.poll_once_assert_pending().await;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_FIN, seq_nr = 101, ack_nr = 0)],
+            "Should send initial FIN"
+        );
+
+        // Wait for first retransmission timeout
+        t.env.increment_now(retransmit_timeout);
+        t.poll_once_assert_pending().await;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_FIN, seq_nr = 101, ack_nr = 0)],
+            "Should retransmit FIN after timeout"
+        );
+
+        // Wait for second retransmission timeout
+        t.env.increment_now(retransmit_timeout);
+        t.poll_once_assert_pending().await;
+        assert_eq!(
+            t.take_sent(),
+            vec![cmphead!(htype = Type::ST_FIN, seq_nr = 101, ack_nr = 0)],
+            "Should retransmit FIN after second timeout"
+        );
+
+        // Now ACK the FIN
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: 101.into(),
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+
+        // Wait another timeout period - should not retransmit anymore
+        t.env.increment_now(retransmit_timeout);
+        t.poll_once_assert_pending().await;
+        t.assert_sent_empty_msg("Should not retransmit FIN after it was ACKed");
+
+        // Connection should stay alive waiting for remote FIN
+        assert_eq!(t.vsock.state, VirtualSocketState::FinWait2);
+    }
 }
