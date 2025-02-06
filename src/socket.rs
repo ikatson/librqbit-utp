@@ -7,7 +7,7 @@ use std::{
         Arc,
     },
     task::Poll,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use rustc_hash::FxHashMap as HashMap;
@@ -18,7 +18,8 @@ use crate::{
     constants::{
         DEFAULT_CONSERVATIVE_OUTGOING_MTU, DEFAULT_INCOMING_MTU, DEFAULT_MAX_OUT_OF_ORDER_PACKETS,
         DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK, DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK,
-        DEFAULT_MTU_AUTODETECT_IP, IPV4_HEADER, MIN_UDP_HEADER, UTP_HEADER_SIZE,
+        DEFAULT_MTU_AUTODETECT_IP, DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IPV4_HEADER, MIN_UDP_HEADER,
+        UTP_HEADER_SIZE,
     },
     message::UtpMessage,
     raw::{Type, UtpHeader},
@@ -97,6 +98,8 @@ pub struct SocketOpts {
     pub cancellation_token: CancellationToken,
 
     pub max_segment_retransmissions: Option<NonZeroUsize>,
+
+    pub remote_inactivity_timeout: Option<Duration>,
 }
 
 impl SocketOpts {
@@ -180,6 +183,9 @@ impl SocketOpts {
             max_segment_retransmissions: self
                 .max_segment_retransmissions
                 .unwrap_or(NonZeroUsize::new(5).unwrap()),
+            remote_inactivity_timeout: self
+                .remote_inactivity_timeout
+                .unwrap_or(DEFAULT_REMOTE_INACTIVITY_TIMEOUT),
         })
     }
 }
@@ -196,6 +202,8 @@ pub(crate) struct ValidatedSocketOpts {
     pub nagle: bool,
     pub congestion: CongestionConfig,
     pub max_segment_retransmissions: NonZeroUsize,
+
+    pub remote_inactivity_timeout: Duration,
 }
 
 pub(crate) struct RequestWithSpan<V> {

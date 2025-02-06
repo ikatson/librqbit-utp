@@ -404,6 +404,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.last_sent_window = header.wnd_size;
         self.consumed_but_unacked_bytes = 0;
         self.timers.reset_delayed_ack_timer();
+        if matches!(header.get_type(), Type::ST_DATA) {
+            self.timers.remote_inactivity_timer =
+                Some(self.this_poll.now + self.socket_opts.remote_inactivity_timeout);
+        }
     }
 
     fn send_control_packet(
@@ -480,6 +484,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.rtte.retransmission_timeout(),
                 false,
             );
+            self.timers.remote_inactivity_timer =
+                Some(self.this_poll.now + self.socket_opts.remote_inactivity_timeout);
             self.last_sent_seq_nr = seq_nr;
         }
         Ok(())
@@ -649,6 +655,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
 
                 if g.is_empty() {
+                    self.timers.remote_inactivity_timer = None;
                     if let Some(w) = g.buffer_flushed.take() {
                         w.wake();
                     }
@@ -733,6 +740,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
 
                 trace!("state: syn-ack-sent -> established");
+                self.timers.remote_inactivity_timer = None;
                 self.state = Established;
             }
             (SynAckSent { .. }, ST_FIN) => {
@@ -773,11 +781,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             (FinWait1 { our_fin }, ST_DATA | ST_STATE) if hdr.ack_nr == our_fin => {
                 trace!("state: fin-wait-1 -> fin-wait-2");
+                self.timers.remote_inactivity_timer = None;
                 self.state = FinWait2;
             }
             (FinWait1 { .. }, ST_DATA | ST_STATE) => {}
             (FinWait2, Type::ST_FIN) => {
                 trace!("state: fin-wait-2 -> closed");
+                self.timers.remote_inactivity_timer = None;
                 self.state = Closed;
             }
             (FinWait2, ST_DATA | ST_STATE) => {}
@@ -792,6 +802,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             (Closing { our_fin, .. } | LastAck { our_fin, .. }, _) if hdr.ack_nr == our_fin => {
                 trace!("state: closing -> closed");
+                self.timers.remote_inactivity_timer = None;
                 self.state = Closed;
             }
 
@@ -998,11 +1009,17 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         };
 
+        let inactivity_poll = self
+            .timers
+            .remote_inactivity_timer
+            .map_or(PollAt::Ingress, PollAt::Time);
+
         // We wait for the earliest of our timers to fire.
         self.timers
             .retransmit
             .poll_at(self.this_poll.now)
             .min(delayed_ack_poll_at)
+            .min(inactivity_poll)
     }
 
     fn user_rx_is_closed(&self) -> bool {
@@ -1093,6 +1110,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             // Read incoming stream.
             pending_if_cannot_send!(self.process_all_incoming_messages(cx, socket));
+
+            if self
+                .timers
+                .remote_inactivity_timer
+                .is_some_and(|expires| expires <= self.this_poll.now)
+            {
+                let err = anyhow::anyhow!("remote was inactive for too long");
+                self.just_before_death(cx, Some(&err));
+                return Poll::Ready(Err(err));
+            }
 
             self.maybe_prepare_for_retransmission();
 
@@ -1299,6 +1326,11 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 retransmit: RetransmitTimer::new(),
                 sleep: Box::pin(tokio::time::sleep(Duration::from_secs(0))),
                 ack_delay_timer: AckDelayTimer::Idle,
+                remote_inactivity_timer: if rtt.is_some() {
+                    None
+                } else {
+                    Some(now + socket.opts().remote_inactivity_timeout)
+                },
             },
             last_remote_timestamp,
             last_remote_window: remote_window,
@@ -1371,6 +1403,7 @@ enum RetransmitTimer {
 
 struct Timers {
     sleep: Pin<Box<Sleep>>,
+    remote_inactivity_timer: Option<Instant>,
     retransmit: RetransmitTimer,
     ack_delay_timer: AckDelayTimer,
 }
@@ -3506,6 +3539,245 @@ mod tests {
         assert!(
             sent[0].header.wnd_size > 0,
             "Window size should be non-zero after reading"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inactivity_timeout() {
+        setup_test_logging();
+
+        // Set up socket with a short inactivity timeout
+        let opts = SocketOpts {
+            remote_inactivity_timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let mut t = make_test_vsock(opts, false);
+
+        // Send initial data to start the inactivity timer
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(b"hello")
+            .await
+            .unwrap();
+        t.poll_once_assert_pending().await;
+
+        // Initial data should be sent
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
+        assert_eq!(sent[0].payload(), b"hello");
+        let seq_nr = sent[0].header.seq_nr;
+
+        // Wait just under timeout - connection should still be alive, but we
+        // should get a retransmission.
+        t.env.increment_now(Duration::from_millis(900));
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].header.htype,
+            Type::ST_DATA,
+            "Expected a retransmission"
+        );
+
+        // Remote sends ACK - should reset inactivity timer
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                seq_nr: 0.into(),
+                ack_nr: seq_nr,
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent(), vec![]);
+
+        // Wait just under timeout again - connection should still be alive
+        t.env.increment_now(Duration::from_millis(900));
+        t.poll_once_assert_pending().await;
+        assert_eq!(
+            t.take_sent().len(),
+            0,
+            "Should not send anything before timeout"
+        );
+
+        // Wait past timeout - connection should not error out as TX is empty.
+        t.env.increment_now(Duration::from_millis(200));
+        t.poll_once_assert_pending().await;
+        assert_eq!(
+            t.take_sent().len(),
+            0,
+            "Should not send anything before timeout"
+        );
+
+        // Write more data
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(b"world")
+            .await
+            .unwrap();
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.get_type(), Type::ST_DATA);
+        assert_eq!(sent[0].payload(), b"world");
+
+        // Wait past timeout - connection should error out as nothing received.
+        t.env.increment_now(Duration::from_secs(1));
+        let result = t.poll_once().await;
+        // Should get inactivity timeout error
+        match result {
+            Poll::Ready(Err(e)) => {
+                assert!(
+                    e.to_string().contains("inactive"),
+                    "Error should mention inactivity: {e}"
+                );
+            }
+            other => panic!("Expected inactivity error, got: {other:?}"),
+        }
+
+        // Try to read - should get error
+        let mut buf = [0u8; 1024];
+        let read_result = t.stream.as_mut().unwrap().read(&mut buf).await;
+        assert!(
+            read_result.is_err(),
+            "Read should fail after inactivity timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inactivity_timeout_initial_synack() {
+        // Set up socket with a short inactivity timeout
+        let opts = SocketOpts {
+            remote_inactivity_timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let mut t = make_test_vsock(opts, true);
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "Should send syn-ack");
+
+        // Wait past timeout.
+        t.env.increment_now(Duration::from_secs(1));
+        let result = t.poll_once().await;
+        // Should get inactivity timeout error
+        match result {
+            Poll::Ready(Err(e)) => {
+                assert!(
+                    e.to_string().contains("inactive"),
+                    "Error should mention inactivity: {e}"
+                );
+            }
+            other => panic!("Expected inactivity error, got: {other:?}"),
+        }
+
+        // Try to read - should get error
+        let mut buf = [0u8; 1024];
+        let read_result = t.stream.as_mut().unwrap().read(&mut buf).await;
+        assert!(
+            read_result.is_err(),
+            "Read should fail after inactivity timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_inactivity_timeout_our_fin_acked() {
+        let opts = SocketOpts {
+            remote_inactivity_timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let mut t = make_test_vsock(opts, false);
+
+        // At first nothing should happen past timeout
+        t.env.increment_now(Duration::from_secs(1));
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent(), vec![], "nothing should happen");
+
+        let (_read, write) = t.stream.take().unwrap().split();
+        drop(write);
+
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "we should send a FIN");
+        assert_eq!(sent[0].header.htype, Type::ST_FIN);
+        let fin_seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            t.vsock.state,
+            VirtualSocketState::FinWait1 {
+                our_fin: fin_seq_nr
+            }
+        );
+
+        t.send_msg(
+            UtpHeader {
+                htype: Type::ST_STATE,
+                ack_nr: fin_seq_nr,
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent(), vec![]);
+        assert_eq!(t.vsock.state, VirtualSocketState::FinWait2);
+
+        // Nothing should happen as our FIN was acked.
+        t.env.increment_now(Duration::from_secs(1));
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent(), vec![]);
+    }
+
+    #[tokio::test]
+    async fn test_inactivity_timeout_our_fin_unacked() {
+        let opts = SocketOpts {
+            remote_inactivity_timeout: Some(Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let mut t = make_test_vsock(opts, false);
+
+        // At first nothing should happen past timeout
+        t.env.increment_now(Duration::from_secs(1));
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.take_sent(), vec![], "nothing should happen");
+
+        let (mut read, write) = t.stream.take().unwrap().split();
+        drop(write);
+
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "we should send a FIN");
+        assert_eq!(sent[0].header.htype, Type::ST_FIN);
+        let fin_seq_nr = sent[0].header.seq_nr;
+        assert_eq!(
+            t.vsock.state,
+            VirtualSocketState::FinWait1 {
+                our_fin: fin_seq_nr
+            }
+        );
+
+        // Connection should die as our FIN was not ACKed for too long.
+        t.env.increment_now(Duration::from_secs(1));
+        let result = t.poll_once().await;
+        // Should get inactivity timeout error
+        match result {
+            Poll::Ready(Err(e)) => {
+                assert!(
+                    e.to_string().contains("inactive"),
+                    "Error should mention inactivity: {e}"
+                );
+            }
+            other => panic!("Expected inactivity error, got: {other:?}"),
+        }
+
+        // Try to read - should get error
+        let mut buf = [0u8; 1024];
+        let read_result = read.read(&mut buf).await;
+        assert!(
+            read_result.is_err(),
+            "Read should fail after inactivity timeout"
         );
     }
 }
