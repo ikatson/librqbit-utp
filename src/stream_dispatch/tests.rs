@@ -99,14 +99,37 @@ impl TestVsock {
             }
         };
     }
+
+    async fn poll_once_assert_finished(&mut self) -> anyhow::Result<()> {
+        let res = self.poll_once().await;
+        match res {
+            Poll::Pending => {
+                panic!("expected poll to not return pending")
+            }
+            Poll::Ready(res) => res,
+        }
+    }
 }
 
-fn make_test_vsock(opts: SocketOpts, is_incoming: bool) -> TestVsock {
+fn make_test_vsock_args(opts: SocketOpts, args: StreamArgs, env: MockUtpEnvironment) -> TestVsock {
     let transport = RememberingTransport::new(ADDR_1);
-    let env = MockUtpEnvironment::new();
     let socket = UtpSocket::new_with_opts(transport.clone(), env.clone(), opts).unwrap();
     let (tx, rx) = unbounded_channel();
 
+    let UtpStreamStarter { stream, vsock, .. } = UtpStreamStarter::new(&socket, ADDR_2, rx, args);
+
+    TestVsock {
+        transport,
+        env,
+        _socket: socket,
+        vsock,
+        stream: Some(stream),
+        tx,
+    }
+}
+
+fn make_test_vsock(opts: SocketOpts, is_incoming: bool) -> TestVsock {
+    let env = MockUtpEnvironment::new();
     let args = if is_incoming {
         let remote_syn = UtpHeader {
             htype: ST_SYN,
@@ -123,17 +146,7 @@ fn make_test_vsock(opts: SocketOpts, is_incoming: bool) -> TestVsock {
         };
         StreamArgs::new_outgoing(&remote_ack, env.now(), env.now())
     };
-
-    let UtpStreamStarter { stream, vsock, .. } = UtpStreamStarter::new(&socket, ADDR_2, rx, args);
-
-    TestVsock {
-        transport,
-        env,
-        _socket: socket,
-        vsock,
-        stream: Some(stream),
-        tx,
-    }
+    make_test_vsock_args(opts, args, env)
 }
 
 #[tokio::test]
@@ -2446,4 +2459,117 @@ async fn test_fin_retransmission() {
 
     // Connection should stay alive waiting for remote FIN
     assert_eq!(t.vsock.state, VirtualSocketState::FinWait2);
+}
+
+#[tokio::test]
+async fn test_read_gets_eof_on_fin_real_world_packets() {
+    setup_test_logging();
+
+    let env = MockUtpEnvironment::new();
+    let mut t = make_test_vsock_args(
+        SocketOpts::default(),
+        StreamArgs::new_outgoing(
+            &UtpHeader {
+                htype: ST_STATE,
+                connection_id: 1.into(),
+                seq_nr: 43658.into(),
+                ack_nr: 39078.into(),
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            env.now(),
+            env.now(),
+        ),
+        env,
+    );
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+    assert_eq!(t.vsock.state, VirtualSocketState::Established);
+
+    let (mut read, mut write) = t.stream.take().unwrap().split();
+
+    write.write_all(b"hello").await.unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(
+            ST_DATA,
+            seq_nr = 39079,
+            ack_nr = 43657,
+            payload = "hello"
+        )]
+    );
+
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            seq_nr: 43658.into(),
+            ack_nr: 39079.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.send_msg(
+        UtpHeader {
+            htype: ST_FIN,
+            seq_nr: 43658.into(),
+            ack_nr: 39079.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_STATE, seq_nr = 39079, ack_nr = 43658)],
+        "we should ACK the FIN"
+    );
+    assert_eq!(
+        t.vsock.state,
+        VirtualSocketState::CloseWait {
+            remote_fin: 43658.into()
+        }
+    );
+
+    assert_eq!(
+        read.read(&mut [0u8; 1024]).await.unwrap(),
+        0,
+        "we should get EOF"
+    );
+
+    // 6 seconds is how long it passed in the real world.
+    t.env.increment_now(Duration::from_secs(6));
+    drop(write);
+
+    // Ensure we send FIN on writer drop
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_FIN, seq_nr = 39080, ack_nr = 43658)],
+        "we should send FIN"
+    );
+    assert_eq!(
+        t.vsock.state,
+        VirtualSocketState::LastAck {
+            our_fin: 39080.into(),
+            remote_fin: 43658.into()
+        }
+    );
+
+    // Remote ACKs our FIN
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            seq_nr: 43658.into(),
+            ack_nr: 39080.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_finished().await.unwrap();
+    t.assert_sent_empty();
+    assert_eq!(t.vsock.state, VirtualSocketState::Closed);
 }

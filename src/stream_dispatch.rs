@@ -780,6 +780,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
             (Established, ST_FIN) => {
                 trace!("state: established -> close-wait");
+                is_first_remote_fin = true;
                 self.state = CloseWait {
                     remote_fin: hdr.seq_nr,
                 };
