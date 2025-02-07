@@ -285,6 +285,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             if recv_wnd < item.payload_size() {
+                METRICS.send_window_exhausted.increment(1);
                 debug!("remote recv window exhausted, not sending anything");
                 break;
             }
@@ -296,7 +297,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .serialize_with_payload(&mut self.this_poll.tmp_buf, |b| {
                     let offset = item.payload_offset();
                     let len = item.payload_size();
-                    // TODO: use rwlock
                     let g = self.user_tx.locked.lock();
                     g.fill_buffer_from_ring_buffer(b, offset, len)
                         .context("error filling output buffer from user_tx")?;
