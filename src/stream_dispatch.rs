@@ -18,7 +18,8 @@ use tracing::{debug, error_span, trace, warn, Level};
 use crate::{
     congestion::CongestionController,
     constants::{
-        ACK_DELAY, CONGESTION_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL, SYNACK_RESEND_INTERNAL,
+        ACK_DELAY, CONGESTION_TRACING_LOG_LEVEL, IMMEDIATE_ACK_EVERY_RMSS, RTTE_TRACING_LOG_LEVEL,
+        SYNACK_RESEND_INTERNAL,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -993,11 +994,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn immediate_ack_to_transmit(&self) -> bool {
         self.should_send_window_update()
             || self.consumed_but_unacked_bytes
-                >= 2 * self.socket_opts.max_incoming_payload_size.get()
+                >= IMMEDIATE_ACK_EVERY_RMSS * self.socket_opts.max_incoming_payload_size.get()
     }
 
     fn force_immedate_ack(&mut self) {
-        self.consumed_but_unacked_bytes = 2 * self.socket_opts.max_incoming_payload_size.get();
+        self.consumed_but_unacked_bytes =
+            IMMEDIATE_ACK_EVERY_RMSS * self.socket_opts.max_incoming_payload_size.get();
     }
 
     fn ack_to_transmit(&self) -> bool {
