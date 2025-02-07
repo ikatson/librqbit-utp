@@ -1300,11 +1300,8 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             cancellation_token,
         } = self;
 
-        let span = match vsock.parent_span.clone() {
-            Some(s) => error_span!(parent: s, "utp_stream", conn_id_send = ?vsock.conn_id_send),
-            None => error_span!(parent: None, "utp_stream", conn_id_send = ?vsock.conn_id_send),
-        };
-
+        let parent = vsock.parent_span.as_ref().and_then(|s| s.id());
+        let span = error_span!(parent: parent, "utp_stream", remote=?vsock.remote);
         spawn_with_cancel(span, cancellation_token, vsock.run_forever());
         stream
     }
