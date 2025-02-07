@@ -91,14 +91,14 @@ impl SegmentIterItem<'_> {
                 SentStatus::SentTime(now)
             }
             SentStatus::SentTime(_) => {
-                METRICS.retransmissions.increment(1);
+                METRICS.data_retransmissions.increment(1);
                 METRICS
                     .retransmitted_bytes
                     .increment(self.payload_size() as u64);
                 SentStatus::Retransmitted { count: 1 }
             }
             SentStatus::Retransmitted { count } => {
-                METRICS.retransmissions.increment(1);
+                METRICS.data_retransmissions.increment(1);
                 METRICS
                     .retransmitted_bytes
                     .increment(self.payload_size() as u64);

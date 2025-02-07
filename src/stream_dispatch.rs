@@ -1090,6 +1090,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 expires_at: self.this_poll.now + SYNACK_RESEND_INTERNAL,
                 count: count + 1,
             };
+
+            if count > 0 {
+                METRICS.synack_retransmissions.increment(1);
+            }
+
             // restore last_sent_seq_nr
             self.last_sent_seq_nr = last_sent_seq_nr;
             self.timers.arm_in(cx, SYNACK_RESEND_INTERNAL);

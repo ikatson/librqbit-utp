@@ -16,7 +16,8 @@ pub struct Metrics {
     pub delayed_acks: Counter,
     pub live_virtual_sockets: Gauge,
     pub out_of_order_packets: Counter,
-    pub retransmissions: Counter,
+    pub data_retransmissions: Counter,
+    pub synack_retransmissions: Counter,
     pub retransmitted_bytes: Counter,
     pub rtt: Histogram,
     pub send_count: Counter,
@@ -42,7 +43,7 @@ impl Metrics {
             duplicate_acks_received: counter!("utp_duplicate_acks_received"),
             live_virtual_sockets: gauge!("utp_live_virtual_sockets"),
             out_of_order_packets: counter!("utp_out_of_order_packets"),
-            retransmissions: counter!("utp_retransmissions"),
+            data_retransmissions: counter!("utp_retransmissions"),
             retransmitted_bytes: counter!("utp_retransmisted_bytes"),
             rtt: histogram!("utp_rtt"),
             send_count: counter!("utp_send_count"),
@@ -55,6 +56,7 @@ impl Metrics {
             immediate_acks: counter!("utp_immediate_acks"),
             delayed_acks: counter!("utp_delayed_acks"),
             inactivity_timeouts: counter!("utp_inactivity_timeouts"),
+            synack_retransmissions: counter!("utp_synack_retransmissions"),
         }
     }
 }
