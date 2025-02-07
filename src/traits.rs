@@ -7,6 +7,8 @@ use std::{
 
 use tokio::net::UdpSocket;
 
+use crate::metrics::METRICS;
+
 pub trait Transport: Send + Sync + Unpin + 'static {
     fn recv_from<'a>(
         &'a self,
@@ -52,7 +54,11 @@ impl Transport for UdpSocket {
         buf: &[u8],
         target: SocketAddr,
     ) -> Poll<std::io::Result<usize>> {
-        UdpSocket::poll_send_to(self, cx, buf, target)
+        let res = UdpSocket::poll_send_to(self, cx, buf, target);
+        if res.is_pending() {
+            METRICS.send_poll_pending.increment(1);
+        }
+        res
     }
 
     fn bind_addr(&self) -> SocketAddr {

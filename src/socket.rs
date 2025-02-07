@@ -23,6 +23,7 @@ use crate::{
         UTP_HEADER_SIZE,
     },
     message::UtpMessage,
+    metrics::METRICS,
     raw::{Type, UtpHeader},
     seq_nr::SeqNr,
     stream_dispatch::{StreamArgs, UtpStreamStarter},
@@ -837,6 +838,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
                 }
             }
             Poll::Ready(Err(e)) => {
+                METRICS.send_errors.increment(1);
                 bail!(
                     "error sending to UDP socket addr={}, len={}: {e:#}",
                     addr,
@@ -844,6 +846,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
                 );
             }
             Poll::Pending => {
+                METRICS.send_poll_pending.increment(1);
                 debug_every_ms!(500, "UDP socket full, could not send packet");
                 return Ok(true);
             }

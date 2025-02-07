@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use librqbit_utp::{CongestionConfig, SocketOpts, UtpSocket, UtpStreamUdp};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
@@ -58,8 +59,11 @@ async fn main() -> anyhow::Result<()> {
     }
     let _ = tracing_subscriber::fmt::try_init();
 
-    let client_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 8001).into();
-    let server_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 8002).into();
+    let sender_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 8001).into();
+    let sender_prometheus_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 9001).into();
+
+    let receiver_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 8002).into();
+    let receiver_prometheus_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 9002).into();
 
     let opts = SocketOpts {
         // mtu: Some(8192),
@@ -71,12 +75,15 @@ async fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
+    const SENDER: &str = "sender";
+    const RECEIVER: &str = "receiver";
+
     // Check command line arguments
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         // If no arguments, spawn both client and server processes
         let server_child = std::process::Command::new(&args[0])
-            .arg("server")
+            .arg(RECEIVER)
             .spawn()
             .context("Failed to spawn server process")?;
 
@@ -84,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let client_child = std::process::Command::new(&args[0])
-            .arg("client")
+            .arg(SENDER)
             .spawn()
             .context("Failed to spawn client process")?;
 
@@ -95,18 +102,29 @@ async fn main() -> anyhow::Result<()> {
         Ok(())
     } else {
         match args[1].as_str() {
-            "server" => {
-                let listener = UtpSocket::new_udp_with_opts(server_addr, opts)
+            RECEIVER => {
+                let builder = PrometheusBuilder::new().with_http_listener(receiver_prometheus_addr);
+                builder
+                    .install()
+                    .expect("failed to install recorder/exporter");
+                let listener = UtpSocket::new_udp_with_opts(receiver_addr, opts)
                     .await
                     .context("error creating socket")?;
-                let sock = listener.accept().await.context("error accepting")?;
+                let sock = timeout(TIMEOUT, listener.accept())
+                    .await
+                    .context("timeout accepting")?
+                    .context("error accepting")?;
                 receiver(sock).await.context("error running receiver")
             }
-            "client" => {
-                let client = UtpSocket::new_udp_with_opts(client_addr, opts)
+            SENDER => {
+                let builder = PrometheusBuilder::new().with_http_listener(sender_prometheus_addr);
+                builder
+                    .install()
+                    .expect("failed to install recorder/exporter");
+                let client = UtpSocket::new_udp_with_opts(sender_addr, opts)
                     .await
                     .context("error creating socket")?;
-                let sock = timeout(TIMEOUT, client.connect(server_addr))
+                let sock = timeout(TIMEOUT, client.connect(receiver_addr))
                     .await
                     .context("timeout connecting")?
                     .context("error connecting")?;

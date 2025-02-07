@@ -42,6 +42,7 @@ mod macros;
 mod congestion;
 mod constants;
 mod message;
+mod metrics;
 pub mod raw;
 mod rtte;
 mod seq_nr;

@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{raw::UtpHeader, seq_nr::SeqNr};
+use crate::{metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
 
 #[derive(Clone, Copy)]
 enum SentStatus {
@@ -85,9 +85,25 @@ impl SegmentIterItem<'_> {
 
     pub fn on_sent(&mut self, now: Instant) {
         self.segment.sent = match self.segment.sent {
-            SentStatus::NotSent => SentStatus::SentTime(now),
-            SentStatus::SentTime(_) => SentStatus::Retransmitted { count: 1 },
-            SentStatus::Retransmitted { count } => SentStatus::Retransmitted { count: count + 1 },
+            SentStatus::NotSent => {
+                METRICS.send_count.increment(1);
+                METRICS.sent_bytes.increment(self.payload_size() as u64);
+                SentStatus::SentTime(now)
+            }
+            SentStatus::SentTime(_) => {
+                METRICS.retransmissions.increment(1);
+                METRICS
+                    .retransmitted_bytes
+                    .increment(self.payload_size() as u64);
+                SentStatus::Retransmitted { count: 1 }
+            }
+            SentStatus::Retransmitted { count } => {
+                METRICS.retransmissions.increment(1);
+                METRICS
+                    .retransmitted_bytes
+                    .increment(self.payload_size() as u64);
+                SentStatus::Retransmitted { count: count + 1 }
+            }
         };
     }
 }

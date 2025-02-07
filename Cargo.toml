@@ -15,11 +15,14 @@ futures = "*"
 rustc-hash = "2.1.0"
 tokio-util = "0.7.13"
 ringbuf = "0.4.7"
+metrics = "0.24.1"
+lazy_static = "1.5.0"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = "*"
 futures = "*"
+metrics-exporter-prometheus = "0.16.2"
 
 [profile.release]
 panic = "abort"

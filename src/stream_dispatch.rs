@@ -21,6 +21,7 @@ use crate::{
         ACK_DELAY, CONGESTION_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL, SYNACK_RESEND_INTERNAL,
     },
     message::UtpMessage,
+    metrics::METRICS,
     raw::{Type, UtpHeader},
     rtte::RttEstimator,
     seq_nr::SeqNr,
@@ -445,7 +446,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let sent = !self.this_poll.transport_pending;
 
         if sent {
+            METRICS.sent_control_packets.increment(1);
             self.on_packet_sent(&header);
+        } else {
+            METRICS.unsent_control_packets.increment(1);
         }
 
         Ok(sent)
