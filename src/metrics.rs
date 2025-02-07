@@ -8,7 +8,12 @@ pub struct Metrics {
     pub connection_attempts: Counter,
     pub connection_failures: Counter,
     pub connection_successes: Counter,
+    pub consumed_bytes: Counter,
+    pub consumed_data_seq_nrs: Counter,
     pub duplicate_acks_received: Counter,
+    pub inactivity_timeouts: Counter,
+    pub immediate_acks: Counter,
+    pub delayed_acks: Counter,
     pub live_virtual_sockets: Gauge,
     pub out_of_order_packets: Counter,
     pub retransmissions: Counter,
@@ -32,6 +37,8 @@ impl Metrics {
             connection_attempts: counter!("utp_connection_attempts"),
             connection_failures: counter!("utp_connection_failures"),
             connection_successes: counter!("utp_connection_successes"),
+            consumed_bytes: counter!("utp_consumed_bytes"),
+            consumed_data_seq_nrs: counter!("utp_consumed_data_seq_nrs"),
             duplicate_acks_received: counter!("utp_duplicate_acks_received"),
             live_virtual_sockets: gauge!("utp_live_virtual_sockets"),
             out_of_order_packets: counter!("utp_out_of_order_packets"),
@@ -45,6 +52,9 @@ impl Metrics {
             sent_bytes: counter!("utp_sent_bytes"),
             sent_control_packets: counter!("utp_sent_control_packets"),
             unsent_control_packets: counter!("utp_unsent_control_packets"),
+            immediate_acks: counter!("utp_immediate_acks"),
+            delayed_acks: counter!("utp_delayed_acks"),
+            inactivity_timeouts: counter!("utp_inactivity_timeouts"),
         }
     }
 }

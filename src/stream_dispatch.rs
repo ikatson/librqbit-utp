@@ -349,10 +349,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<bool> {
         if self.immediate_ack_to_transmit() {
+            METRICS.immediate_acks.increment(1);
             return self.send_ack(cx, socket);
         }
         let expired = self.delayed_ack_expired();
         if expired && self.ack_to_transmit() {
+            METRICS.delayed_acks.increment(1);
             trace!("delayed ack expired, sending ACK");
             self.send_ack(cx, socket)
         } else {
@@ -872,6 +874,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     } => {
                         if sequence_numbers > 0 {
                             trace!(sequence_numbers, "consumed messages");
+                            METRICS
+                                .consumed_data_seq_nrs
+                                .increment(sequence_numbers as u64);
+                            METRICS.consumed_bytes.increment(bytes as u64);
                         } else {
                             METRICS.out_of_order_packets.increment(1);
                             trace!("out of order");
@@ -1137,6 +1143,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .remote_inactivity_timer
                 .is_some_and(|expires| expires <= self.this_poll.now)
             {
+                METRICS.inactivity_timeouts.increment(1);
                 let err = anyhow::anyhow!("remote was inactive for too long");
                 self.just_before_death(cx, Some(&err));
                 return Poll::Ready(Err(err));
