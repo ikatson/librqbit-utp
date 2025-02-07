@@ -1,5 +1,5 @@
 use lazy_static::lazy_static;
-use metrics::{counter, Counter};
+use metrics::{counter, gauge, histogram, Counter, Gauge, Histogram};
 
 pub struct Metrics {
     pub send_count: Counter,
@@ -7,9 +7,11 @@ pub struct Metrics {
     pub send_poll_pending: Counter,
     pub send_errors: Counter,
     pub retransmissions: Counter,
+    pub live_virtual_sockets: Gauge,
     pub retransmitted_bytes: Counter,
     pub sent_control_packets: Counter,
     pub unsent_control_packets: Counter,
+    pub rtt: Histogram,
 }
 
 impl Metrics {
@@ -23,6 +25,8 @@ impl Metrics {
             sent_control_packets: counter!("utp_sent_control_packets"),
             unsent_control_packets: counter!("utp_unsent_control_packets"),
             send_errors: counter!("utp_send_errors"),
+            live_virtual_sockets: gauge!("utp_live_virtual_sockets"),
+            rtt: histogram!("utp_rtt"),
         }
     }
 }

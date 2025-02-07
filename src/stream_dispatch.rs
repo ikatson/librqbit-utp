@@ -684,6 +684,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             // Update RTO and congestion controller.
             if let Some(rtt) = on_ack_result.new_rtt {
+                METRICS.rtt.record(rtt.as_secs_f64());
                 log_before_and_after_if_changed(
                     "rtte:sample",
                     self,
@@ -1195,6 +1196,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
 impl<T, E> Drop for VirtualSocket<T, E> {
     fn drop(&mut self) {
+        METRICS.live_virtual_sockets.decrement(1);
         self.user_tx.mark_stream_dead();
         self.user_rx.mark_stream_dead();
     }
@@ -1394,6 +1396,8 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
 
             socket: Arc::downgrade(socket),
         };
+
+        METRICS.live_virtual_sockets.increment(1);
 
         let stream = UtpStream::new(read_half, write_half, vsock.remote);
         UtpStreamStarter {
