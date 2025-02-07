@@ -28,7 +28,7 @@ use crate::{
     seq_nr::SeqNr,
     stream_dispatch::{StreamArgs, UtpStreamStarter},
     traits::{DefaultUtpEnvironment, Transport, UtpEnvironment},
-    utils::DropGuardSendBeforeDeath,
+    utils::{DropGuardSendBeforeDeath, FnDropGuard},
 };
 use crate::{spawn_utils::spawn_with_cancel, UtpStream};
 use anyhow::{bail, Context};
@@ -783,12 +783,19 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     #[tracing::instrument(level = "debug", name="utp_socket:accept", skip(self), fields(local=?self.local_addr))]
     pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream> {
         let (tx, rx) = oneshot::channel();
+
+        METRICS.accepting.increment(1);
+        let _accepting_guard = FnDropGuard::new(|| METRICS.accepting.decrement(1));
+
         self.accept_requests
             .send(RequestWithSpan::new(tx))
             .await
             .context("dispatcher dead")?;
 
         let stream = rx.await.context("dispatcher dead")?;
+
+        METRICS.accepts.increment(1);
+
         let stream = stream.start();
         trace!("accepted");
         Ok(stream)
@@ -798,6 +805,17 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     pub async fn connect(self: &Arc<Self>, remote: SocketAddr) -> anyhow::Result<UtpStream> {
         let (tx, rx) = oneshot::channel();
         let token = NEXT_CONNECT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        METRICS.connection_attempts.increment(1);
+        METRICS.connecting.increment(1);
+
+        let mut fail_guard = FnDropGuard::new(|| {
+            METRICS.connection_failures.increment(1);
+        });
+
+        let _connecting_guard = FnDropGuard::new(|| {
+            METRICS.connecting.decrement(1);
+        });
+
         self.control_requests
             .send(ControlRequest::ConnectRequest(
                 remote,
@@ -806,13 +824,18 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             ))
             .context("dispatcher dead")?;
 
-        let mut guard = DropGuardSendBeforeDeath::new(
+        let mut send_drop_guard = DropGuardSendBeforeDeath::new(
             ControlRequest::ConnectDropped(remote, token),
             &self.control_requests,
         );
 
         let stream_or_err = rx.await.context("dispatcher dead")?;
-        guard.disarm();
+        send_drop_guard.disarm();
+        if stream_or_err.is_ok() {
+            fail_guard.disarm();
+            METRICS.connection_successes.increment(1);
+        }
+
         stream_or_err
     }
 

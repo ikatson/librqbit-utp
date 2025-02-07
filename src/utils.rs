@@ -165,6 +165,28 @@ pub fn log_before_and_after_if_changed<
     result
 }
 
+pub struct FnDropGuard<F: FnOnce()> {
+    f: Option<F>,
+}
+
+impl<F: FnOnce()> FnDropGuard<F> {
+    pub fn new(f: F) -> Self {
+        Self { f: Some(f) }
+    }
+
+    pub fn disarm(&mut self) {
+        self.f = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for FnDropGuard<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.f.take() {
+            f();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::fill_buffer_from_slices;

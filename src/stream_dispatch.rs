@@ -873,6 +873,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         if sequence_numbers > 0 {
                             trace!(sequence_numbers, "consumed messages");
                         } else {
+                            METRICS.out_of_order_packets.increment(1);
                             trace!("out of order");
                         }
 
@@ -921,6 +922,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     {
                         // Increment duplicate ACK count
                         self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
+                        METRICS.duplicate_acks_received.increment(1);
 
                         // Inform congestion controller of duplicate ACK
                         self.congestion_controller
