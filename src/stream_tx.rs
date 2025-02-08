@@ -17,7 +17,7 @@ use crate::utils::{fill_buffer_from_slices, update_optional_waker};
 
 pub struct UserTxLocked {
     // Set when stream dies abruptly for writer to know about it.
-    pub dead: bool,
+    pub mark_vsock_closed: bool,
     // When the writer shuts down, or both reader and writer die, the stream is closed.
     closed: bool,
 
@@ -75,9 +75,8 @@ impl UserTxLocked {
         self.buffer.is_full()
     }
 
-    // This will send FIN (if not yet).
-    fn mark_stream_dead(&mut self) {
-        self.dead = true;
+    fn mark_vsock_closed(&mut self) {
+        self.mark_vsock_closed = true;
         if let Some(waker) = self.buffer_has_space.take() {
             waker.wake();
         }
@@ -106,14 +105,14 @@ impl UserTx {
                 buffer_has_space: None,
                 buffer_has_data: None,
                 buffer_flushed: None,
-                dead: false,
+                mark_vsock_closed: false,
                 closed: false,
             }),
         })
     }
 
-    pub fn mark_stream_dead(&self) {
-        self.locked.lock().mark_stream_dead();
+    pub fn mark_vsock_closed(&self) {
+        self.locked.lock().mark_vsock_closed();
     }
 }
 
@@ -159,7 +158,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
 
         let mut g = this.user_tx.locked.lock();
 
-        if g.dead {
+        if g.mark_vsock_closed {
             return Poll::Ready(Err(std::io::Error::other("socket died")));
         }
 
@@ -192,7 +191,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
     ) -> Poll<Result<(), std::io::Error>> {
         let mut g = self.user_tx.locked.lock();
 
-        if g.dead {
+        if g.mark_vsock_closed {
             return Poll::Ready(Err(std::io::Error::other("socket died")));
         }
 

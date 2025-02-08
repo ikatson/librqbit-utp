@@ -603,10 +603,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         );
 
         // This will close the reader.
-        self.user_rx.mark_stream_dead();
+        self.user_rx.mark_vsock_closed();
 
         // This will close the writer.
-        self.user_tx.mark_stream_dead();
+        self.user_tx.mark_vsock_closed();
 
         if error.is_some() && !self.state.is_local_fin_or_later() {
             let mut fin = self.outgoing_header();
@@ -1213,8 +1213,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 impl<T, E> Drop for VirtualSocket<T, E> {
     fn drop(&mut self) {
         METRICS.live_virtual_sockets.decrement(1);
-        self.user_tx.mark_stream_dead();
-        self.user_rx.mark_stream_dead();
+        self.user_tx.mark_vsock_closed();
+        self.user_rx.mark_vsock_closed();
     }
 }
 

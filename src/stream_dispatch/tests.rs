@@ -2654,3 +2654,57 @@ async fn test_real_world_packets_fin_sequence_0() {
         .await
         .expect("expected poll to return Ready");
 }
+
+#[tokio::test]
+async fn test_repeated_eof_read() {
+    setup_test_logging();
+
+    let mut t = make_test_vsock(Default::default(), false);
+    let (mut r, _w) = t.stream.take().unwrap().split();
+    t.send_msg(
+        UtpHeader {
+            htype: ST_FIN,
+            seq_nr: 1.into(),
+            ack_nr: 100.into(),
+            ..Default::default()
+        },
+        "",
+    );
+
+    t.poll_once_assert_pending().await;
+    assert_eq!(r.read(&mut [0u8; 1]).await.unwrap(), 0);
+    assert_eq!(r.read(&mut [0u8; 1]).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_repeated_eof_read_2() {
+    setup_test_logging();
+
+    let mut t = make_test_vsock(Default::default(), false);
+    let (mut r, _w) = t.stream.take().unwrap().split();
+    t.send_msg(
+        UtpHeader {
+            htype: ST_DATA,
+            seq_nr: 1.into(),
+            ack_nr: 100.into(),
+            ..Default::default()
+        },
+        "hello",
+    );
+    t.send_msg(
+        UtpHeader {
+            htype: ST_FIN,
+            seq_nr: 2.into(),
+            ack_nr: 100.into(),
+            ..Default::default()
+        },
+        "",
+    );
+
+    t.poll_once_assert_pending().await;
+    let mut buf = [0u8; 1024];
+    assert_eq!(r.read(&mut buf).await.unwrap(), 5);
+    assert_eq!(&buf[..5], b"hello");
+    assert_eq!(r.read(&mut buf).await.unwrap(), 0);
+    assert_eq!(r.read(&mut buf).await.unwrap(), 0);
+}

@@ -71,6 +71,7 @@ use crate::{
 
 pub struct UtpStreamReadHalf {
     current: Option<BeingRead>,
+    is_eof: bool,
     shared: Arc<UserRxShared>,
 }
 
@@ -131,6 +132,10 @@ impl AsyncRead for UtpStreamReadHalf {
                 continue;
             }
 
+            if self.is_eof {
+                break;
+            }
+
             let mut g = self.shared.locked.lock();
             if let Some(msg) = g.queue.pop_front() {
                 match msg {
@@ -141,7 +146,11 @@ impl AsyncRead for UtpStreamReadHalf {
                     UserRxMessage::Error(msg) => {
                         return Poll::Ready(Err(std::io::Error::other(msg)))
                     }
-                    UserRxMessage::Eof => return Poll::Ready(Ok(())),
+                    UserRxMessage::Eof => {
+                        drop(g);
+                        self.is_eof = true;
+                        return Poll::Ready(Ok(()));
+                    }
                 }
             } else {
                 if g.writer_dead {
@@ -160,6 +169,10 @@ impl AsyncRead for UtpStreamReadHalf {
             if let Some(waker) = waker {
                 waker.wake();
             }
+            return Poll::Ready(Ok(()));
+        }
+
+        if self.is_eof {
             return Poll::Ready(Ok(()));
         }
 
@@ -244,6 +257,7 @@ impl UserRx {
         let read_half = UtpStreamReadHalf {
             current: None,
             shared: shared.clone(),
+            is_eof: false,
         };
         let out_of_order_queue = OutOfOrderQueue::new(out_of_order_max_packets);
         let write_half = UserRx {
@@ -268,7 +282,7 @@ impl UserRx {
         }
     }
 
-    pub fn mark_stream_dead(&self) {
+    pub fn mark_vsock_closed(&self) {
         // nothing here
         // keeping this function to be consistent with UserTx
     }
