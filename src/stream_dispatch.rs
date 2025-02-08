@@ -58,17 +58,6 @@ enum VirtualSocketState {
     // Our fin was ACKed
     FinWait2,
 
-    // We received a FIN, but we may still send data.
-    CloseWait {
-        remote_fin: SeqNr,
-    },
-
-    // We and remote sent FINs, but none were ACKed
-    Closing {
-        our_fin: SeqNr,
-        remote_fin: SeqNr,
-    },
-
     // Both sides closed, we are waiting for final ACK.
     // After this we just kill the socket.
     LastAck {
@@ -92,8 +81,6 @@ impl VirtualSocketState {
             VirtualSocketState::Established => "established",
             VirtualSocketState::FinWait1 { .. } => "fin-wait-1",
             VirtualSocketState::FinWait2 => "fin-wait-2",
-            VirtualSocketState::CloseWait { .. } => "close-wait",
-            VirtualSocketState::Closing { .. } => "closing",
             VirtualSocketState::LastAck { .. } => "last-ack",
             VirtualSocketState::Closed => "closed",
         }
@@ -107,13 +94,6 @@ impl VirtualSocketState {
                 trace!("state {} -> fin-wait-1", self.name());
                 *self = VirtualSocketState::FinWait1 { our_fin }
             }
-            VirtualSocketState::CloseWait { remote_fin } => {
-                trace!("state close-wait -> last-ack");
-                *self = VirtualSocketState::LastAck {
-                    our_fin,
-                    remote_fin,
-                }
-            }
             _ => return false,
         };
         true
@@ -124,12 +104,10 @@ impl VirtualSocketState {
         match self {
             VirtualSocketState::SynReceived { .. }
             | VirtualSocketState::SynAckSent { .. }
-            | VirtualSocketState::Established { .. }
-            | VirtualSocketState::CloseWait { .. } => false,
+            | VirtualSocketState::Established { .. } => false,
             VirtualSocketState::Closed { .. }
             | VirtualSocketState::FinWait1 { .. }
             | VirtualSocketState::FinWait2 { .. }
-            | VirtualSocketState::Closing { .. }
             | VirtualSocketState::LastAck { .. } => true,
         }
     }
@@ -137,7 +115,6 @@ impl VirtualSocketState {
     fn our_fin_if_unacked(&self) -> Option<SeqNr> {
         match *self {
             VirtualSocketState::FinWait1 { our_fin }
-            | VirtualSocketState::Closing { our_fin, .. }
             | VirtualSocketState::LastAck { our_fin, .. } => Some(our_fin),
             _ => None,
         }
@@ -146,10 +123,7 @@ impl VirtualSocketState {
     fn is_remote_fin_or_later(&self) -> bool {
         matches!(
             self,
-            VirtualSocketState::CloseWait { .. }
-                | VirtualSocketState::Closing { .. }
-                | VirtualSocketState::LastAck { .. }
-                | VirtualSocketState::Closed
+            VirtualSocketState::LastAck { .. } | VirtualSocketState::Closed
         )
     }
 }
@@ -391,49 +365,52 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn maybe_prepare_for_retransmission(&mut self) {
-        if let Some(expired_delay) = self.timers.retransmit.should_retransmit(self.this_poll.now) {
-            let rewind_to = self
-                .user_tx_segments
-                .first_seq_nr()
-                .or_else(|| self.state.our_fin_if_unacked())
-                .map(|rw| rw - 1);
-            let rewind_to = match rewind_to {
-                Some(v) => v,
-                None => {
-                    trace!("nowhere to rewind to, resetting retransmit timer");
-                    self.timers.retransmit.set_for_idle();
-                    return;
-                }
-            };
+        let Some(expired_delay) = self.timers.retransmit.should_retransmit(self.this_poll.now)
+        else {
+            return;
+        };
 
-            // If a retransmit timer expired, we should resend data starting at the last ACK.
-            log_every_ms!(100, CONGESTION_TRACING_LOG_LEVEL, ?expired_delay, ?rewind_to, ?self.last_sent_seq_nr, "retransmitting");
+        let rewind_to = self
+            .user_tx_segments
+            .first_seq_nr()
+            .or_else(|| self.state.our_fin_if_unacked())
+            .map(|rw| rw - 1);
+        let rewind_to = match rewind_to {
+            Some(v) => v,
+            None => {
+                trace!("nowhere to rewind to, resetting retransmit timer");
+                self.timers.retransmit.set_for_idle();
+                return;
+            }
+        };
 
-            // Rewind "last sequence number sent", as if we never
-            // had sent them. This will cause all data in the queue
-            // to be sent again.
-            self.last_sent_seq_nr = rewind_to;
+        // If a retransmit timer expired, we should resend data starting at the last ACK.
+        log_every_ms!(100, CONGESTION_TRACING_LOG_LEVEL, ?expired_delay, ?rewind_to, ?self.last_sent_seq_nr, "retransmitting");
 
-            // Clear the `should_retransmit` state. If we can't retransmit right
-            // now for whatever reason (like zero window), this avoids an
-            // infinite polling loop where `poll_at` returns `Now` but `dispatch`
-            // can't actually do anything.
-            //
-            // Ideally, we only clear it after we were able to send anything.
-            self.timers.retransmit.set_for_idle();
+        // Rewind "last sequence number sent", as if we never
+        // had sent them. This will cause all data in the queue
+        // to be sent again.
+        self.last_sent_seq_nr = rewind_to;
 
-            // Inform RTTE to become more conservative.
-            log_before_and_after_if_changed(
-                "rtte:on_retransmit",
-                &mut self.rtte,
-                |r| r.retransmission_timeout(),
-                |r| r.on_retransmit(),
-                |_, _| CONGESTION_TRACING_LOG_LEVEL,
-            );
+        // Clear the `should_retransmit` state. If we can't retransmit right
+        // now for whatever reason (like zero window), this avoids an
+        // infinite polling loop where `poll_at` returns `Now` but `dispatch`
+        // can't actually do anything.
+        //
+        // Ideally, we only clear it after we were able to send anything.
+        self.timers.retransmit.set_for_idle();
 
-            // Inform the congestion controller that we're retransmitting.
-            self.congestion_controller.on_retransmit(self.this_poll.now);
-        }
+        // Inform RTTE to become more conservative.
+        log_before_and_after_if_changed(
+            "rtte:on_retransmit",
+            &mut self.rtte,
+            |r| r.retransmission_timeout(),
+            |r| r.on_retransmit(),
+            |_, _| CONGESTION_TRACING_LOG_LEVEL,
+        );
+
+        // Inform the congestion controller that we're retransmitting.
+        self.congestion_controller.on_retransmit(self.this_poll.now);
     }
 
     fn on_packet_sent(&mut self, header: &UtpHeader) {
@@ -690,7 +667,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 drop(g);
 
                 // Waking under lock slows things down.
-
                 if let Some(w) = waker_1 {
                     w.wake();
                 }
@@ -792,19 +768,26 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             (Established, ST_DATA | ST_STATE) => {}
-            (Established, ST_FIN) if hdr.seq_nr != self.last_consumed_remote_seq_nr + 1 => {
-                debug!(
-                    "dropping FIN as too early, expected seq_nr to be {}",
+
+            // Fin received in an expected state, but its sequence number is wrong
+            (Established | FinWait1 { .. } | FinWait2 { .. }, ST_FIN)
+                if hdr.seq_nr != self.last_consumed_remote_seq_nr + 1 =>
+            {
+                warn!(
+                    "dropping FIN, expected seq_nr to be {}",
                     self.last_consumed_remote_seq_nr + 1
                 );
                 return Ok(Default::default());
             }
+
             (Established, ST_FIN) => {
-                trace!("state: established -> close-wait");
+                trace!("state: established -> last-ack");
                 is_first_remote_fin = true;
-                self.state = CloseWait {
+                let our_fin = self.user_tx_segments.next_seq_nr();
+                self.state = LastAck {
+                    our_fin,
                     remote_fin: hdr.seq_nr,
-                };
+                }
             }
 
             (FinWait1 { our_fin }, ST_FIN) if hdr.ack_nr == our_fin => {
@@ -814,11 +797,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
             (FinWait1 { our_fin }, ST_FIN) => {
                 is_first_remote_fin = true;
-                trace!("state: fin-wait-1 -> closing");
-                self.state = Closing {
+                trace!("state: fin-wait-1 -> last-ack");
+                self.state = LastAck {
                     our_fin,
                     remote_fin: hdr.seq_nr,
-                };
+                }
             }
 
             (FinWait1 { our_fin }, ST_DATA | ST_STATE) if hdr.ack_nr == our_fin => {
@@ -827,7 +810,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.state = FinWait2;
             }
             (FinWait1 { .. }, ST_DATA | ST_STATE) => {}
-            (FinWait2, Type::ST_FIN) => {
+            (FinWait2, ST_FIN) => {
                 trace!("state: fin-wait-2 -> closed");
                 is_first_remote_fin = true;
                 self.timers.remote_inactivity_timer = None;
@@ -835,16 +818,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
             (FinWait2, ST_DATA | ST_STATE) => {}
 
-            (Closing { our_fin, .. } | LastAck { our_fin, .. }, _) if hdr.ack_nr == our_fin => {
-                trace!("state: closing -> closed");
+            (LastAck { our_fin, .. }, _) if hdr.ack_nr == our_fin => {
+                trace!("state: last-ack -> closed");
                 self.timers.remote_inactivity_timer = None;
                 self.state = Closed;
             }
 
-            (
-                CloseWait { remote_fin } | Closing { remote_fin, .. } | LastAck { remote_fin, .. },
-                _,
-            ) if hdr.seq_nr > remote_fin => {
+            (LastAck { remote_fin, .. }, _) if hdr.seq_nr > remote_fin => {
                 if hdr.htype == ST_DATA {
                     warn!("received higher seq nr than remote FIN, dropping packet");
                     return Ok(Default::default());
@@ -854,7 +834,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
-            (CloseWait { .. } | Closing { .. } | LastAck { .. }, _) => {}
+            (LastAck { .. }, _) => {}
         }
 
         let on_ack_result = self
@@ -994,12 +974,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     debug!("remote closed with {close_reason:?}");
                 }
 
+                self.force_immedate_ack();
+
                 if is_first_remote_fin {
                     self.last_consumed_remote_seq_nr = hdr.seq_nr;
                     self.user_rx.enqueue_last_message(UserRxMessage::Eof);
+                    self.user_rx.mark_vsock_closed();
                     self.user_tx.mark_vsock_closed();
-                    self.force_immedate_ack(); // this will send either ACK or FIN right away.
-                    self.transition_to_fin_sent();
                 }
             }
             ST_SYN => {
@@ -1191,22 +1172,28 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.transition_to_fin_sent();
             }
 
+            // If the retransmission timer expired and there's something to send,
+            // set up state for retransmission.
             self.maybe_prepare_for_retransmission();
 
             // (Re)send tx queue.
             pending_if_cannot_send!(self.send_tx_queue(cx, socket));
 
+            // (Re)send a pending FIN if needed.
             pending_if_cannot_send!(self.maybe_send_fin(cx, socket));
 
+            // Send an ACK if nothing sent yet and sending an ACK is necessary.
             pending_if_cannot_send!(self.maybe_send_ack(cx, socket));
 
+            // Quit normally if both sides sent FIN and ACKed each other.
             if self.state.is_closed() {
                 self.just_before_death(cx, None);
                 return Poll::Ready(Ok(()));
             }
 
+            // If we are done and there's nothing outstanding to send, give the remote last chance to
+            // send a meaningful update (their FIN) or die.
             if self.state.is_local_fin_or_later() && self.user_tx_segments.is_empty() {
-                // Give the remote 1 second to send FIN so that we can ACK it.
                 let next_exp = self.this_poll.now + Duration::from_secs(1);
                 match self.timers.remote_inactivity_timer {
                     Some(time) if time < next_exp => {}
@@ -1217,6 +1204,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
+            // If there's a timer-based next poll to run, arm the timer.
             match self.next_poll_send_to_at() {
                 PollAt::Now => {
                     return Poll::Ready(Err(anyhow::anyhow!(

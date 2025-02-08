@@ -1,0 +1,25 @@
+digraph uTP_state_machine {
+    rankdir = TD;
+    node [shape = ellipse;];
+    
+    SynReceived;
+    SynAckSent;
+    Established;
+    FinWait1;
+    FinWait2;
+    LastAck;
+    Closed;
+    
+    SynReceived -> SynAckSent [label = "ack sent";];
+    SynAckSent -> Established [label = "st data";];
+    SynAckSent -> Closed [label = "remote FIN";];
+    
+    Established -> FinWait1 [label = "r/w dropped";];
+    FinWait1 -> FinWait2 [label = "finack received";];
+    FinWait1 -> LastAck [label = "fin received, but no ack";];
+    FinWait1 -> Closed [label = "fin+ack received";];
+    FinWait2 -> Closed [label = "fin received";];
+    
+    Established -> LastAck [label = "remote FIN received";];
+    LastAck -> Closed [label = "finack received";];
+}
