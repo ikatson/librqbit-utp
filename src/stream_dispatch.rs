@@ -729,7 +729,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         use VirtualSocketState::*;
         let hdr = &msg.header;
 
-        let mut is_first_remote_fin = false;
+        let previously_seen_remote_fin = self.state.is_remote_fin_or_later();
 
         match (self.state, hdr.get_type()) {
             // From real world packets: if ST_RESET acks our FIN, it's ok
@@ -763,7 +763,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
             (SynAckSent { .. }, ST_FIN) => {
                 trace!("state: syn-ack-sent -> closed");
-                is_first_remote_fin = true;
                 self.state = Closed;
             }
 
@@ -782,7 +781,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             (Established, ST_FIN) => {
                 trace!("state: established -> last-ack");
-                is_first_remote_fin = true;
                 let our_fin = self.user_tx_segments.next_seq_nr();
                 self.state = LastAck {
                     our_fin,
@@ -791,12 +789,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             (FinWait1 { our_fin }, ST_FIN) if hdr.ack_nr == our_fin => {
-                is_first_remote_fin = true;
                 trace!("state: fin-wait-1 -> closed");
                 self.state = Closed;
             }
             (FinWait1 { our_fin }, ST_FIN) => {
-                is_first_remote_fin = true;
                 trace!("state: fin-wait-1 -> last-ack");
                 self.state = LastAck {
                     our_fin,
@@ -812,7 +808,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (FinWait1 { .. }, ST_DATA | ST_STATE) => {}
             (FinWait2, ST_FIN) => {
                 trace!("state: fin-wait-2 -> closed");
-                is_first_remote_fin = true;
                 self.timers.remote_inactivity_timer = None;
                 self.state = Closed;
             }
@@ -976,7 +971,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                 self.force_immedate_ack();
 
-                if is_first_remote_fin {
+                if !previously_seen_remote_fin {
                     self.last_consumed_remote_seq_nr = hdr.seq_nr;
                     self.user_rx.enqueue_last_message(UserRxMessage::Eof);
                     self.user_rx.mark_vsock_closed();
