@@ -37,6 +37,8 @@ use crate::{
     UtpSocket,
 };
 
+// TODO: as FIN works differently from TCP, we need to refactor states to simplify them.
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VirtualSocketState {
     SynReceived,
@@ -754,6 +756,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let mut is_first_remote_fin = false;
 
         match (self.state, hdr.get_type()) {
+            // From real world packets: if ST_RESET acks our FIN, it's ok
+            (LastAck { our_fin, .. }, ST_RESET) if hdr.ack_nr == our_fin => {
+                self.state = Closed;
+                return Ok(Default::default());
+            }
             (_, ST_RESET) => {
                 self.state = Closed;
                 bail!("ST_RESET received")
@@ -838,8 +845,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 CloseWait { remote_fin } | Closing { remote_fin, .. } | LastAck { remote_fin, .. },
                 _,
             ) if hdr.seq_nr > remote_fin => {
-                warn!("received higher seq nr than remote FIN, dropping packet");
-                return Ok(Default::default());
+                if hdr.htype == ST_DATA {
+                    warn!("received higher seq nr than remote FIN, dropping packet");
+                    return Ok(Default::default());
+                } else {
+                    // We COULD drop this packet, but turns out it happens very often in the wild.
+                    warn!("received higher seq nr than remote FIN, ignoring this");
+                }
             }
 
             (CloseWait { .. } | Closing { .. } | LastAck { .. }, _) => {}
@@ -998,6 +1010,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn should_send_window_update(&self) -> bool {
+        if self.state.is_remote_fin_or_later() {
+            return false;
+        }
         // if we need to send a window update, also send immediately.
         // TODO: this is clumsy, but should do the job in case the reader was fully flow controlled.
         let rmss = self.socket_opts.max_incoming_payload_size.get() as u32;
