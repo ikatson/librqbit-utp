@@ -159,7 +159,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
         let mut g = this.user_tx.locked.lock();
 
         if g.mark_vsock_closed {
-            return Poll::Ready(Err(std::io::Error::other("socket died")));
+            return Poll::Ready(Err(std::io::Error::other("socket closed")));
         }
 
         if g.closed {

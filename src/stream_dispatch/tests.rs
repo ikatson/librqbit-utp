@@ -2708,3 +2708,109 @@ async fn test_repeated_eof_read_2() {
     assert_eq!(r.read(&mut buf).await.unwrap(), 0);
     assert_eq!(r.read(&mut buf).await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn test_write_fails_after_remote_fin_received() {
+    setup_test_logging();
+    let mut t = make_test_vsock(Default::default(), false);
+
+    let (mut reader, mut writer) = t.stream.take().unwrap().split();
+
+    // First write some data and get it ACKed
+    writer.write_all(b"hello").await.unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(
+            ST_DATA,
+            seq_nr = 101,
+            ack_nr = 0,
+            payload = "hello"
+        )],
+    );
+
+    // Remote ACKs our data
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            seq_nr: 0.into(),
+            ack_nr: 101.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+
+    // Remote sends some data followed by FIN
+    t.send_msg(
+        UtpHeader {
+            htype: ST_DATA,
+            seq_nr: 1.into(),
+            ack_nr: 101.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "world",
+    );
+    t.send_msg(
+        UtpHeader {
+            htype: ST_FIN,
+            seq_nr: 2.into(),
+            ack_nr: 101.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+
+    // We should ACK both the data and FIN as one message, and send FIN in return.
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_FIN, seq_nr = 102, ack_nr = 2)],
+        "Should ACK both data and FIN and send FIN"
+    );
+
+    // Try to write more data - should fail
+    let write_result = writer.write(b"more data").await;
+    assert!(
+        write_result.is_err(),
+        "Write should fail after receiving FIN"
+    );
+    let err = write_result.unwrap_err();
+    assert!(
+        err.to_string().contains("closed"),
+        "Error should indicate connection is closed: {err}"
+    );
+
+    // Read should get the last data
+    let mut buf = [0u8; 1024];
+    let n = reader.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"world");
+
+    // Next read should return EOF (0 bytes)
+    let n = reader.read(&mut buf).await.unwrap();
+    assert_eq!(n, 0, "Read should return EOF after FIN");
+
+    // We should wait for remote FIN
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+
+    // Remote ACKs our FIN
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            seq_nr: 2.into(),
+            ack_nr: 102.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
+
+    t.poll_once_assert_ready()
+        .await
+        .expect("connection should complete with Ok(())");
+}

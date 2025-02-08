@@ -83,14 +83,30 @@ impl VirtualSocketState {
         matches!(self, VirtualSocketState::Closed)
     }
 
+    fn name(&self) -> &'static str {
+        match self {
+            VirtualSocketState::SynReceived => "syn-received",
+            VirtualSocketState::SynAckSent { .. } => "syn-ack-sent",
+            VirtualSocketState::Established => "established",
+            VirtualSocketState::FinWait1 { .. } => "fin-wait-1",
+            VirtualSocketState::FinWait2 => "fin-wait-2",
+            VirtualSocketState::CloseWait { .. } => "close-wait",
+            VirtualSocketState::Closing { .. } => "closing",
+            VirtualSocketState::LastAck { .. } => "last-ack",
+            VirtualSocketState::Closed => "closed",
+        }
+    }
+
     fn transition_to_fin_sent(&mut self, our_fin: SeqNr) -> bool {
         match *self {
             VirtualSocketState::Established
             | VirtualSocketState::SynReceived
             | VirtualSocketState::SynAckSent { .. } => {
+                trace!("state {} -> fin-wait-1", self.name());
                 *self = VirtualSocketState::FinWait1 { our_fin }
             }
             VirtualSocketState::CloseWait { remote_fin } => {
+                trace!("state close-wait -> last-ack");
                 *self = VirtualSocketState::LastAck {
                     our_fin,
                     remote_fin,
@@ -517,20 +533,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         if g.is_empty() {
             update_optional_waker(&mut g.buffer_has_data, cx);
-
-            if g.is_closed() {
-                let changed = log_before_and_after_if_changed(
-                    "state",
-                    &mut self.state,
-                    |s| *s,
-                    |s| s.transition_to_fin_sent(self.user_tx_segments.next_seq_nr()),
-                    |_, _| Level::DEBUG,
-                );
-                if changed {
-                    trace!("writer closed");
-                }
-            }
-
             return Ok(());
         }
 
@@ -968,10 +970,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     debug!("remote closed with {close_reason:?}");
                 }
 
-                let _ = self.send_finack(cx, socket, hdr.seq_nr);
+                // let _ = self.send_finack(cx, socket, hdr.seq_nr);
                 if is_first_remote_fin {
                     self.last_consumed_remote_seq_nr = hdr.seq_nr;
                     self.user_rx.enqueue_last_message(UserRxMessage::Eof);
+                    self.user_tx.mark_vsock_closed();
+                    self.state
+                        .transition_to_fin_sent(self.user_tx_segments.next_seq_nr());
                 }
             }
             ST_SYN => {
@@ -1172,7 +1177,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 return Poll::Ready(Ok(()));
             }
 
-            if self.user_rx_is_closed() && self.state.is_local_fin_or_later() {
+            if self.state.is_local_fin_or_later() {
                 // Give the remote 1 second to send FIN so that we can ACK it.
                 let next_exp = self.this_poll.now + Duration::from_secs(1);
                 match self.timers.remote_inactivity_timer {
