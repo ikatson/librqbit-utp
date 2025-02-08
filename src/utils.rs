@@ -53,34 +53,51 @@ pub fn fill_buffer_from_slices(
         )
     }
 
-    let mut offset = offset;
-    let mut out_buf = out_buf;
-    let mut remaining = len;
-
-    for mut chunk in [first, second] {
-        // Advance until offset is found
-        if offset > 0 {
-            if chunk.len() < offset {
-                offset -= chunk.len();
-                continue;
-            } else {
-                chunk = &chunk[offset..];
-                offset = 0;
-            }
-        }
-
-        assert_eq!(offset, 0);
-        let advance = remaining.min(chunk.len());
-        out_buf[..advance].copy_from_slice(&chunk[..advance]);
-        out_buf = &mut out_buf[advance..];
-        remaining -= advance;
-    }
-
-    if remaining > 0 {
-        bail!("not enough data in ring buffer");
-    }
+    let [first, second] = prepare_2_ioslices(first, second, offset, len)?;
+    out_buf[..first.len()].copy_from_slice(first);
+    out_buf[first.len()..first.len() + second.len()].copy_from_slice(second);
 
     Ok(())
+}
+
+pub fn prepare_2_ioslices<'a>(
+    first: &'a [u8],
+    second: &'a [u8],
+    offset: usize,
+    len: usize,
+) -> anyhow::Result<[&'a [u8]; 2]> {
+    if len == 0 {
+        return Ok([&[], &[]]);
+    }
+
+    let total_len = first.len() + second.len();
+    if offset >= total_len {
+        bail!("offset beyond buffer bounds");
+    }
+    if offset + len > total_len {
+        bail!("requested length exceeds buffer bounds");
+    }
+
+    // Handle offset
+    let (first_slice, second_slice) = if offset >= first.len() {
+        // Offset points into second slice
+        let second_offset = offset - first.len();
+        (&[][..], &second[second_offset..])
+    } else {
+        // Offset points into first slice
+        (&first[offset..], second)
+    };
+
+    // Handle length
+    let remaining_in_first = first_slice.len();
+    if len <= remaining_in_first {
+        // All data can be taken from first slice
+        Ok([&first_slice[..len], &[]])
+    } else {
+        // Need to take data from both slices
+        let needed_from_second = len - remaining_in_first;
+        Ok([first_slice, &second_slice[..needed_from_second]])
+    }
 }
 
 pub(crate) struct DropGuardSendBeforeDeath<Msg> {
@@ -189,6 +206,8 @@ impl<F: FnOnce()> Drop for FnDropGuard<F> {
 
 #[cfg(test)]
 mod tests {
+    use crate::utils::prepare_2_ioslices;
+
     use super::fill_buffer_from_slices;
 
     #[test]
@@ -290,5 +309,35 @@ mod tests {
 
         buf = [E; 10];
         assert!(fill_buffer_from_slices(&mut buf, 6, 1, &[1, 2, 3], &[4, 5, 6]).is_err());
+    }
+
+    #[test]
+    fn test_prepare_2_ioslices() {
+        // Test empty request
+        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 0, 0).unwrap();
+        assert_eq!(result, [&[][..], &[][..]]);
+
+        // Test single slice scenarios
+        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 0, 2).unwrap();
+        assert_eq!(result, [&[1, 2][..], &[][..]]);
+
+        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 1, 2).unwrap();
+        assert_eq!(result, [&[2, 3][..], &[][..]]);
+
+        // Test cross-slice scenarios
+        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 2, 2).unwrap();
+        assert_eq!(result, [&[3][..], &[4][..]]);
+
+        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 3, 2).unwrap();
+        assert_eq!(result, [&[][..], &[4, 5][..]]);
+
+        // Test full length
+        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 0, 6).unwrap();
+        assert_eq!(result, [&[1, 2, 3][..], &[4, 5, 6][..]]);
+
+        // Test error cases
+        assert!(prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 7, 1).is_err()); // offset too large
+        assert!(prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 0, 7).is_err()); // length too large
+        assert!(prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 5, 2).is_err()); // offset + length too large
     }
 }
