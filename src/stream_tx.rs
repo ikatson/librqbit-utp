@@ -41,14 +41,6 @@ impl UserTxLocked {
         Ok(())
     }
 
-    pub fn is_closed(&self) -> bool {
-        self.closed
-    }
-
-    // pub fn buffer(&self) -> &VecDeque<u8> {
-    //     &self.buffer
-    // }
-
     pub fn fill_buffer_from_ring_buffer(
         &self,
         out_buf: &mut [u8],

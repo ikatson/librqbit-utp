@@ -546,7 +546,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(());
         }
 
-        if self.state.is_remote_fin_or_later() {
+        if self.state.is_remote_fin_or_later() || self.state.is_local_fin_or_later() {
             trace!("there is still unsent data, but we are closed, so not segmenting further");
             return Ok(());
         }
@@ -665,9 +665,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     return Ok(());
                 }
             };
-            on_ack_result.update(&self.process_incoming_message(cx, socket, msg)?);
-            if self.this_poll.transport_pending || matches!(self.state, VirtualSocketState::Closed)
-            {
+            on_ack_result.update(&self.process_incoming_message(cx, msg)?);
+            if self.state.is_closed() {
                 break;
             }
         }
@@ -743,7 +742,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn process_incoming_message(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T, Env>,
         msg: UtpMessage,
     ) -> anyhow::Result<OnAckResult> {
         trace!("processing message");
@@ -984,11 +982,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     debug!("remote closed with {close_reason:?}");
                 }
 
-                // let _ = self.send_finack(cx, socket, hdr.seq_nr);
                 if is_first_remote_fin {
                     self.last_consumed_remote_seq_nr = hdr.seq_nr;
                     self.user_rx.enqueue_last_message(UserRxMessage::Eof);
                     self.user_tx.mark_vsock_closed();
+                    self.force_immedate_ack(); // this will send either ACK or FIN right away.
                     self.transition_to_fin_sent();
                 }
             }
@@ -1067,21 +1065,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .poll_at(self.this_poll.now)
             .min(delayed_ack_poll_at)
             .min(inactivity_poll)
-    }
-
-    fn user_rx_is_closed(&self) -> bool {
-        self.user_rx.is_closed()
-    }
-
-    fn send_finack(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T, Env>,
-        remote_fin: SeqNr,
-    ) -> anyhow::Result<bool> {
-        let mut hdr = self.outgoing_header();
-        hdr.ack_nr = remote_fin;
-        self.send_control_packet(cx, socket, hdr)
     }
 
     fn maybe_send_syn_ack(

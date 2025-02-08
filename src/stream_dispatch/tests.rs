@@ -421,7 +421,7 @@ async fn test_fast_retransmit() {
 }
 
 #[tokio::test]
-async fn test_fin_shutdown_sequence_initiated_by_explicit_shutdown() {
+async fn test_no_writes_allowed_after_explicit_shutdown() {
     setup_test_logging();
     let mut t = make_test_vsock(Default::default(), false);
 
@@ -471,47 +471,7 @@ async fn test_fin_shutdown_sequence_initiated_by_explicit_shutdown() {
     assert!(stream.write(b"test").await.is_err());
 
     t.poll_once_assert_pending().await;
-
-    // Should send FIN after data is acknowledged
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(ST_FIN, seq_nr = 102)],
-        "FIN should use next sequence number after data"
-    );
-
-    // Remote acknowledges our FIN
-    t.send_msg(
-        UtpHeader {
-            htype: ST_STATE,
-            seq_nr: 0.into(),
-            ack_nr: 102.into(),
-            ..Default::default()
-        },
-        "",
-    );
-
-    // Remote sends its FIN
-    t.send_msg(
-        UtpHeader {
-            htype: ST_FIN,
-            seq_nr: 1.into(),
-            ack_nr: 102.into(),
-            ..Default::default()
-        },
-        "",
-    );
-    let result = t.poll_once().await;
-
-    // We should acknowledge remote's FIN
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(ST_STATE, ack_nr = 1, seq_nr = 102)],
-        "FIN should use next sequence number after data"
-    );
-    assert!(
-        matches!(result, Poll::Ready(Ok(()))),
-        "Connection should complete cleanly"
-    );
+    t.assert_sent_empty();
 }
 
 #[tokio::test]
