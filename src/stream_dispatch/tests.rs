@@ -95,16 +95,16 @@ impl TestVsock {
             Poll::Pending => {}
             Poll::Ready(res) => {
                 res.unwrap();
-                panic!("unexpected finish");
+                panic!("poll returned Ready, but expected Pending");
             }
         };
     }
 
-    async fn poll_once_assert_finished(&mut self) -> anyhow::Result<()> {
+    async fn poll_once_assert_ready(&mut self) -> anyhow::Result<()> {
         let res = self.poll_once().await;
         match res {
             Poll::Pending => {
-                panic!("expected poll to not return pending")
+                panic!("expected poll to return Ready, but got Pending")
             }
             Poll::Ready(res) => res,
         }
@@ -2569,7 +2569,88 @@ async fn test_read_gets_eof_on_fin_real_world_packets() {
         },
         "",
     );
-    t.poll_once_assert_finished().await.unwrap();
+    t.poll_once_assert_ready().await.unwrap();
     t.assert_sent_empty();
     assert_eq!(t.vsock.state, VirtualSocketState::Closed);
+}
+
+#[tokio::test]
+async fn test_real_world_packets_fin_sequence_0() {
+    setup_test_logging();
+
+    let env = MockUtpEnvironment::new();
+    let mut t = make_test_vsock_args(
+        SocketOpts::default(),
+        StreamArgs::new_outgoing(
+            &UtpHeader {
+                htype: ST_STATE,
+                connection_id: 1.into(),
+                seq_nr: 52040.into(),
+                ack_nr: 32747.into(),
+                wnd_size: 1024,
+                ..Default::default()
+            },
+            env.now(),
+            env.now(),
+        ),
+        env,
+    );
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+    assert_eq!(t.vsock.state, VirtualSocketState::Established);
+
+    let (_read, mut write) = t.stream.take().unwrap().split();
+
+    write.write_all(b"hello").await.unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(
+            ST_DATA,
+            seq_nr = 32748,
+            ack_nr = 52039,
+            payload = "hello"
+        )]
+    );
+
+    let mut rhdr = UtpHeader {
+        htype: ST_DATA,
+        seq_nr: 52040.into(),
+        ack_nr: 32748.into(),
+        wnd_size: 1024,
+        ..Default::default()
+    };
+    t.send_msg(rhdr, "a");
+
+    drop(write);
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_FIN, seq_nr = 32749, ack_nr = 52040)],
+    );
+    rhdr.seq_nr = 52041.into();
+    t.send_msg(rhdr, "b");
+    rhdr.seq_nr = 52042.into();
+    t.send_msg(rhdr, "c");
+    rhdr.seq_nr = 52043.into();
+    t.send_msg(rhdr, "d");
+    rhdr.seq_nr = 52044.into();
+    rhdr.htype = ST_FIN;
+    t.send_msg(rhdr, "");
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_STATE, seq_nr = 32749, ack_nr = 52044)],
+    );
+
+    // Remote ACKs our FIN, BUT sends a higher seq_nr
+    rhdr.htype = ST_STATE;
+    rhdr.seq_nr = 52045.into();
+    rhdr.ack_nr = 32749.into();
+    t.send_msg(rhdr, "");
+
+    // We should still process it and close ourselves.
+    t.poll_once_assert_ready()
+        .await
+        .expect("expected poll to return Ready");
 }

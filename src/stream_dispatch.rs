@@ -813,18 +813,19 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.state = Closed;
             }
             (FinWait2, ST_DATA | ST_STATE) => {}
+
+            (Closing { our_fin, .. } | LastAck { our_fin, .. }, _) if hdr.ack_nr == our_fin => {
+                trace!("state: closing -> closed");
+                self.timers.remote_inactivity_timer = None;
+                self.state = Closed;
+            }
+
             (
                 CloseWait { remote_fin } | Closing { remote_fin, .. } | LastAck { remote_fin, .. },
                 _,
             ) if hdr.seq_nr > remote_fin => {
                 warn!("received higher seq nr than remote FIN, dropping packet");
                 return Ok(Default::default());
-            }
-
-            (Closing { our_fin, .. } | LastAck { our_fin, .. }, _) if hdr.ack_nr == our_fin => {
-                trace!("state: closing -> closed");
-                self.timers.remote_inactivity_timer = None;
-                self.state = Closed;
             }
 
             (CloseWait { .. } | Closing { .. } | LastAck { .. }, _) => {}
