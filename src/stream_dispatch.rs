@@ -140,6 +140,16 @@ impl VirtualSocketState {
             _ => None,
         }
     }
+
+    fn is_remote_fin_or_later(&self) -> bool {
+        matches!(
+            self,
+            VirtualSocketState::CloseWait { .. }
+                | VirtualSocketState::Closing { .. }
+                | VirtualSocketState::LastAck { .. }
+                | VirtualSocketState::Closed
+        )
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -536,6 +546,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(());
         }
 
+        if self.state.is_remote_fin_or_later() {
+            trace!("there is still unsent data, but we are closed, so not segmenting further");
+            return Ok(());
+        }
+
         let tx_offset = self
             .user_tx_segments
             .iter_mut()
@@ -644,8 +659,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     //    receive any messages!
 
                     trace!("no more data. transitioning to FINISHED");
-                    self.state
-                        .transition_to_fin_sent(self.user_tx_segments.next_seq_nr());
+                    self.transition_to_fin_sent();
                     self.maybe_send_fin(cx, socket)?;
                     self.state = VirtualSocketState::Closed;
                     return Ok(());
@@ -975,8 +989,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     self.last_consumed_remote_seq_nr = hdr.seq_nr;
                     self.user_rx.enqueue_last_message(UserRxMessage::Eof);
                     self.user_tx.mark_vsock_closed();
-                    self.state
-                        .transition_to_fin_sent(self.user_tx_segments.next_seq_nr());
+                    self.transition_to_fin_sent();
                 }
             }
             ST_SYN => {
@@ -1109,6 +1122,19 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(())
     }
 
+    fn transition_to_fin_sent(&mut self) {
+        log_before_and_after_if_changed(
+            "state",
+            self,
+            |s| s.state,
+            |s| {
+                s.state
+                    .transition_to_fin_sent(s.user_tx_segments.next_seq_nr())
+            },
+            |_, _| Level::DEBUG,
+        );
+    }
+
     fn poll(&mut self, cx: &mut std::task::Context<'_>) -> Poll<anyhow::Result<()>> {
         macro_rules! bail_if_err {
             ($e:expr) => {
@@ -1161,9 +1187,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 return Poll::Ready(Err(err));
             }
 
-            self.maybe_prepare_for_retransmission();
-
             bail_if_err!(self.split_tx_queue_into_segments(cx));
+
+            if self.user_rx.is_closed() && self.user_tx.is_closed() {
+                self.transition_to_fin_sent();
+            }
+
+            self.maybe_prepare_for_retransmission();
 
             // (Re)send tx queue.
             pending_if_cannot_send!(self.send_tx_queue(cx, socket));
@@ -1177,7 +1207,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 return Poll::Ready(Ok(()));
             }
 
-            if self.state.is_local_fin_or_later() {
+            if self.state.is_local_fin_or_later() && self.user_tx_segments.is_empty() {
                 // Give the remote 1 second to send FIN so that we can ACK it.
                 let next_exp = self.this_poll.now + Duration::from_secs(1);
                 match self.timers.remote_inactivity_timer {

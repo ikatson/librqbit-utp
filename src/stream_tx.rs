@@ -111,6 +111,10 @@ impl UserTx {
         })
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.locked.lock().closed
+    }
+
     pub fn mark_vsock_closed(&self) {
         self.locked.lock().mark_vsock_closed();
     }

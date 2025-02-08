@@ -515,63 +515,6 @@ async fn test_fin_shutdown_sequence_initiated_by_explicit_shutdown() {
 }
 
 #[tokio::test]
-async fn test_fin_sent_when_writer_dropped() {
-    setup_test_logging();
-    let mut t = make_test_vsock(Default::default(), false);
-
-    let (_reader, mut writer) = t.stream.take().unwrap().split();
-
-    // Allow sending by setting window size
-    t.send_msg(
-        UtpHeader {
-            htype: ST_STATE,
-            seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
-            wnd_size: 1024,
-            ..Default::default()
-        },
-        "",
-    );
-
-    // Write some data and initiate shutdown
-    writer.write_all(b"hello").await.unwrap();
-
-    // Ensure it's processed and sent.
-    t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 101,
-            ack_nr = 0,
-            payload = "hello"
-        )],
-    );
-
-    // Acknowledge the data
-    t.send_msg(
-        UtpHeader {
-            htype: ST_STATE,
-            seq_nr: 0.into(),
-            ack_nr: 101.into(),
-            ..Default::default()
-        },
-        "",
-    );
-    // Deliver the ACK.
-    t.poll_once_assert_pending().await;
-
-    // Initiate FIN.
-    drop(writer);
-
-    t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(ST_FIN, seq_nr = 102, ack_nr = 0)],
-    );
-}
-
-#[tokio::test]
 async fn test_flush_works() {
     setup_test_logging();
     let mut t = make_test_vsock(Default::default(), false);
@@ -855,23 +798,8 @@ async fn test_resource_cleanup_both_sides_dropped_normally() {
         )],
     );
 
-    // Drop the writer - this should NOT trigger sending FIN until data is ACKed.
+    drop(reader);
     drop(writer);
-    t.poll_once_assert_pending().await;
-
-    // Nothing should happen until it's ACKed.
-    t.assert_sent_empty();
-    t.send_msg(
-        UtpHeader {
-            htype: ST_STATE,
-            seq_nr: 0.into(),
-            ack_nr: 101.into(),
-            wnd_size: 1024,
-            ..Default::default()
-        },
-        "",
-    );
-
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
@@ -886,15 +814,17 @@ async fn test_resource_cleanup_both_sides_dropped_normally() {
         }
     );
 
-    // Drop the reader - this should cause the stream to complete in 1 second.
-    drop(reader);
-    t.poll_once_assert_pending().await;
-    t.env.increment_now(Duration::from_secs(1));
-    let result = t.poll_once().await;
-    assert!(
-        !matches!(result, Poll::Pending),
-        "Poll should complete after both halves are dropped"
+    t.send_msg(
+        UtpHeader {
+            htype: ST_FIN,
+            seq_nr: 1.into(),
+            ack_nr: 102.into(),
+            ..Default::default()
+        },
+        "",
     );
+
+    t.poll_once_assert_ready().await.unwrap();
 }
 
 #[tokio::test]
@@ -961,40 +891,51 @@ async fn test_resource_cleanup_with_pending_data() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 101,
-            ack_nr = 0,
-            payload = "hello"
-        )]
+        vec![
+            cmphead!(ST_DATA, seq_nr = 101, ack_nr = 0, payload = "hello"),
+            cmphead!(ST_FIN, seq_nr = 102, ack_nr = 0)
+        ]
     );
 
     // Nothing else should be sent before ACK.
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
 
+    // Data should be retransmitted
+    t.env.increment_now(Duration::from_secs(2));
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![
+            cmphead!(ST_DATA, seq_nr = 101, ack_nr = 0, payload = "hello"),
+            cmphead!(ST_FIN, seq_nr = 102, ack_nr = 0)
+        ]
+    );
+
     // Send ACK
     t.send_msg(
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: 102.into(),
             wnd_size: 1024,
             ..Default::default()
         },
         "",
     );
 
-    // Next poll should send FIN and die in 1 second.
     t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(ST_FIN, seq_nr = 102, ack_nr = 0)]
-    );
+    t.assert_sent_empty();
+    assert_eq!(t.vsock.state, VirtualSocketState::FinWait2);
 
+    // We should die in 1 second now
     t.env.increment_now(Duration::from_secs(1));
-    let res = t.poll_once().await;
-    assert!(!matches!(res, Poll::Pending));
+
+    let err = t.poll_once_assert_ready().await.unwrap_err();
+    assert!(
+        err.to_string().contains("inactive"),
+        "Error should mention inactivity: {err}"
+    );
 }
 
 #[tokio::test]
@@ -1381,8 +1322,8 @@ async fn test_duplicate_ack_only_on_st_state() {
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 102, ack_nr = 3)],
-        "Should have ACKed the FIN"
+        vec![cmphead!(ST_FIN, seq_nr = 103, ack_nr = 3)],
+        "Should have ACKed the FIN and sent back another FIN"
     );
 
     // Now send three ST_STATE duplicates
@@ -1397,12 +1338,11 @@ async fn test_duplicate_ack_only_on_st_state() {
     assert_eq!(t.vsock.local_rx_dup_acks, 3);
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 102,
-            // TODO: which? ack_nr = 3,
-            payload = "world"
-        )],
+        vec![
+            cmphead!(ST_DATA, seq_nr = 102, ack_nr = 3, payload = "world"),
+            // Re-send the FIN.
+            cmphead!(ST_FIN, seq_nr = 103, ack_nr = 3)
+        ],
         "Should have triggered fast retransmit"
     );
 }
@@ -1463,7 +1403,7 @@ async fn test_finack_not_sent_until_all_data_consumed() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 100, ack_nr = 3)],
+        vec![cmphead!(ST_FIN, seq_nr = 101, ack_nr = 3)],
         "we should ACK the FIN"
     );
 }
@@ -2222,8 +2162,7 @@ async fn test_inactivity_timeout_our_fin_acked() {
     t.poll_once_assert_pending().await;
     t.assert_sent_empty_msg("nothing should happen");
 
-    let (_read, write) = t.stream.take().unwrap().split();
-    drop(write);
+    drop(t.stream.take().unwrap());
 
     t.poll_once_assert_pending().await;
     assert_eq!(
@@ -2251,7 +2190,11 @@ async fn test_inactivity_timeout_our_fin_acked() {
 
     // Nothing should happen as our FIN was acked.
     t.env.increment_now(Duration::from_secs(1));
-    t.poll_once_assert_pending().await;
+    let err = t.poll_once_assert_ready().await.unwrap_err();
+    assert!(
+        err.to_string().contains("inactive"),
+        "Error should mention inactivity: {err}"
+    );
     t.assert_sent_empty();
 }
 
@@ -2268,8 +2211,7 @@ async fn test_inactivity_timeout_our_fin_unacked() {
     t.poll_once_assert_pending().await;
     t.assert_sent_empty_msg("nothing should happen");
 
-    let (mut read, write) = t.stream.take().unwrap().split();
-    drop(write);
+    drop(t.stream.take().unwrap());
 
     t.poll_once_assert_pending().await;
     assert_eq!(
@@ -2296,14 +2238,6 @@ async fn test_inactivity_timeout_our_fin_unacked() {
         }
         other => panic!("Expected inactivity error, got: {other:?}"),
     }
-
-    // Try to read - should get error
-    let mut buf = [0u8; 1024];
-    let read_result = read.read(&mut buf).await;
-    assert!(
-        read_result.is_err(),
-        "Read should fail after inactivity timeout"
-    );
 }
 
 #[tokio::test]
@@ -2409,9 +2343,8 @@ async fn test_fin_retransmission() {
     let retransmit_timeout = Duration::from_millis(100);
     t.vsock.rtte.force_timeout(retransmit_timeout);
 
-    // Drop writer immediately to trigger FIN
-    let (_reader, writer) = t.stream.take().unwrap().split();
-    drop(writer);
+    // Drop reader and writer immediately to trigger FIN
+    t.stream.take().unwrap().split();
 
     // Should send initial FIN
     t.poll_once_assert_pending().await;
@@ -2523,12 +2456,13 @@ async fn test_read_gets_eof_on_fin_real_world_packets() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 39079, ack_nr = 43658)],
+        vec![cmphead!(ST_FIN, seq_nr = 39080, ack_nr = 43658)],
         "we should ACK the FIN"
     );
     assert_eq!(
         t.vsock.state,
-        VirtualSocketState::CloseWait {
+        VirtualSocketState::LastAck {
+            our_fin: 39080.into(),
             remote_fin: 43658.into()
         }
     );
@@ -2537,25 +2471,6 @@ async fn test_read_gets_eof_on_fin_real_world_packets() {
         read.read(&mut [0u8; 1024]).await.unwrap(),
         0,
         "we should get EOF"
-    );
-
-    // 6 seconds is how long it passed in the real world.
-    t.env.increment_now(Duration::from_secs(6));
-    drop(write);
-
-    // Ensure we send FIN on writer drop
-    t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(ST_FIN, seq_nr = 39080, ack_nr = 43658)],
-        "we should send FIN"
-    );
-    assert_eq!(
-        t.vsock.state,
-        VirtualSocketState::LastAck {
-            our_fin: 39080.into(),
-            remote_fin: 43658.into()
-        }
     );
 
     // Remote ACKs our FIN
@@ -2572,87 +2487,6 @@ async fn test_read_gets_eof_on_fin_real_world_packets() {
     t.poll_once_assert_ready().await.unwrap();
     t.assert_sent_empty();
     assert_eq!(t.vsock.state, VirtualSocketState::Closed);
-}
-
-#[tokio::test]
-async fn test_real_world_packets_fin_sequence_0() {
-    setup_test_logging();
-
-    let env = MockUtpEnvironment::new();
-    let mut t = make_test_vsock_args(
-        SocketOpts::default(),
-        StreamArgs::new_outgoing(
-            &UtpHeader {
-                htype: ST_STATE,
-                connection_id: 1.into(),
-                seq_nr: 52040.into(),
-                ack_nr: 32747.into(),
-                wnd_size: 1024,
-                ..Default::default()
-            },
-            env.now(),
-            env.now(),
-        ),
-        env,
-    );
-    t.poll_once_assert_pending().await;
-    t.assert_sent_empty();
-    assert_eq!(t.vsock.state, VirtualSocketState::Established);
-
-    let (_read, mut write) = t.stream.take().unwrap().split();
-
-    write.write_all(b"hello").await.unwrap();
-    t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 32748,
-            ack_nr = 52039,
-            payload = "hello"
-        )]
-    );
-
-    let mut rhdr = UtpHeader {
-        htype: ST_DATA,
-        seq_nr: 52040.into(),
-        ack_nr: 32748.into(),
-        wnd_size: 1024,
-        ..Default::default()
-    };
-    t.send_msg(rhdr, "a");
-
-    drop(write);
-    t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(ST_FIN, seq_nr = 32749, ack_nr = 52040)],
-    );
-    rhdr.seq_nr = 52041.into();
-    t.send_msg(rhdr, "b");
-    rhdr.seq_nr = 52042.into();
-    t.send_msg(rhdr, "c");
-    rhdr.seq_nr = 52043.into();
-    t.send_msg(rhdr, "d");
-    rhdr.seq_nr = 52044.into();
-    rhdr.htype = ST_FIN;
-    t.send_msg(rhdr, "");
-    t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 32749, ack_nr = 52044)],
-    );
-
-    // Remote ACKs our FIN, BUT sends a higher seq_nr
-    rhdr.htype = ST_STATE;
-    rhdr.seq_nr = 52045.into();
-    rhdr.ack_nr = 32749.into();
-    t.send_msg(rhdr, "");
-
-    // We should still process it and close ourselves.
-    t.poll_once_assert_ready()
-        .await
-        .expect("expected poll to return Ready");
 }
 
 #[tokio::test]
