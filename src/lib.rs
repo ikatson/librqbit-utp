@@ -1,3 +1,6 @@
+// TODO: maybe send immediate ACKs before processing the whole loop?
+// TODO: send ACKs when someone redelivers a packet that we have seen already, in case they lost the previous ACK
+
 // TODO: redeliver FIN-ACKs if they were not received. Also may re-send the last control packet (or even the last packet) if
 // failed sending, but break the poll loop.
 
