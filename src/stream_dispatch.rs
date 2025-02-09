@@ -870,6 +870,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         %self.last_consumed_remote_seq_nr,
                         "dropping message, we already ACKed it"
                     );
+                    self.force_immedate_ack();
                     return Ok(on_ack_result);
                 }
 
