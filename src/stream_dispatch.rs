@@ -780,7 +780,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (Established | FinWait1 { .. } | FinWait2 { .. }, ST_FIN)
                 if hdr.seq_nr != self.last_consumed_remote_seq_nr + 1 =>
             {
-                warn!(
+                debug!(
+                    hdr=%hdr.short_repr(),
                     "dropping FIN, expected seq_nr to be {}",
                     self.last_consumed_remote_seq_nr + 1
                 );
@@ -834,11 +835,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             (LastAck { remote_fin, .. }, _) if hdr.seq_nr > remote_fin => {
                 if hdr.htype == ST_DATA {
-                    warn!("received higher seq nr than remote FIN, dropping packet");
+                    debug!(hdr=%hdr.short_repr(), ?remote_fin, "received higher seq nr than remote FIN, dropping packet");
                     return Ok(Default::default());
                 } else {
                     // We COULD drop this packet, but turns out it happens very often in the wild.
-                    warn!("received higher seq nr than remote FIN, ignoring this");
+                    debug!(hdr=%hdr.short_repr(), ?remote_fin, "received higher seq nr than remote FIN, ignoring this");
                 }
             }
 
@@ -897,7 +898,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                             METRICS.consumed_bytes.increment(bytes as u64);
                         } else {
                             METRICS.out_of_order_packets.increment(1);
-                            warn_every_ms!(500, header=%hdr.short_repr(), "out of order");
+                            debug_every_ms!(500, header=%hdr.short_repr(), offset, ?self.last_consumed_remote_seq_nr, "out of order");
                         }
 
                         self.last_consumed_remote_seq_nr += sequence_numbers as u16;
@@ -905,7 +906,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         trace!(self.consumed_but_unacked_bytes);
                     }
                     AssemblerAddRemoveResult::Unavailable(_) => {
-                        warn_every_ms!(500, header=%hdr.short_repr(), "cannot reassemble message, ignoring it");
+                        debug_every_ms!(500, header=%hdr.short_repr(), offset,
+                            ?self.last_consumed_remote_seq_nr, "cannot reassemble message, ignoring it");
                     }
                 }
 
@@ -951,7 +953,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         self.congestion_controller
                             .on_duplicate_ack(self.this_poll.now);
 
-                        debug!(
+                        trace!(
                             "received duplicate ACK for seq {} (duplicate nr {}{})",
                             msg.header.ack_nr,
                             self.local_rx_dup_acks,
@@ -993,7 +995,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
             ST_SYN => {
-                warn!("ignoring unexpected ST_SYN packet: {:?}", msg.header);
+                debug!("ignoring unexpected ST_SYN packet: {:?}", msg.header);
             }
         }
         Ok(on_ack_result)
@@ -1208,7 +1210,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 match self.timers.remote_inactivity_timer {
                     Some(time) if time < next_exp => {}
                     _ => {
-                        debug!("both halves are dead, arming inactivity timer in 1 second");
+                        trace!("both halves are dead, arming inactivity timer in 1 second");
                         self.timers.remote_inactivity_timer = Some(next_exp)
                     }
                 }

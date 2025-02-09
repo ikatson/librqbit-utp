@@ -10,7 +10,7 @@ use anyhow::{bail, Context};
 use msgq::MsgQueue;
 use parking_lot::Mutex;
 use tokio::io::AsyncRead;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 mod msgq {
     use std::collections::VecDeque;
@@ -306,7 +306,7 @@ impl UserRx {
         while let Some(len) = self.ooq.send_front_if_fits(remaining_rx_window, |msg| {
             let mut g = self.shared.locked.lock();
             if g.reader_dead {
-                debug_every_ms!(200, "reader is dead, could not send UtpMesage to it");
+                debug_every_ms!(5000, "reader is dead, could not send UtpMesage to it");
                 return Err(msg);
             }
             g.queue.try_push_back(UserRxMessage::Payload(msg)).unwrap();
@@ -557,7 +557,7 @@ impl OutOfOrderQueue {
         offset: usize,
     ) -> anyhow::Result<AssemblerAddRemoveResult> {
         if self.is_full() {
-            trace!(offset, "assembler buffer full");
+            debug!(offset, "assembler buffer full");
             return Ok(AssemblerAddRemoveResult::Unavailable(msg));
         }
 
@@ -574,6 +574,7 @@ impl OutOfOrderQueue {
         }
 
         if msg.payload().is_empty() {
+            // This shouldn't happen anyway, as we check for it way above, so warn is ok.
             warn!("empty payload unsupported");
             return Ok(AssemblerAddRemoveResult::Unavailable(msg));
         }

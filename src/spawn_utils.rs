@@ -1,6 +1,6 @@
 use anyhow::bail;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn, Instrument};
+use tracing::{debug, trace, Instrument};
 
 #[derive(Debug)]
 struct CancelledError {}
@@ -25,18 +25,18 @@ pub fn spawn(
         loop {
             tokio::select! {
                 _ = trace_interval.tick() => {
-                    debug!("still running");
+                    trace!("still running");
                 },
                 r = &mut fut => {
                     match r {
                         Ok(_) => {
-                            debug!("finished");
+                            trace!("finished");
                         }
                         Err(e) => {
                             if e.is::<CancelledError>() {
                                 debug!("task cancelled")
                             } else {
-                                warn!("finished with error: {:#}", e)
+                                debug!("finished with error: {:#}", e)
                             }
 
                         }

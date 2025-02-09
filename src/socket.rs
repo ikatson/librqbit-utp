@@ -467,6 +467,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 match self.socket.transport.send_to(&buf, addr).await {
                     Ok(len) if len == buf.len() => {}
                     Ok(len) => {
+                        // Never seen this happen yet, so can be warn.
                         warn!(
                             len,
                             expected_len = buf.len(),
@@ -489,6 +490,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 if self.connecting.entry(addr).or_default().insert(c) {
                     self.next_connection_id += 2;
                 } else {
+                    // This is super rare, can be warn.
                     warn!("too many concurrent connectins to {addr}");
                 }
             }
@@ -526,7 +528,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let mut occ = match self.connecting.entry(addr) {
             Entry::Occupied(occ) => occ,
             Entry::Vacant(_) => {
-                debug!(
+                trace!(
                     ?msg,
                     "dropping packet, noone is connecting, and no registered streams"
                 );
@@ -654,11 +656,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             return Ok(());
         }
 
-        trace!(
-            exist = ?self.streams.keys().collect::<Vec<_>>(),
-            ?key,
-            "no matching live streams"
-        );
+        trace!(?key, "no matching live streams");
 
         match message.header.get_type() {
             Type::ST_STATE => {
@@ -668,7 +666,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 self.on_syn(addr, message)?;
             }
             _ => {
-                debug!(?message, ?addr, "dropping packet");
+                trace!(?message, ?addr, "dropping packet");
             }
         }
         Ok(())
@@ -778,7 +776,9 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             cancellation_token: opts.cancellation_token.clone(),
         });
 
-        let rx = start_recvfrom_task(sock.transport.clone(), 128);
+        // This will act as increased socket recv buffer
+        // TODO: try this or increasing actual socket buffer?
+        let rx = start_recvfrom_task(sock.transport.clone(), 8192);
 
         let dispatcher = Dispatcher {
             streams: Default::default(),
@@ -896,7 +896,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             }
             Poll::Pending => {
                 METRICS.send_poll_pending.increment(1);
-                debug_every_ms!(500, "UDP socket full, could not send packet");
+                debug_every_ms!(5000, "UDP socket full, could not send packet");
                 return Ok(true);
             }
         }
