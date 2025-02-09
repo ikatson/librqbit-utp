@@ -878,11 +878,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 );
 
                 let assembler_was_empty = self.user_rx.assembler_empty();
+                let hdr = msg.header;
 
                 match self
                     .user_rx
                     .add_remove(cx, msg, offset as usize)
-                    .context("fatal error in assember")?
+                    .context("fatal error in assembler")?
                 {
                     AssemblerAddRemoveResult::Consumed {
                         sequence_numbers,
@@ -896,7 +897,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                             METRICS.consumed_bytes.increment(bytes as u64);
                         } else {
                             METRICS.out_of_order_packets.increment(1);
-                            trace!("out of order");
+                            warn_every_ms!(500, header=%hdr.short_repr(), "out of order");
                         }
 
                         self.last_consumed_remote_seq_nr += sequence_numbers as u16;
@@ -904,7 +905,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         trace!(self.consumed_but_unacked_bytes);
                     }
                     AssemblerAddRemoveResult::Unavailable(_) => {
-                        trace!("cannot reassemble message, ignoring it");
+                        warn_every_ms!(500, header=%hdr.short_repr(), "cannot reassemble message, ignoring it");
                     }
                 }
 

@@ -75,6 +75,23 @@ impl UtpHeader {
         self.htype
     }
 
+    pub fn short_repr(&self) -> impl std::fmt::Display + '_ {
+        struct D<'a>(&'a UtpHeader);
+        impl std::fmt::Display for D<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(
+                    f,
+                    "{:?}:seq_nr={}:ack_nr={}:wnd_size={}",
+                    self.0.get_type(),
+                    self.0.seq_nr,
+                    self.0.ack_nr,
+                    self.0.wnd_size,
+                )
+            }
+        }
+        D(self)
+    }
+
     pub fn serialize(&self, buffer: &mut [u8]) -> anyhow::Result<usize> {
         if buffer.len() < UTP_HEADER_SIZE {
             bail!("too small buffer");

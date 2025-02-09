@@ -13,14 +13,7 @@ pub struct UtpMessage {
 
 impl std::fmt::Debug for UtpMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{:?}:seq_nr={}:ack_nr={}:wnd_size={}",
-            self.header.get_type(),
-            self.header.seq_nr,
-            self.header.ack_nr,
-            self.header.wnd_size,
-        )?;
+        write!(f, "{}", self.header.short_repr())?;
         if cfg!(test) {
             write!(
                 f,
