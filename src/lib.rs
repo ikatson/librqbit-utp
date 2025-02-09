@@ -1,14 +1,3 @@
-// TODO: maybe send immediate ACKs before processing the whole loop?
-// TODO: send ACKs when someone redelivers a packet that we have seen already, in case they lost the previous ACK
-
-// TODO: redeliver FIN-ACKs if they were not received. Also may re-send the last control packet (or even the last packet) if
-// failed sending, but break the poll loop.
-
-// TODO: When someone connects to us and doesn't send anything - we keep sending STATE every 200ms forever. But need to die.
-
-// (Done) TODO: in case the other end doesn't answer we need to stop the dispatcher. Otherwise it'll leak memory.
-// currently, only if we send the whole tx queue we check if it's dead or not and transition to FIN.
-
 // RTT, RTO, congestion
 // Recent RFCs that we might try to implement exactly to make everyting super explicit
 // RFC 9293 https://datatracker.ietf.org/doc/html/rfc9293 (TCP) (2022, standard)
@@ -17,27 +6,7 @@
 //
 // rfc8985 (draft, 2021) - RACK algorithm
 
-// (partly done) TODO: I don't like the timer logic - it's too complex and thus probably buggy. Rewrite it.
-
-// TODO: uTP socket death
-// if main socket dies
-// - scream about it
-// - test: error all subsequent accept() and connect() attempts
-// - test: drop all outstanding accepts() and connects()
-
-// TODO: flow control
-// - test it
-//   - ensure the user gets all neded messages even if it was blocked for a while
-// - test: ensure the user gets a fin
-//
-// TODO: Initial SYN - keep resending it with increasing delay. This would probably require refactoring SYN
-// into the VirtualSocket state machine (like smoltcp), cause otherwise it'll get nasty.
-// Although we could just send it in a loop with connect() like every second or so no problem;
-// With jitter though! Not to flood all at the same time.
-//
 // TODO: LEDBAT congestion control
-//
-// TODO: built-in connection timeouts?
 
 #[macro_use]
 mod macros;

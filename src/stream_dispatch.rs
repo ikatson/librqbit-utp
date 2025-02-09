@@ -870,7 +870,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         %self.last_consumed_remote_seq_nr,
                         "dropping message, we already ACKed it"
                     );
-                    self.force_immedate_ack();
+                    METRICS.incoming_already_acked_data_packets.increment(1);
+                    self.force_immediate_ack();
                     return Ok(on_ack_result);
                 }
 
@@ -933,7 +934,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         immediate_ack_to_transmit = self.immediate_ack_to_transmit(),
                         "forcing immediate ACK"
                     );
-                    self.force_immedate_ack();
+                    self.force_immediate_ack();
                 }
             }
             ST_STATE => {
@@ -987,7 +988,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     debug!("remote closed with {close_reason:?}");
                 }
 
-                self.force_immedate_ack();
+                self.force_immediate_ack();
 
                 if !previously_seen_remote_fin {
                     self.last_consumed_remote_seq_nr = hdr.seq_nr;
@@ -1033,7 +1034,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 >= IMMEDIATE_ACK_EVERY_RMSS * self.socket_opts.max_incoming_payload_size.get()
     }
 
-    fn force_immedate_ack(&mut self) {
+    fn force_immediate_ack(&mut self) {
         self.consumed_but_unacked_bytes =
             IMMEDIATE_ACK_EVERY_RMSS * self.socket_opts.max_incoming_payload_size.get();
     }

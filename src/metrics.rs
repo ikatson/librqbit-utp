@@ -28,6 +28,7 @@ pub struct Metrics {
     pub sent_bytes: Counter,
     pub sent_control_packets: Counter,
     pub unsent_control_packets: Counter,
+    pub incoming_already_acked_data_packets: Counter,
 }
 
 impl Metrics {
@@ -55,6 +56,9 @@ impl Metrics {
             sent_control_packets: counter!("utp_sent_control_packets"),
             unsent_control_packets: counter!("utp_unsent_control_packets"),
             immediate_acks: counter!("utp_immediate_acks"),
+            incoming_already_acked_data_packets: counter!(
+                "utp_incoming_already_acked_data_packets"
+            ),
             delayed_acks: counter!("utp_delayed_acks"),
             inactivity_timeouts: counter!("utp_inactivity_timeouts"),
             synack_retransmissions: counter!("utp_synack_retransmissions"),
