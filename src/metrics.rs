@@ -24,6 +24,7 @@ pub struct Metrics {
     pub send_errors: Counter,
     pub send_poll_pending: Counter,
     pub send_window_exhausted: Counter,
+    pub max_retransmissions_reached: Counter,
     pub sent_bytes: Counter,
     pub sent_control_packets: Counter,
     pub unsent_control_packets: Counter,
@@ -57,6 +58,7 @@ impl Metrics {
             delayed_acks: counter!("utp_delayed_acks"),
             inactivity_timeouts: counter!("utp_inactivity_timeouts"),
             synack_retransmissions: counter!("utp_synack_retransmissions"),
+            max_retransmissions_reached: counter!("utp_max_retransmissions_reached"),
         }
     }
 }

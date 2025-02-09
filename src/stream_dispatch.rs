@@ -287,12 +287,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             if item.retransmit_count() == self.socket_opts.max_segment_retransmissions.get() {
+                METRICS.max_retransmissions_reached.increment(1);
                 anyhow::bail!("max number of retransmissions reached");
             }
 
             if recv_wnd < item.payload_size() {
                 METRICS.send_window_exhausted.increment(1);
-                debug!("remote recv window exhausted, not sending anything");
+                debug_every_ms!(100, "remote recv window exhausted, not sending anything");
                 break;
             }
 
