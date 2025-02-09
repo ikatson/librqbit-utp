@@ -70,8 +70,12 @@ enum VirtualSocketState {
 }
 
 impl VirtualSocketState {
-    fn is_closed(&self) -> bool {
-        matches!(self, VirtualSocketState::Closed)
+    fn is_closed(&self, wait_for_last_ack: bool) -> bool {
+        match self {
+            VirtualSocketState::Closed => true,
+            VirtualSocketState::LastAck { .. } if !wait_for_last_ack => true,
+            _ => false,
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -616,6 +620,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
     }
 
+    fn state_is_closed(&self) -> bool {
+        self.state.is_closed(self.socket_opts.wait_for_last_ack)
+    }
+
     fn process_all_incoming_messages(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -645,7 +653,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             };
             on_ack_result.update(&self.process_incoming_message(cx, msg)?);
-            if self.state.is_closed() {
+            if self.state_is_closed() {
                 break;
             }
         }
@@ -804,6 +812,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 trace!("state: fin-wait-1 -> fin-wait-2");
                 self.timers.remote_inactivity_timer = None;
                 self.state = FinWait2;
+                if hdr.htype == ST_STATE && hdr.seq_nr - self.last_consumed_remote_seq_nr == 1 {
+                    // some clients sends back FIN + ACK as STATE with seq_nr + 1. This is proably one of them.
+                    trace!("treating ST_STATE as FIN");
+                    self.state = Closed;
+                }
             }
             (FinWait1 { .. }, ST_DATA | ST_STATE) => {}
             (FinWait2, ST_FIN) => {
@@ -1156,7 +1169,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .is_some_and(|expires| expires <= self.this_poll.now)
             {
                 METRICS.inactivity_timeouts.increment(1);
-                let err = anyhow::anyhow!("remote was inactive for too long");
+                let err =
+                    anyhow::anyhow!("remote was inactive for too long. state: {:?}", self.state);
                 self.just_before_death(cx, Some(&err));
                 return Poll::Ready(Err(err));
             }
@@ -1181,7 +1195,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             pending_if_cannot_send!(self.maybe_send_ack(cx, socket));
 
             // Quit normally if both sides sent FIN and ACKed each other.
-            if self.state.is_closed() {
+            if self.state_is_closed() {
                 self.just_before_death(cx, None);
                 return Poll::Ready(Ok(()));
             }

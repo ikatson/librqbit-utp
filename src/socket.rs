@@ -104,6 +104,9 @@ pub struct SocketOpts {
     pub remote_inactivity_timeout: Option<Duration>,
 
     pub max_active_streams: Option<usize>,
+
+    // If true, will wait for ACK of FIN.
+    pub dont_wait_for_lastack: bool,
 }
 
 impl SocketOpts {
@@ -193,6 +196,7 @@ impl SocketOpts {
             max_active_streams: self
                 .max_active_streams
                 .unwrap_or(DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET),
+            wait_for_last_ack: !self.dont_wait_for_lastack,
         })
     }
 }
@@ -212,6 +216,8 @@ pub(crate) struct ValidatedSocketOpts {
 
     pub remote_inactivity_timeout: Duration,
     pub max_active_streams: usize,
+
+    pub wait_for_last_ack: bool,
 }
 
 pub(crate) struct RequestWithSpan<V> {
