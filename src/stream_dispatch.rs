@@ -530,8 +530,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(());
         }
 
-        if self.state.is_remote_fin_or_later() || self.state.is_local_fin_or_later() {
-            trace!("there is still unsent data, but we are closed, so not segmenting further");
+        if self.state.is_remote_fin_or_later() {
+            debug!("there is still unsent data, but the remote closed, so not segmenting further");
             return Ok(());
         }
 
