@@ -2,6 +2,7 @@ use std::{
     collections::{hash_map::Entry, VecDeque},
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
+    os::fd::{AsRawFd, FromRawFd},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -81,6 +82,10 @@ pub struct SocketOpts {
     /// If MTU is not provided, this address will be used to detect MTU
     /// once.
     pub mtu_autodetect_host: Option<IpAddr>,
+
+    /// If set will try to send SO_RCVBUF option on the socket.
+    /// If not set, will use OS default.
+    pub udp_socket_rx_bufsize_bytes: Option<usize>,
 
     /// For flow control, if the user isn't reading, when to start dropping packets.
     pub vsock_rx_bufsize_bytes: Option<usize>,
@@ -726,6 +731,23 @@ impl UtpSocketUdp {
         let sock = tokio::net::UdpSocket::bind(bind_addr)
             .await
             .context("error binding")?;
+
+        if let Some(so_recvbuf) = opts.udp_socket_rx_bufsize_bytes {
+            let raw_fd = sock.as_raw_fd();
+            let s = unsafe { socket2::Socket::from_raw_fd(raw_fd) };
+            if let Err(e) = s.set_recv_buffer_size(so_recvbuf) {
+                warn!(so_recvbuf, "couldn't set UDP socket recv buf size: {e:#}");
+            } else {
+                let current = s.recv_buffer_size();
+                debug!(
+                    requested = so_recvbuf,
+                    ?current,
+                    "set UDP socket recv buf size"
+                );
+            }
+            std::mem::forget(s);
+        }
+
         Self::new_with_opts(sock, Default::default(), opts)
     }
 }

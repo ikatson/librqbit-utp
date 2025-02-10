@@ -642,6 +642,7 @@ dependencies = [
  "rand",
  "ringbuf",
  "rustc-hash 2.1.0",
+ "socket2",
  "tokio",
  "tokio-util",
  "tracing",
