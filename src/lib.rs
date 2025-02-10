@@ -31,7 +31,7 @@ mod traits;
 mod utils;
 
 pub use socket::{CongestionConfig, CongestionControllerKind, SocketOpts, UtpSocket, UtpSocketUdp};
-pub use stream::{UtpStream, UtpStreamUdp};
+pub use stream::UtpStream;
 pub use traits::Transport;
 
 type Payload = Vec<u8>;

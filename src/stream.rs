@@ -4,8 +4,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::{stream_rx::UtpStreamReadHalf, stream_tx::UtpStreamWriteHalf};
 
-pub type UtpStreamUdp = UtpStream;
-
 pub struct UtpStream {
     reader: UtpStreamReadHalf,
     writer: UtpStreamWriteHalf,

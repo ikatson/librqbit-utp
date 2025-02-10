@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{bail, Context};
-use librqbit_utp::{CongestionConfig, SocketOpts, UtpSocket, UtpStreamUdp};
+use librqbit_utp::{CongestionConfig, SocketOpts, UtpSocket, UtpStream};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -15,7 +15,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const PRINT_INTERVAL: Duration = Duration::from_secs(1);
 const BUFFER_SIZE: usize = 16384; // 16KB buffer
 
-async fn sender(mut stream: UtpStreamUdp) -> anyhow::Result<()> {
+async fn sender(mut stream: UtpStream) -> anyhow::Result<()> {
     let mut buffer = vec![0u8; BUFFER_SIZE];
     rand::thread_rng().fill(buffer.as_mut_slice());
 
@@ -28,7 +28,7 @@ async fn sender(mut stream: UtpStreamUdp) -> anyhow::Result<()> {
     }
 }
 
-async fn receiver(mut stream: UtpStreamUdp) -> anyhow::Result<()> {
+async fn receiver(mut stream: UtpStream) -> anyhow::Result<()> {
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut total_bytes = 0u64;
     let start = Instant::now();

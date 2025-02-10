@@ -7,7 +7,8 @@ use std::{
 use anyhow::{bail, Context};
 use futures::FutureExt;
 pub use librqbit_utp::UtpSocket;
-use librqbit_utp::UtpStreamUdp;
+
+use librqbit_utp::UtpStream;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     time::timeout,
@@ -29,7 +30,7 @@ async fn flatten<JoinError>(
     }
 }
 
-async fn echo(stream: UtpStreamUdp) -> anyhow::Result<()> {
+async fn echo(stream: UtpStream) -> anyhow::Result<()> {
     let (reader, writer) = stream.split();
 
     let mut reader = reader;
