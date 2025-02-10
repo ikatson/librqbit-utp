@@ -75,37 +75,48 @@ impl CongestionConfig {
 
 #[derive(Debug, Default, Clone)]
 pub struct SocketOpts {
-    // The MTU to base calculations on.
+    /// The MTU to base calculations on. If not provided, will auto-detect.
     pub mtu: Option<usize>,
 
-    // If MTU is not provided, this address will be used to detect MTU
-    // once.
+    /// If MTU is not provided, this address will be used to detect MTU
+    /// once.
     pub mtu_autodetect_host: Option<IpAddr>,
 
-    // For flow control, if the user isn't reading, when to start dropping packets.
-    pub rx_bufsize: Option<usize>,
+    /// For flow control, if the user isn't reading, when to start dropping packets.
+    pub vsock_rx_bufsize_bytes: Option<usize>,
+    /// How many bytes to allocate for each virtual socket's TX.
+    pub vsock_tx_bufsize_bytes: Option<usize>,
 
-    // How many out-of-order packets to track in the RX window.
+    /// How many out-of-order packets to track in the RX window.
     pub max_rx_out_of_order_packets: Option<usize>,
 
-    // How many bytes to allocate for each virtual socket's TX.
-    pub tx_bytes: Option<usize>,
-
-    // Disable Nagle's algorithm
+    /// Disable Nagle's algorithm
     pub disable_nagle: bool,
 
+    /// Congestion control configuration.
     pub congestion: CongestionConfig,
 
+    /// The parent span for spawned tokio tasks. If not provided, will use
+    /// root span.
     pub parent_span: Option<tracing::Id>,
+
+    /// If provided, this can be used to abruptly terminate all spawned tasks.
     pub cancellation_token: CancellationToken,
 
-    pub max_segment_retransmissions: Option<NonZeroUsize>,
+    /// How many times to retry retransmitting a packet before terminating
+    /// the virtual socket.
+    pub max_retransmissions: Option<NonZeroUsize>,
 
+    /// How many seconds to wait for incoming data
+    /// before terminating the connection.
     pub remote_inactivity_timeout: Option<Duration>,
 
-    pub max_active_streams: Option<usize>,
+    /// How many virtual sockets to have at the same time. Each vsock consumes
+    /// resources (memory, tokio tasks).
+    pub max_live_vsocks: Option<usize>,
 
-    // If true, will wait for ACK of FIN.
+    /// If true, will wait for ACK of FIN. By default we don't wait
+    /// as it's not required for torrents.
     pub dont_wait_for_lastack: bool,
 }
 
@@ -164,9 +175,11 @@ impl SocketOpts {
             }
         };
 
-        let max_user_rx_buffered_bytes =
-            NonZeroUsize::new(self.rx_bufsize.unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK))
-                .context("max_user_rx_buffered_bytes = 0. Increase rx_bufsize")?;
+        let max_user_rx_buffered_bytes = NonZeroUsize::new(
+            self.vsock_rx_bufsize_bytes
+                .unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK),
+        )
+        .context("max_user_rx_buffered_bytes = 0. Increase rx_bufsize")?;
 
         let max_rx_out_of_order_packets = NonZeroUsize::new(
             self.max_rx_out_of_order_packets
@@ -174,9 +187,11 @@ impl SocketOpts {
         )
         .context("invalid configuration: virtual_socket_tx_packets = 0")?;
 
-        let virtual_socket_tx_bytes =
-            NonZeroUsize::new(self.tx_bytes.unwrap_or(DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK))
-                .context("invalid configuration: virtual_socket_tx_bytes = 0")?;
+        let virtual_socket_tx_bytes = NonZeroUsize::new(
+            self.vsock_tx_bufsize_bytes
+                .unwrap_or(DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK),
+        )
+        .context("invalid configuration: virtual_socket_tx_bytes = 0")?;
 
         Ok(ValidatedSocketOpts {
             max_incoming_packet_size: incoming.max_packet_size,
@@ -188,13 +203,13 @@ impl SocketOpts {
             nagle: !self.disable_nagle,
             congestion: self.congestion,
             max_segment_retransmissions: self
-                .max_segment_retransmissions
+                .max_retransmissions
                 .unwrap_or(NonZeroUsize::new(5).unwrap()),
             remote_inactivity_timeout: self
                 .remote_inactivity_timeout
                 .unwrap_or(DEFAULT_REMOTE_INACTIVITY_TIMEOUT),
             max_active_streams: self
-                .max_active_streams
+                .max_live_vsocks
                 .unwrap_or(DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET),
             wait_for_last_ack: !self.dont_wait_for_lastack,
         })

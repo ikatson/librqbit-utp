@@ -1375,7 +1375,7 @@ async fn test_flow_control() {
     // Configure socket with small buffers to test flow control
     let opts = SocketOpts {
         mtu: Some(5 + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
-        rx_bufsize: Some(25), // Small receive buffer (~5 packets of size 5)
+        vsock_rx_bufsize_bytes: Some(25), // Small receive buffer (~5 packets of size 5)
         max_rx_out_of_order_packets: Some(5), // Small assembly queue
         ..Default::default()
     };
@@ -1438,7 +1438,7 @@ async fn test_data_integrity_manual_packets() {
 
     let mut t = make_test_vsock(
         SocketOpts {
-            rx_bufsize: Some(DATA_SIZE),
+            vsock_rx_bufsize_bytes: Some(DATA_SIZE),
             ..Default::default()
         },
         false,
@@ -1834,7 +1834,7 @@ async fn test_window_update_sent_when_window_less_than_mss() {
     // Configure socket with small but non-zero receive buffer
     let mss = 5;
     let opts = SocketOpts {
-        rx_bufsize: Some(mss * 2),
+        vsock_rx_bufsize_bytes: Some(mss * 2),
         mtu: Some(mss + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
         ..Default::default()
     };
@@ -1895,7 +1895,7 @@ async fn test_window_update_ack_after_read_with_waking() {
     // Configure socket with very small receive buffer to test flow control
     let mss = 5;
     let opts = SocketOpts {
-        rx_bufsize: Some(mss * 2),
+        vsock_rx_bufsize_bytes: Some(mss * 2),
         mtu: Some(mss + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
         ..Default::default()
     };
