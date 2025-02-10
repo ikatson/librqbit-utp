@@ -17,9 +17,9 @@ use crate::utils::{fill_buffer_from_slices, update_optional_waker};
 
 pub struct UserTxLocked {
     // Set when stream dies abruptly for writer to know about it.
-    pub mark_vsock_closed: bool,
+    pub vsock_closed: bool,
     // When the writer shuts down, or both reader and writer die, the stream is closed.
-    closed: bool,
+    writer_closed: bool,
 
     buffer: ringbuf::LocalRb<Heap<u8>>,
 
@@ -68,16 +68,16 @@ impl UserTxLocked {
     }
 
     fn mark_vsock_closed(&mut self) {
-        self.mark_vsock_closed = true;
+        self.vsock_closed = true;
         if let Some(waker) = self.buffer_has_space.take() {
             waker.wake();
         }
     }
 
     pub fn close(&mut self) {
-        if !self.closed {
+        if !self.writer_closed {
             trace!("closing writer");
-            self.closed = true;
+            self.writer_closed = true;
             if let Some(w) = self.buffer_has_data.take() {
                 w.wake();
             }
@@ -97,14 +97,14 @@ impl UserTx {
                 buffer_has_space: None,
                 buffer_has_data: None,
                 buffer_flushed: None,
-                mark_vsock_closed: false,
-                closed: false,
+                vsock_closed: false,
+                writer_closed: false,
             }),
         })
     }
 
     pub fn is_closed(&self) -> bool {
-        self.locked.lock().closed
+        self.locked.lock().writer_closed
     }
 
     pub fn mark_vsock_closed(&self) {
@@ -154,11 +154,11 @@ impl AsyncWrite for UtpStreamWriteHalf {
 
         let mut g = this.user_tx.locked.lock();
 
-        if g.mark_vsock_closed {
+        if g.vsock_closed {
             return Poll::Ready(Err(std::io::Error::other("socket closed")));
         }
 
-        if g.closed {
+        if g.writer_closed {
             return Poll::Ready(Err(std::io::Error::other(
                 "shutdown was initiated, can't write",
             )));
@@ -187,12 +187,12 @@ impl AsyncWrite for UtpStreamWriteHalf {
     ) -> Poll<Result<(), std::io::Error>> {
         let mut g = self.user_tx.locked.lock();
 
-        if g.mark_vsock_closed {
-            return Poll::Ready(Err(std::io::Error::other("socket died")));
-        }
-
         if g.buffer.is_empty() {
             return Poll::Ready(Ok(()));
+        }
+
+        if g.vsock_closed {
+            return Poll::Ready(Err(std::io::Error::other("socket died")));
         }
 
         update_optional_waker(&mut g.buffer_flushed, cx);
