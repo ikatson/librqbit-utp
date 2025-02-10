@@ -9,7 +9,14 @@ repository = "https://github.com/ikatson/librqbit-utp"
 readme = "README.md"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "sync", "time", "io-util", "rt"] }
+tokio = { version = "1", features = [
+    "net",
+    "sync",
+    "time",
+    "io-util",
+    "rt",
+    "macros",
+] }
 anyhow = "1.0.95"
 rand = "0.8.5"
 tracing = "0.1.41"
