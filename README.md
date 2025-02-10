@@ -1,4 +1,4 @@
-# **WORK IN PROGRESS** librqbit-utp
+# librqbit-utp
 
 A uTP library in Rust inspired by (and much copy-pasted from!) awesome [smoltcp](https://github.com/smoltcp-rs/smoltcp)
 
