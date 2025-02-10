@@ -2,6 +2,11 @@
 name = "librqbit-utp"
 version = "0.1.0"
 edition = "2021"
+description = "uTP (uTorrent Transport Protocol) library, implements BEP 29"
+license = "Apache-2.0"
+documentation = "https://docs.rs/librqbit-utp"
+repository = "https://github.com/ikatson/librqbit-utp"
+readme = "README.md"
 
 [dependencies]
 tokio = { version = "1", features = ["net", "sync", "time", "io-util", "rt"] }
@@ -11,7 +16,6 @@ tracing = "0.1.41"
 parking_lot = "0.12.3"
 mtu = "0.2.4"
 bitvec = "1.0.1"
-futures = "*"
 rustc-hash = "2.1.0"
 tokio-util = "0.7.13"
 ringbuf = "0.4.7"
@@ -21,9 +25,9 @@ socket2 = "0.5.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tracing-subscriber = "*"
-futures = "*"
+tracing-subscriber = "0.3"
 metrics-exporter-prometheus = "0.16.2"
+futures = "0.3"
 
 [profile.release]
 panic = "abort"

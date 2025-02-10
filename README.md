@@ -4,7 +4,7 @@ A uTP library in Rust inspired by (and much copy-pasted from!) awesome [smoltcp]
 
 Intended for use in [rqbit](https://github.com/ikatson/rqbit) torrent client.
 
-See example usage in [examples](https://github.com/ikatson/librqbit-utp/blob/main/examples/echo.rs).
+See example usage in [examples](https://github.com/ikatson/librqbit-utp/blob/main/examples/echo_minimal.rs).
 
 ## Run example
 
