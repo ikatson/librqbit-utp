@@ -1312,7 +1312,7 @@ impl StreamArgs {
             next_seq_nr,
             // The connecting client will send the next ST_DATA packet with seq_nr + 1.
             last_consumed_remote_seq_nr: remote_syn.seq_nr,
-            last_sent_seq_nr: next_seq_nr - 1,
+            last_sent_seq_nr: next_seq_nr,
             last_sent_ack_nr: remote_syn.seq_nr,
 
             // For RTTE
