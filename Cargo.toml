@@ -35,6 +35,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = "0.3"
 metrics-exporter-prometheus = "0.16.2"
 futures = "0.3"
+clap = { version = "4.5.29", features = ["derive"] }
+libutp-rs2 = { version = "0.1.0", path = "../libutp-rs-2/libutp-rs2" }
 
 [profile.release]
 panic = "abort"
