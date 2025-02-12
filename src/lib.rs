@@ -13,6 +13,8 @@ mod macros;
 
 mod congestion;
 mod constants;
+#[cfg(test)]
+mod e2e_tests;
 mod message;
 mod metrics;
 pub mod raw;
