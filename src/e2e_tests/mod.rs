@@ -11,7 +11,7 @@ use tokio::{
     time::timeout,
     try_join,
 };
-use tracing::info;
+use tracing::{error_span, info, Instrument};
 
 use crate::UtpSocketUdp;
 
@@ -60,8 +60,8 @@ async fn echo(
 ) -> anyhow::Result<()> {
     let mut reader = reader;
 
-    const MAX_COUNTER: u64 = 1_000_000;
-    const PRINT_EVERY: u64 = 100_000;
+    const MAX_COUNTER: u64 = 10_000;
+    const PRINT_EVERY: u64 = 1_000;
 
     let reader = async move {
         for expected in 0..=MAX_COUNTER {
@@ -98,7 +98,7 @@ async fn echo(
 }
 
 async fn test_one_echo<T1: AcceptConnect, T2: AcceptConnect>(port1: u16, port2: u16) {
-    tracing_subscriber::fmt().init();
+    tracing_subscriber::fmt::init();
 
     let addr1: SocketAddr = (Ipv4Addr::LOCALHOST, port1).into();
     let addr2: SocketAddr = (Ipv4Addr::LOCALHOST, port2).into();
@@ -107,25 +107,27 @@ async fn test_one_echo<T1: AcceptConnect, T2: AcceptConnect>(port1: u16, port2: 
         let s = T1::bind(addr1).await;
         let (r, w) = s.accept().await;
         echo(r, w).await.unwrap()
-    };
+    }
+    .instrument(error_span!("echo", port = port1));
 
     let t2 = async {
         let s = T2::bind(addr2).await;
         let (r, w) = s.connect(addr1).await;
         echo(r, w).await.unwrap()
-    };
+    }
+    .instrument(error_span!("echo", port = port2));
 
     tokio::join!(t1, t2);
 }
 
 #[tokio::test]
-async fn e2e_test_librqbit_utp_client_libutp_rs2_server() {
-    test_one_echo::<Arc<crate::UtpSocketUdp>, Arc<libutp_rs2::UtpUdpContext>>(8530, 8531).await;
+async fn e2e_test_librqbit_utp_client_librqbit_utp_server() {
+    test_one_echo::<Arc<crate::UtpSocketUdp>, Arc<crate::UtpSocketUdp>>(8532, 8533).await;
 }
 
 #[tokio::test]
-async fn e2e_test_librqbit_utp_client_librqbit_utp_server() {
-    test_one_echo::<Arc<crate::UtpSocketUdp>, Arc<crate::UtpSocketUdp>>(8532, 8533).await;
+async fn e2e_test_librqbit_utp_client_libutp_rs2_server() {
+    test_one_echo::<Arc<crate::UtpSocketUdp>, Arc<libutp_rs2::UtpUdpContext>>(8530, 8531).await;
 }
 
 #[tokio::test]

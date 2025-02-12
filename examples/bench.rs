@@ -13,6 +13,7 @@ use tokio::{
     time::timeout,
 };
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum Mode {
@@ -233,8 +234,11 @@ impl BenchArgs {
 }
 
 fn main() -> anyhow::Result<()> {
-    let args = BenchArgs::parse();
-    tracing_subscriber::fmt().init();
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
+    tracing_subscriber::fmt::init();
 
+    let args = BenchArgs::parse();
     args.run().context("error running bench")
 }

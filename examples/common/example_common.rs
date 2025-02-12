@@ -95,8 +95,8 @@ pub async fn echo(
 ) -> anyhow::Result<()> {
     let mut reader = reader;
 
-    const MAX_COUNTER: u64 = 1_000_000;
-    const PRINT_EVERY: u64 = 100_000;
+    const MAX_COUNTER: u64 = 10_000;
+    const PRINT_EVERY: u64 = 1_000;
 
     let reader = async move {
         for expected in 0..=MAX_COUNTER {
@@ -139,118 +139,5 @@ pub async fn flatten<JoinError>(
         Ok(Ok(result)) => Ok(result),
         Ok(Err(err)) => Err(err),
         Err(_) => bail!("joining failed"),
-    }
-}
-
-pub fn bench_main(
-    run_server: impl FnOnce(SocketAddr) -> anyhow::Result<()>,
-    run_client: impl FnOnce(SocketAddr) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-
-    let server_addr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 8002);
-
-    // Check command line arguments
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        // If no arguments, spawn both client and server processes
-        let server_child = std::process::Command::new(&args[0])
-            .arg("server")
-            .spawn()
-            .context("Failed to spawn server process")?;
-
-        // Wait a bit for the server to start
-        std::thread::sleep(Duration::from_millis(500));
-
-        let client_child = std::process::Command::new(&args[0])
-            .arg("client")
-            .spawn()
-            .context("Failed to spawn client process")?;
-
-        // Wait for both processes to complete
-        server_child.wait_with_output()?;
-        client_child.wait_with_output()?;
-
-        Ok(())
-    } else {
-        match args[1].as_str() {
-            "server" => run_server(server_addr).context("server error"),
-            "client" => run_client(server_addr).context("client error"),
-            _ => bail!("Invalid argument. Use 'server' or 'client'"),
-        }
-    }
-}
-
-pub async fn bench_main_async<Listener, ListenerFut, Reader, Client, ClientFut, Writer>(
-    listener: Listener,
-    client: Client,
-) -> anyhow::Result<()>
-where
-    Listener: FnOnce(SocketAddr) -> ListenerFut,
-    ListenerFut: Future<Output = anyhow::Result<Reader>>,
-    Reader: AsyncRead + Unpin,
-    Client: FnOnce(SocketAddr) -> ClientFut,
-    ClientFut: Future<Output = anyhow::Result<Writer>>,
-    Writer: AsyncWrite + Unpin,
-{
-    tracing_subscriber::fmt::init();
-
-    let sender_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 8001).into();
-    let sender_prometheus_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 9001).into();
-
-    let receiver_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 8002).into();
-    let receiver_prometheus_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 9002).into();
-
-    const SENDER: &str = "sender";
-    const RECEIVER: &str = "receiver";
-
-    // Check command line arguments
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        // If no arguments, spawn both client and server processes
-        let server_child = std::process::Command::new(&args[0])
-            .arg(RECEIVER)
-            .spawn()
-            .context("Failed to spawn server process")?;
-
-        // Wait a bit for the server to start
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        let client_child = std::process::Command::new(&args[0])
-            .arg(SENDER)
-            .spawn()
-            .context("Failed to spawn client process")?;
-
-        // Wait for both processes to complete
-        server_child.wait_with_output()?;
-        client_child.wait_with_output()?;
-
-        Ok(())
-    } else {
-        match args[1].as_str() {
-            RECEIVER => {
-                let builder = PrometheusBuilder::new().with_http_listener(receiver_prometheus_addr);
-                builder
-                    .install()
-                    .expect("failed to install recorder/exporter");
-                let sock = timeout(TIMEOUT, listener(receiver_addr))
-                    .await
-                    .context("timeout starting listener")?
-                    .context("error starting listener")?;
-                receiver_async(sock).await.context("error running receiver")
-            }
-            SENDER => {
-                let builder = PrometheusBuilder::new().with_http_listener(sender_prometheus_addr);
-                builder
-                    .install()
-                    .expect("failed to install recorder/exporter");
-                let sock = timeout(TIMEOUT, client(sender_addr))
-                    .await
-                    .context("timeout starting client")?
-                    .context("error starting client")?;
-                sender_async(sock).await.context("error running sender")
-            }
-            _ => bail!("Invalid argument. Use 'server' or 'client'"),
-        }
     }
 }

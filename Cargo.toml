@@ -32,7 +32,7 @@ socket2 = "0.5.8"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 metrics-exporter-prometheus = "0.16.2"
 futures = "0.3"
 clap = { version = "4.5.29", features = ["derive"] }
