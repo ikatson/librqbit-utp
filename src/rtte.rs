@@ -98,7 +98,7 @@ impl RttEstimator {
     }
 
     pub fn on_retransmit(&mut self) {
-        // rfc6298 section 5
+        // rfc6298 section 5.5
         match &mut self.state {
             RttState::Initial { rto } => {
                 *rto = clamp(*rto * 2);

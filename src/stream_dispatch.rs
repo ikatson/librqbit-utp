@@ -281,10 +281,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 continue;
             }
 
-            if item.retransmit_count() == self.socket_opts.max_segment_retransmissions.get() {
-                METRICS.max_retransmissions_reached.increment(1);
-                anyhow::bail!("max number of retransmissions reached");
-            }
+            // if item.retransmit_count() == self.socket_opts.max_segment_retransmissions.get() {
+            //     METRICS.max_retransmissions_reached.increment(1);
+            //     anyhow::bail!("max number of retransmissions reached");
+            // }
 
             if recv_wnd < item.payload_size() {
                 METRICS.send_window_exhausted.increment(1);
@@ -391,22 +391,22 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         // to be sent again.
         self.last_sent_seq_nr = rewind_to;
 
-        // Inform the congestion controller that we're retransmitting.
+        // Inform the congestion controller and RTTE that we're retransmitting.
         if !matches!(reason, ShouldRetransmitReason::FastRetransmit) {
             self.congestion_controller
                 .on_rto_timeout(self.this_poll.now);
+
+            // Inform RTTE to become more conservative.
+            log_before_and_after_if_changed(
+                "rtte:on_retransmit",
+                &mut self.rtte,
+                |r| r.roundtrip_time_estimate(),
+                |r| r.on_retransmit(),
+                |_, _| CONGESTION_TRACING_LOG_LEVEL,
+            );
         }
 
         self.timers.retransmit.set_for_idle();
-
-        // Inform RTTE to become more conservative.
-        log_before_and_after_if_changed(
-            "rtte:on_retransmit",
-            &mut self.rtte,
-            |r| r.roundtrip_time_estimate(),
-            |r| r.on_retransmit(),
-            |_, _| CONGESTION_TRACING_LOG_LEVEL,
-        );
     }
 
     fn on_packet_sent(&mut self, header: &UtpHeader) {
