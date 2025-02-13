@@ -42,28 +42,19 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VirtualSocketState {
     SynReceived,
-    SynAckSent {
-        seq_nr: SeqNr,
-        expires_at: Instant,
-        count: usize,
-    },
+    SynAckSent { expires_at: Instant, count: usize },
 
     Established,
 
     // We sent FIN, not yet ACKed
-    FinWait1 {
-        our_fin: SeqNr,
-    },
+    FinWait1 { our_fin: SeqNr },
 
     // Our fin was ACKed
     FinWait2,
 
     // Both sides closed, we are waiting for final ACK.
     // After this we just kill the socket.
-    LastAck {
-        our_fin: SeqNr,
-        remote_fin: SeqNr,
-    },
+    LastAck { our_fin: SeqNr, remote_fin: SeqNr },
 
     // We are fully done, no more packets to be sent or received.
     Closed,
@@ -165,7 +156,15 @@ struct VirtualSocket<T, Env> {
     last_remote_timestamp: u32,
     last_remote_window: u32,
 
-    // The last seq_nr we told the other end about.
+    // The seq_nr to use in outgoing packets. It gets incremented AFTER the
+    // following cases:
+    // 1. Initial SYN is sent.
+    // 2. ST_DATA is sent
+    // 3. ST_FIN is sent.
+    seq_nr: SeqNr,
+
+    // This is used to rewind state back for retransmission.
+    // All packets after this number will get resent (ST_DATA, ST_FIN).
     last_sent_seq_nr: SeqNr,
 
     // Last remote sequence number that we fully processed.
@@ -239,7 +238,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         header.timestamp_difference_microseconds = header
             .timestamp_microseconds
             .wrapping_sub(self.last_remote_timestamp);
-        header.seq_nr = self.last_sent_seq_nr;
+        header.seq_nr = self.seq_nr;
         header.ack_nr = self.last_consumed_remote_seq_nr;
         header.wnd_size = self.rx_window();
         header
@@ -274,8 +273,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         // Send only the stuff we haven't sent yet, up to sender's window.
         for mut item in self.user_tx_segments.iter_mut() {
-            // Re-delivery - don't send until retransmission happens (it will rewind elf.last_sent_seq_nr).
-            let already_sent = item.seq_nr() - self.last_sent_seq_nr <= 0;
+            // Re-delivery - don't send until retransmission happens (it will rewind self.last_sent_seq_nr).
+            let already_sent = item.seq_nr() <= self.last_sent_seq_nr;
             if already_sent {
                 recv_wnd = recv_wnd.saturating_sub(item.payload_size());
                 continue;
@@ -327,6 +326,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             item.on_sent(self.this_poll.now);
+            self.last_sent_seq_nr = item.seq_nr();
+            self.seq_nr = item.seq_nr() + 1;
 
             recv_wnd = recv_wnd.saturating_sub(item.payload_size());
 
@@ -420,7 +421,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
     fn on_packet_sent(&mut self, header: &UtpHeader) {
         // Each packet sent can act as ACK so update related state.
-        self.last_sent_seq_nr = header.seq_nr;
         self.last_sent_ack_nr = header.ack_nr;
         self.last_sent_window = header.wnd_size;
         self.consumed_but_unacked_bytes = 0;
@@ -612,7 +612,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if error.is_some() && !self.state.is_local_fin_or_later() {
             let mut fin = self.outgoing_header();
             fin.set_type(Type::ST_FIN);
-            fin.seq_nr = self.user_tx_segments.next_seq_nr();
+            fin.seq_nr = self.seq_nr;
+            self.seq_nr += 1;
             if let Some(socket) = self.socket.upgrade() {
                 if let Err(e) = self.send_control_packet(cx, &socket, fin) {
                     debug!("error sending FIN: {e:#}")
@@ -760,8 +761,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (SynReceived, _) => {
                 bail!("bug: unexpected packet in SynReceived state. We should have sent the SYN-ACK first.")
             }
-            (SynAckSent { seq_nr, .. }, ST_DATA | ST_STATE) => {
-                if hdr.ack_nr != seq_nr - 1 {
+            (SynAckSent { .. }, ST_DATA | ST_STATE) => {
+                if hdr.ack_nr != self.seq_nr - 1 {
                     trace!("dropping packet, we expected a different ack_nr");
                     return Ok(Default::default());
                 }
@@ -791,7 +792,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             (Established, ST_FIN) => {
                 trace!("state: established -> last-ack");
-                let our_fin = self.user_tx_segments.next_seq_nr();
+                let our_fin = self.seq_nr;
+                self.seq_nr += 1;
                 self.state = LastAck {
                     our_fin,
                     remote_fin: hdr.seq_nr,
@@ -1082,26 +1084,25 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         cx: &mut std::task::Context<'_>,
         socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<()> {
-        let (synack_seq_nr, count) = match self.state {
-            VirtualSocketState::SynReceived => (self.last_sent_seq_nr, 0),
-            VirtualSocketState::SynAckSent {
-                seq_nr,
-                expires_at,
-                count,
-            } if expires_at < self.this_poll.now => (seq_nr, count),
+        let sent_count = match self.state {
+            VirtualSocketState::SynReceived => 0,
+            VirtualSocketState::SynAckSent { expires_at, count }
+                if expires_at < self.this_poll.now =>
+            {
+                count
+            }
             _ => return Ok(()),
         };
-        if count == self.socket_opts.max_segment_retransmissions.get() {
+        if sent_count == self.socket_opts.max_segment_retransmissions.get() {
             bail!("too many syn-acks sent")
         }
         if self.send_ack(cx, socket)? {
             self.state = VirtualSocketState::SynAckSent {
-                seq_nr: synack_seq_nr,
                 expires_at: self.this_poll.now + SYNACK_RESEND_INTERNAL,
-                count: count + 1,
+                count: sent_count + 1,
             };
 
-            if count > 0 {
+            if sent_count > 0 {
                 METRICS.synack_retransmissions.increment(1);
             }
             self.timers.arm_in(cx, SYNACK_RESEND_INTERNAL);
@@ -1115,8 +1116,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self,
             |s| s.state,
             |s| {
-                s.state
-                    .transition_to_fin_sent(s.user_tx_segments.next_seq_nr())
+                if s.state.transition_to_fin_sent(s.seq_nr) {
+                    s.seq_nr += 1;
+                }
             },
             |_, _| Level::DEBUG,
         );
@@ -1254,7 +1256,7 @@ pub struct StreamArgs {
     conn_id_send: SeqNr,
     last_remote_timestamp: u32,
 
-    next_seq_nr: SeqNr,
+    seq_nr: SeqNr,
     last_sent_seq_nr: SeqNr,
     last_consumed_remote_seq_nr: SeqNr,
     last_sent_ack_nr: SeqNr,
@@ -1280,7 +1282,7 @@ impl StreamArgs {
             remote_window: remote_ack.wnd_size,
 
             // The next ST_DATA must be +1 from initial SYN.
-            next_seq_nr: remote_ack.ack_nr + 1,
+            seq_nr: remote_ack.ack_nr + 1,
             last_sent_seq_nr: remote_ack.ack_nr,
 
             // On connect, the client sends a number that represents the next ST_DATA number.
@@ -1303,10 +1305,10 @@ impl StreamArgs {
             last_remote_timestamp: remote_syn.timestamp_microseconds,
             remote_window: 0, // remote_syn.wnd_size should be 0 anyway. We can't send anything first.
 
-            next_seq_nr,
+            seq_nr: next_seq_nr,
+            last_sent_seq_nr: next_seq_nr - 1,
             // The connecting client will send the next ST_DATA packet with seq_nr + 1.
             last_consumed_remote_seq_nr: remote_syn.seq_nr,
-            last_sent_seq_nr: next_seq_nr - 1,
             last_sent_ack_nr: remote_syn.seq_nr,
 
             // For RTTE
@@ -1354,7 +1356,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             conn_id_recv,
             conn_id_send,
             last_remote_timestamp,
-            next_seq_nr,
+            seq_nr,
             last_sent_seq_nr,
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
@@ -1402,12 +1404,13 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             },
             last_remote_timestamp,
             last_remote_window: remote_window,
+            seq_nr,
             last_sent_seq_nr,
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
             consumed_but_unacked_bytes: 0,
             rx,
-            user_tx_segments: Segments::new(next_seq_nr),
+            user_tx_segments: Segments::new(seq_nr),
             local_rx_last_ack: None,
             local_rx_dup_acks: 0,
             user_tx,

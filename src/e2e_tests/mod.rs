@@ -13,7 +13,7 @@ use tokio::{
 };
 use tracing::{error_span, info, Instrument};
 
-use crate::UtpSocketUdp;
+use crate::{test_util::setup_test_logging, UtpSocketUdp};
 
 trait AcceptConnect {
     async fn bind(addr: SocketAddr) -> Self;
@@ -98,7 +98,7 @@ async fn echo(
 }
 
 async fn test_one_echo<T1: AcceptConnect, T2: AcceptConnect>(port1: u16, port2: u16) {
-    tracing_subscriber::fmt::init();
+    setup_test_logging();
 
     let addr1: SocketAddr = (Ipv4Addr::LOCALHOST, port1).into();
     let addr2: SocketAddr = (Ipv4Addr::LOCALHOST, port2).into();

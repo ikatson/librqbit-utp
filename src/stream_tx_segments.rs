@@ -143,10 +143,10 @@ impl Segments {
         }
     }
 
-    // Named like in rfc9293 SND.NEXT
-    pub fn next_seq_nr(&self) -> SeqNr {
-        self.snd_una + self.segments.len() as u16
-    }
+    // // Named like in rfc9293 SND.NEXT
+    // pub fn next_seq_nr(&self) -> SeqNr {
+    //     self.snd_una + self.segments.len() as u16
+    // }
 
     pub fn first_seq_nr(&self) -> Option<SeqNr> {
         if self.segments.is_empty() {

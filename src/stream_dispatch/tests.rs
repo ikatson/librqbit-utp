@@ -161,7 +161,7 @@ async fn test_delayed_ack_sent_once() {
         UtpHeader {
             htype: ST_DATA,
             seq_nr: 1.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             ..Default::default()
         },
         "hello",
@@ -209,7 +209,7 @@ async fn test_doesnt_send_until_window_updated() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -248,7 +248,7 @@ async fn test_sends_up_to_remote_window_only_single_msg() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: 4,
             ..Default::default()
         },
@@ -288,7 +288,7 @@ async fn test_sends_up_to_remote_window_only_multi_msg() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             // This is enough to send "hello" in 3 messages
             wnd_size: 5,
             ..Default::default()
@@ -366,7 +366,7 @@ async fn test_fast_retransmit() {
     let mut ack = UtpHeader {
         htype: ST_STATE,
         seq_nr: 0.into(),
-        ack_nr: t.vsock.last_sent_seq_nr,
+        ack_nr: t.vsock.seq_nr,
         wnd_size: 1024,
         ..Default::default()
     };
@@ -432,7 +432,7 @@ async fn test_no_writes_allowed_after_explicit_shutdown() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -487,7 +487,7 @@ async fn test_flush_works() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -596,7 +596,7 @@ async fn test_out_of_order_delivery() {
         UtpHeader {
             htype: ST_DATA,
             seq_nr: 3.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             ..Default::default()
         },
         "test!",
@@ -617,7 +617,7 @@ async fn test_out_of_order_delivery() {
         UtpHeader {
             htype: ST_DATA,
             seq_nr: 1.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             ..Default::default()
         },
         "hello",
@@ -649,7 +649,7 @@ async fn test_nagle_algorithm() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -734,7 +734,7 @@ async fn test_resource_cleanup_both_sides_dropped_normally() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -797,7 +797,7 @@ async fn test_resource_cleanup_both_sides_dropped_abruptly() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -831,7 +831,7 @@ async fn test_resource_cleanup_with_pending_data() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -908,7 +908,7 @@ async fn test_sender_flow_control() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: 5, // Only allow 5 bytes
             ..Default::default()
         },
@@ -984,7 +984,7 @@ async fn test_sender_flow_control() {
 
     // Verify total data sent matches original write
     assert_eq!(
-        t.vsock.user_tx_segments.next_seq_nr(),
+        t.vsock.seq_nr,
         104.into(),
         "Should have split data into correct number of packets"
     );
@@ -1000,7 +1000,7 @@ async fn test_zero_window_handling() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: 5,
             ..Default::default()
         },
@@ -1080,7 +1080,7 @@ async fn test_congestion_control_basics() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: remote_wnd, // Large window to not interfere with congestion control
             ..Default::default()
         },
@@ -1320,7 +1320,7 @@ async fn test_finack_not_sent_until_all_data_consumed() {
     let mut header = UtpHeader {
         htype: ST_DATA,
         seq_nr: 2.into(),
-        ack_nr: t.vsock.last_sent_seq_nr,
+        ack_nr: t.vsock.seq_nr,
         wnd_size: 1024,
         ..Default::default()
     };
@@ -1386,9 +1386,9 @@ async fn test_flow_control() {
 
     // Test assembly queue limit first
     // Send packets out of order to fill assembly queue
-    t.send_data(3, t.vsock.last_sent_seq_nr, "third"); // Out of order
-    t.send_data(4, t.vsock.last_sent_seq_nr, "fourth"); // Out of order
-    t.send_data(6, t.vsock.last_sent_seq_nr, "sixth"); // Should be dropped - assembly queue full
+    t.send_data(3, t.vsock.seq_nr, "third"); // Out of order
+    t.send_data(4, t.vsock.seq_nr, "fourth"); // Out of order
+    t.send_data(6, t.vsock.seq_nr, "sixth"); // Should be dropped - assembly queue full
 
     t.poll_once_assert_pending().await;
 
@@ -1396,7 +1396,7 @@ async fn test_flow_control() {
     assert_eq!(t.vsock.user_rx.assembler_packets(), 2);
 
     // Send in-order packet to trigger processing
-    t.send_data(1, t.vsock.last_sent_seq_nr, "first");
+    t.send_data(1, t.vsock.seq_nr, "first");
     t.poll_once_assert_pending().await;
 
     // Read available data
@@ -1406,7 +1406,7 @@ async fn test_flow_control() {
     // Now test user rx channel limit
     // Send several packets that exceed the rx buffer size
     for i in 6..15 {
-        t.send_data(i, t.vsock.last_sent_seq_nr, "data!");
+        t.send_data(i, t.vsock.seq_nr, "data!");
         t.poll_once_assert_pending().await;
     }
 
@@ -1421,7 +1421,7 @@ async fn test_flow_control() {
     assert!(window < 1024); // Window should be reduced
 
     // Send more data - should be dropped due to full rx buffer
-    t.send_data(15, t.vsock.last_sent_seq_nr, "dropped");
+    t.send_data(15, t.vsock.seq_nr, "dropped");
     t.poll_once_assert_pending().await;
 
     // Verify data was dropped
@@ -1455,7 +1455,7 @@ async fn test_data_integrity_manual_packets() {
     let mut header = UtpHeader {
         htype: ST_DATA,
         seq_nr: 0.into(),
-        ack_nr: t.vsock.last_sent_seq_nr,
+        ack_nr: t.vsock.seq_nr,
         wnd_size: 64 * 1024,
         ..Default::default()
     };
@@ -1499,7 +1499,7 @@ async fn test_retransmission_behavior() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -1606,7 +1606,7 @@ async fn test_selective_ack_retransmission() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -1691,7 +1691,7 @@ async fn test_st_reset_error_propagation() {
         UtpHeader {
             htype: ST_RESET,
             seq_nr: 1.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             ..Default::default()
         },
         "",
@@ -1723,7 +1723,7 @@ async fn test_fin_sent_when_both_halves_dropped() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
+            ack_nr: t.vsock.seq_nr,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -1811,7 +1811,7 @@ async fn test_fin_sent_when_reader_dead_first() {
     t.poll_once_assert_pending().await;
 
     // Remote sends some data - it should accumulate in OOQ, but be ACKed.
-    t.send_data(1, t.vsock.last_sent_seq_nr, "ignored data");
+    t.send_data(1, t.vsock.seq_nr, "ignored data");
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
 
@@ -1843,14 +1843,14 @@ async fn test_window_update_sent_when_window_less_than_mss() {
     assert_eq!(t.vsock.socket_opts.max_incoming_payload_size.get(), mss);
 
     // Fill buffer to just under MSS to get a small window
-    t.send_data(1, t.vsock.last_sent_seq_nr, "aaaaa");
+    t.send_data(1, t.vsock.seq_nr, "aaaaa");
     t.poll_once_assert_pending().await;
     // We shouldn't have registered the flush waker yet.
     assert!(!t.vsock.user_rx.is_flush_waker_registered());
     assert_eq!(t.take_sent(), Vec::<UtpMessage>::new());
 
     // Now the window should be less than MSS.
-    t.send_data(2, t.vsock.last_sent_seq_nr, "b");
+    t.send_data(2, t.vsock.seq_nr, "b");
     t.poll_once_assert_pending().await;
     assert!(t.vsock.user_rx.is_flush_waker_registered());
 
@@ -2662,6 +2662,7 @@ async fn test_sequence_numbers_incoming() {
         )]
     );
 
+    t.vsock.socket_opts.nagle = false;
     w.write_all(b"world").await.unwrap();
     t.poll_once_assert_pending().await;
     assert_eq!(
