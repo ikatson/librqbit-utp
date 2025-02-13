@@ -46,7 +46,6 @@ type StreamRecvKey = (SocketAddr, ConnectionId);
 
 #[derive(Debug, Default, Clone, Copy)]
 pub enum CongestionControllerKind {
-    Reno,
     #[default]
     Cubic,
 }
@@ -60,12 +59,9 @@ pub struct CongestionConfig {
 impl CongestionConfig {
     pub(crate) fn create(&self, now: Instant, rmss: usize) -> Box<dyn CongestionController> {
         use crate::congestion::cubic::Cubic;
-        use crate::congestion::reno::Reno;
         use crate::congestion::tracing::TracingController;
 
         match (self.kind, self.tracing) {
-            (CongestionControllerKind::Reno, true) => Box::new(TracingController::new(Reno::new())),
-            (CongestionControllerKind::Reno, false) => Box::new(Reno::new()),
             (CongestionControllerKind::Cubic, true) => {
                 Box::new(TracingController::new(Cubic::new(now, rmss)))
             }
