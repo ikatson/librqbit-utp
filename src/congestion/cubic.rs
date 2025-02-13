@@ -20,6 +20,7 @@ pub struct Cubic {
 
     k: f64, // CUBIC: time required to get to w_max
     w_max: f64,
+    w_max_last: f64, // fast convergence https://datatracker.ietf.org/doc/html/rfc8312#section-4.6
 
     mss: usize,
     last_congestion_event: Instant,
@@ -54,6 +55,7 @@ impl Cubic {
 
             k: 0.,
             w_max: 0.,
+            w_max_last: 0.,
             last_congestion_event: now,
 
             rwnd: 0.,
@@ -75,10 +77,19 @@ impl CongestionController for Cubic {
 
     fn on_triple_duplicate_ack(&mut self, now: Instant) {
         self.w_max = self.cwnd;
-        self.k = calc_k(self.w_max);
         self.ssthresh = (self.cwnd * BETA_CUBIC).max(2.);
         self.cwnd *= BETA_CUBIC;
         self.last_congestion_event = now;
+
+        // Fast convergence https://datatracker.ietf.org/doc/html/rfc8312#section-4.6
+        if self.w_max < self.w_max_last {
+            self.w_max_last = self.w_max;
+            self.w_max *= (1. + BETA_CUBIC) / 2.;
+        } else {
+            self.w_max_last = self.w_max;
+        }
+
+        self.k = calc_k(self.w_max);
     }
 
     fn on_ack(&mut self, now: Instant, len: usize, rtte: &RttEstimator) {
