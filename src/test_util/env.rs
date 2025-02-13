@@ -35,6 +35,12 @@ pub struct MockUtpEnvironment {
     inner: Arc<Mutex<MockUtpEnvironmentInner>>,
 }
 
+impl Default for MockUtpEnvironment {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockUtpEnvironment {
     pub fn new() -> Self {
         Self {

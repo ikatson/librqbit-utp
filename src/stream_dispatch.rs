@@ -1083,7 +1083,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<()> {
         let (synack_seq_nr, count) = match self.state {
-            VirtualSocketState::SynReceived => (self.user_tx_segments.next_seq_nr(), 0),
+            VirtualSocketState::SynReceived => (self.last_sent_seq_nr, 0),
             VirtualSocketState::SynAckSent {
                 seq_nr,
                 expires_at,
@@ -1094,10 +1094,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if count == self.socket_opts.max_segment_retransmissions.get() {
             bail!("too many syn-acks sent")
         }
-        let mut syn_ack = self.outgoing_header();
-        let last_sent_seq_nr = self.last_sent_seq_nr;
-        syn_ack.seq_nr = synack_seq_nr;
-        if self.send_control_packet(cx, socket, syn_ack)? {
+        if self.send_ack(cx, socket)? {
             self.state = VirtualSocketState::SynAckSent {
                 seq_nr: synack_seq_nr,
                 expires_at: self.this_poll.now + SYNACK_RESEND_INTERNAL,
@@ -1107,9 +1104,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if count > 0 {
                 METRICS.synack_retransmissions.increment(1);
             }
-
-            // restore last_sent_seq_nr
-            self.last_sent_seq_nr = last_sent_seq_nr;
             self.timers.arm_in(cx, SYNACK_RESEND_INTERNAL);
         }
         Ok(())
@@ -1312,7 +1306,7 @@ impl StreamArgs {
             next_seq_nr,
             // The connecting client will send the next ST_DATA packet with seq_nr + 1.
             last_consumed_remote_seq_nr: remote_syn.seq_nr,
-            last_sent_seq_nr: next_seq_nr,
+            last_sent_seq_nr: next_seq_nr - 1,
             last_sent_ack_nr: remote_syn.seq_nr,
 
             // For RTTE

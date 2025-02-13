@@ -2608,3 +2608,115 @@ async fn test_write_fails_after_remote_fin_received() {
         .await
         .expect("connection should complete with Ok(())");
 }
+
+#[tokio::test]
+async fn test_sequence_numbers_incoming() {
+    // The sequence numbers for incoming connections don't make any sense unfortunately in the protocol,
+    // or its reference libutp implementation.
+    //
+    // Before we sent any data, we keep sending ST_STATE packets with seq_nr=NEXT,
+    // but the remote ACKs NEXT-1.
+    // Like WTF.
+    //
+    // After that all the other packets have the actual last sent data sequence number in there.
+
+    tracing_subscriber::fmt::init();
+    let mut t = make_test_vsock_args(
+        Default::default(),
+        StreamArgs::new_incoming(
+            31420.into(),
+            &UtpHeader {
+                htype: ST_SYN,
+                seq_nr: 15089.into(),
+                ack_nr: 0.into(),
+                ..Default::default()
+            },
+        ),
+        Default::default(),
+    );
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_STATE, seq_nr = 31420, ack_nr = 15089)]
+    );
+    // allow sending by setting the remote window
+    t.send_data(15090, 31419, "hello");
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_STATE, seq_nr = 31420, ack_nr = 15090)]
+    );
+
+    let (_r, mut w) = t.stream.take().unwrap().split();
+    w.write_all(b"hello").await.unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(
+            ST_DATA,
+            seq_nr = 31420,
+            ack_nr = 15090,
+            payload = "hello"
+        )]
+    );
+
+    w.write_all(b"world").await.unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(
+            ST_DATA,
+            seq_nr = 31421,
+            ack_nr = 15090,
+            payload = "world"
+        )]
+    );
+}
+
+#[tokio::test]
+async fn test_sequence_numbers_outgoing() {
+    // The same test as test_sequence_numbers_incoming but in reverse.
+
+    tracing_subscriber::fmt::init();
+    let env = MockUtpEnvironment::default();
+    let mut t = make_test_vsock_args(
+        Default::default(),
+        StreamArgs::new_outgoing(
+            &UtpHeader {
+                htype: ST_STATE,
+                seq_nr: 31420.into(),
+                ack_nr: 15089.into(),
+                wnd_size: 1024 * 1024,
+                ..Default::default()
+            },
+            env.now(),
+            env.now(),
+        ),
+        Default::default(),
+    );
+    let (_r, mut w) = t.stream.take().unwrap().split();
+    w.write_all(b"hello").await.unwrap();
+
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_DATA, seq_nr = 15090, ack_nr = 31419)]
+    );
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            seq_nr: 31420.into(),
+            ack_nr: 15090.into(),
+            wnd_size: 1024 * 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.send_data(31420, 15090, "hello");
+    t.send_data(31421, 15090, "world");
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_STATE, seq_nr = 15091, ack_nr = 31421)]
+    )
+}
