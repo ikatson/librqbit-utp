@@ -6,7 +6,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use example_common::{echo, receiver_async, sender_async, TIMEOUT};
+use example_common::{bench_receiver, bench_sender, echo, TIMEOUT};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
@@ -102,7 +102,7 @@ impl BenchArgs {
             }
             Program::Bench => {
                 info!("starting receiver");
-                receiver_async(r).await
+                bench_receiver(r).await
             }
         }
     }
@@ -121,7 +121,7 @@ impl BenchArgs {
             }
             Program::Bench => {
                 info!("starting sender");
-                sender_async(w).await
+                bench_sender(w).await
             }
         }
     }

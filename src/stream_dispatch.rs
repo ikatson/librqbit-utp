@@ -1156,7 +1156,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // (Re)send tx queue.
             pending_if_cannot_send!(self.send_tx_queue(cx));
 
-            if self.user_rx.is_reader_closed() && self.user_tx.is_writer_closed() {
+            if (self.user_rx.is_reader_dropped() && self.user_tx.is_writer_dropped())
+                || self.user_tx.is_writer_shutdown()
+            {
                 self.transition_to_fin_sent();
             }
 

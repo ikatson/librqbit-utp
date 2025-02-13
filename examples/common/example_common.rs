@@ -19,7 +19,7 @@ pub const TIMEOUT: Duration = Duration::from_secs(5);
 const PRINT_INTERVAL: Duration = Duration::from_secs(1);
 const BUFFER_SIZE: usize = 16384;
 
-pub async fn receiver_async(mut stream: impl AsyncRead + Unpin) -> anyhow::Result<()> {
+pub async fn bench_receiver(mut stream: impl AsyncRead + Unpin) -> anyhow::Result<()> {
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let mut total_bytes = 0u64;
     let start = Instant::now();
@@ -43,7 +43,7 @@ pub async fn receiver_async(mut stream: impl AsyncRead + Unpin) -> anyhow::Resul
     }
 }
 
-pub async fn sender_async(mut stream: impl AsyncWrite + Unpin) -> anyhow::Result<()> {
+pub async fn bench_sender(mut stream: impl AsyncWrite + Unpin) -> anyhow::Result<()> {
     let mut buffer = vec![0u8; BUFFER_SIZE];
     rand::thread_rng().fill(buffer.as_mut_slice());
 
@@ -52,39 +52,6 @@ pub async fn sender_async(mut stream: impl AsyncWrite + Unpin) -> anyhow::Result
             Ok(Ok(())) => {}
             Ok(Err(e)) => bail!("Error writing: {}", e),
             Err(_) => bail!("Timeout while writing"),
-        }
-    }
-}
-
-pub fn sender_sync(mut stream: impl Write) -> anyhow::Result<()> {
-    let mut buffer = vec![0u8; BUFFER_SIZE];
-    rand::thread_rng().fill(buffer.as_mut_slice());
-
-    loop {
-        stream.write_all(&buffer)?;
-    }
-}
-
-pub fn receiver_sync(mut stream: impl Read) -> anyhow::Result<()> {
-    let mut buffer = vec![0u8; BUFFER_SIZE];
-    let mut total_bytes = 0u64;
-    let start = Instant::now();
-    let mut last_print = start;
-
-    loop {
-        match stream.read(&mut buffer) {
-            Ok(0) => bail!("Connection closed by peer"),
-            Ok(received) => {
-                total_bytes += received as u64;
-                let now = Instant::now();
-                if now.duration_since(last_print) >= PRINT_INTERVAL {
-                    let elapsed = now.duration_since(start).as_secs_f64();
-                    let speed = (total_bytes as f64) / (1024.0 * 1024.0) / elapsed;
-                    info!("Receiving speed: {:.2} MB/s", speed);
-                    last_print = now;
-                }
-            }
-            Err(e) => bail!("Error reading: {}", e),
         }
     }
 }
@@ -115,8 +82,7 @@ pub async fn echo(
                 info!("current counter {current}");
             }
         }
-        #[allow(unreachable_code)]
-        Ok::<_, anyhow::Error>(())
+        Ok(reader)
     };
 
     let writer = async move {
@@ -130,21 +96,36 @@ pub async fn echo(
         Ok(writer)
     };
 
-    let (_, mut writer) = try_join!(reader, writer)?;
+    let (mut reader, mut writer) = try_join!(reader, writer)?;
+
     // Ensure we got everything sent and ACKed. Otherwise we'll quit and tokio will die killing everything in the
     // process before we were able to send it all.
-    let shutdown_result = timeout(TIMEOUT, writer.shutdown())
+    if let Err(e) = timeout(TIMEOUT, writer.shutdown())
         .await
-        .context("timeout shutting down")?;
-
-    if let Err(e) = shutdown_result {
+        .context("timeout shutting down")?
+    {
         // libutp2-rs doesn't implement shutdown, so if it errored, just wait a bit, that's all we can do.
         if e.to_string().contains("not implemented") {
+            // Ensure it sends everything
             tokio::time::sleep(Duration::from_millis(500)).await;
+            timeout(TIMEOUT, writer.shutdown())
+                .await
+                .context("timeout shutting down")?
+                .context("error shutting down for the second time")?;
         } else {
             return Err(e).context("error shutting down");
         }
     }
+
+    let len = timeout(TIMEOUT, reader.read(&mut [0u8; 8192]))
+        .await
+        .context("timeout checking for EOF")?
+        .context("expected to read EOF")?;
+    if len != 0 {
+        bail!("read unexpected {len} bytes at the end")
+    }
+
+    info!("echo completed successfully");
     Ok(())
 }
 

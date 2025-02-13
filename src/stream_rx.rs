@@ -153,7 +153,7 @@ impl AsyncRead for UtpStreamReadHalf {
                     }
                 }
             } else {
-                if g.writer_dead {
+                if g.vsock_closed {
                     dispatcher_dead = true;
                 } else {
                     update_optional_waker(&mut g.reader_waker, cx);
@@ -190,8 +190,8 @@ struct BeingRead {
 }
 
 struct UserRxSharedLocked {
-    reader_dead: bool,
-    writer_dead: bool,
+    reader_dropped: bool,
+    vsock_closed: bool,
     queue: MsgQueue,
     dispatcher_waker: Option<Waker>,
     reader_waker: Option<Waker>,
@@ -204,7 +204,7 @@ struct UserRxShared {
 impl Drop for UtpStreamReadHalf {
     fn drop(&mut self) {
         let mut g = self.shared.locked.lock();
-        g.reader_dead = true;
+        g.reader_dropped = true;
         let waker = g.dispatcher_waker.take();
         drop(g);
         if let Some(waker) = waker {
@@ -215,13 +215,7 @@ impl Drop for UtpStreamReadHalf {
 
 impl Drop for UserRx {
     fn drop(&mut self) {
-        let mut g = self.shared.locked.lock();
-        g.writer_dead = true;
-        let waker = g.reader_waker.take();
-        drop(g);
-        if let Some(waker) = waker {
-            waker.wake();
-        }
+        self.mark_vsock_closed();
     }
 }
 
@@ -250,8 +244,8 @@ impl UserRx {
                 dispatcher_waker: None,
                 reader_waker: None,
                 queue: MsgQueue::new(max_rx_bytes.get()),
-                reader_dead: false,
-                writer_dead: false,
+                reader_dropped: false,
+                vsock_closed: false,
             }),
         });
         let read_half = UtpStreamReadHalf {
@@ -269,12 +263,12 @@ impl UserRx {
         (write_half, read_half)
     }
 
-    pub fn is_reader_closed(&self) -> bool {
-        self.shared.locked.lock().reader_dead
+    pub fn is_reader_dropped(&self) -> bool {
+        self.shared.locked.lock().reader_dropped
     }
 
     pub fn remaining_rx_window(&self) -> usize {
-        if self.is_reader_closed() {
+        if self.is_reader_dropped() {
             0
         } else {
             self.last_remaining_rx_window
@@ -283,8 +277,16 @@ impl UserRx {
     }
 
     pub fn mark_vsock_closed(&self) {
-        // nothing here
-        // keeping this function to be consistent with UserTx
+        let mut g = self.shared.locked.lock();
+        if !g.vsock_closed {
+            trace!("user_rx: marking vsock closed");
+            g.vsock_closed = true;
+            let waker = g.reader_waker.take();
+            drop(g);
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
     }
 
     pub fn flush(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<usize> {
@@ -305,7 +307,7 @@ impl UserRx {
 
         while let Some(len) = self.ooq.send_front_if_fits(remaining_rx_window, |msg| {
             let mut g = self.shared.locked.lock();
-            if g.reader_dead {
+            if g.reader_dropped {
                 debug_every_ms!(5000, "reader is dead, could not send UtpMesage to it");
                 return Err(msg);
             }

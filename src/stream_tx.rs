@@ -18,8 +18,11 @@ use crate::utils::{fill_buffer_from_slices, update_optional_waker};
 pub struct UserTxLocked {
     // Set when stream dies abruptly for writer to know about it.
     pub vsock_closed: bool,
-    // When the writer shuts down, or both reader and writer die, the stream is closed.
-    writer_closed: bool,
+    // When the writer drops this is set to true.
+    writer_dropped: bool,
+
+    // When the writer calls shutdown, this is set to true.
+    writer_shutdown: bool,
 
     buffer: ringbuf::LocalRb<Heap<u8>>,
 
@@ -70,10 +73,10 @@ impl UserTxLocked {
         }
     }
 
-    fn mark_writer_closed(&mut self) -> bool {
-        if !self.writer_closed {
+    fn mark_writer_dropped(&mut self) -> bool {
+        if !self.writer_dropped {
             trace!("closing writer");
-            self.writer_closed = true;
+            self.writer_dropped = true;
             if let Some(w) = self.dispatcher_waker.take() {
                 w.wake();
             }
@@ -96,13 +99,18 @@ impl UserTx {
                 dispatcher_waker: None,
                 writer_waker: None,
                 vsock_closed: false,
-                writer_closed: false,
+                writer_dropped: false,
+                writer_shutdown: false,
             }),
         })
     }
 
-    pub fn is_writer_closed(&self) -> bool {
-        self.locked.lock().writer_closed
+    pub fn is_writer_dropped(&self) -> bool {
+        self.locked.lock().writer_dropped
+    }
+
+    pub fn is_writer_shutdown(&self) -> bool {
+        self.locked.lock().writer_shutdown
     }
 
     pub fn mark_vsock_closed(&self) {
@@ -126,7 +134,7 @@ impl UtpStreamWriteHalf {
 
 impl Drop for UtpStreamWriteHalf {
     fn drop(&mut self) {
-        self.user_tx.locked.lock().mark_writer_closed();
+        self.user_tx.locked.lock().mark_writer_dropped();
     }
 }
 
@@ -152,7 +160,11 @@ impl AsyncWrite for UtpStreamWriteHalf {
             return Poll::Ready(Err(std::io::Error::other("socket closed")));
         }
 
-        if g.writer_closed {
+        if g.writer_shutdown {
+            return Poll::Ready(Err(std::io::Error::other("no writing after shutdown")));
+        }
+
+        if g.writer_dropped {
             return Poll::Ready(Err(std::io::Error::other(
                 "shutdown was initiated, can't write",
             )));
@@ -212,7 +224,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
             return Poll::Ready(Ok(()));
         }
 
-        g.mark_writer_closed();
+        g.writer_shutdown = true;
         update_optional_waker(&mut g.writer_waker, cx);
         Poll::Pending
     }
