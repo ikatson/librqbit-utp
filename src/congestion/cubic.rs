@@ -32,9 +32,10 @@ impl core::fmt::Debug for Cubic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cwnd={},sshthresh:{}",
+            "window={},cwnd={},sshthresh:{}",
             self.window(),
-            (self.ssthresh * self.mss as f64) as usize
+            self.cwnd,
+            self.ssthresh
         )
     }
 }
@@ -105,7 +106,7 @@ impl CongestionController for Cubic {
             }
         }
 
-        self.cwnd = self.cwnd.min(self.rwnd)
+        self.cwnd = self.cwnd.min(self.rwnd).max(2.)
     }
 
     fn set_remote_window(&mut self, win: usize) {
@@ -131,11 +132,21 @@ fn w_est(t: Duration, rtt: Duration, w_max_in_mss_units: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use approx::assert_abs_diff_eq;
+    use tracing::trace;
 
-    use crate::congestion::cubic::{calc_k, w_cubic, BETA_CUBIC};
+    use crate::{
+        congestion::{
+            cubic::{calc_k, w_cubic, BETA_CUBIC},
+            CongestionController,
+        },
+        rtte::RttEstimator,
+        test_util::setup_test_logging,
+    };
+
+    use super::Cubic;
 
     #[test]
     fn test_w_cubic_zero() {
@@ -148,5 +159,49 @@ mod tests {
                 epsilon = 0.01f64
             );
         }
+    }
+
+    #[test]
+    fn test_cubic_playground() {
+        setup_test_logging();
+        let mut now = Instant::now();
+        let rtt = Duration::from_millis(50);
+        let mut rtte = RttEstimator::default();
+        let mut cubic = Cubic::new(now, 1500);
+        cubic.set_remote_window(1024 * 1024);
+
+        dbg!(&cubic);
+
+        rtte.sample(rtt);
+
+        for _ in 0..50 {
+            now += rtt;
+            cubic.on_ack(now, 1500, &rtte);
+        }
+        trace!(?cubic, "cubic after 50 MSS packets");
+
+        now += rtt * 3;
+        cubic.on_triple_duplicate_ack(now);
+        trace!(?cubic, "cubic after triple duplicate acks");
+        // Pretend there was a fast retransmit here.
+
+        for _ in 0..500 {
+            now += rtt;
+            cubic.on_ack(now, 1500, &rtte);
+        }
+
+        trace!(?cubic, "cubic after 250 acked packets");
+
+        now += Duration::from_secs(1);
+        cubic.on_rto_timeout(now);
+
+        trace!(?cubic, "cubic after RTO");
+
+        for _ in 0..50 {
+            now += rtt;
+            cubic.on_ack(now, 1500, &rtte);
+        }
+
+        trace!(?cubic, "cubic after 50 acked packets");
     }
 }
