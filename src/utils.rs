@@ -2,7 +2,6 @@ use std::{cmp::Ordering, task::Waker};
 
 use anyhow::bail;
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
-use tracing::{error, info, trace, warn, Level};
 
 pub fn update_optional_waker(waker: &mut Option<Waker>, cx: &std::task::Context<'_>) {
     match waker.as_mut() {
@@ -145,39 +144,6 @@ pub fn run_before_and_after_if_changed<
     let after = calc(obj);
     if before != after {
         callback(obj, &before, &after);
-    }
-    result
-}
-
-#[inline(always)]
-pub fn log_before_and_after_if_changed<
-    'a,
-    Object: 'a,
-    Value: PartialEq + Copy + std::fmt::Debug + 'static,
-    ChangeResult,
->(
-    name: &'static str,
-    obj: &mut Object,
-    calc: impl Fn(&Object) -> Value,
-    maybe_change: impl FnOnce(&mut Object) -> ChangeResult,
-    calc_level: impl Fn(&Value, &Value) -> Level,
-) -> ChangeResult {
-    let before = calc(obj);
-    let result = maybe_change(obj);
-    let after = calc(obj);
-    if before != after {
-        let level = calc_level(&before, &after);
-        if level == Level::TRACE {
-            trace!(?before, ?after, "{name} changed");
-        } else if level == Level::DEBUG {
-            trace!(?before, ?after, "{name} changed");
-        } else if level == Level::INFO {
-            info!(?before, ?after, "{name} changed");
-        } else if level == Level::WARN {
-            warn!(?before, ?after, "{name} changed");
-        } else if level == Level::ERROR {
-            error!(?before, ?after, "{name} changed");
-        }
     }
     result
 }

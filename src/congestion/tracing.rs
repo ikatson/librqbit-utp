@@ -35,8 +35,7 @@ where
     }
 
     fn on_rto_timeout(&mut self, now: Instant) {
-        log_every_ms_if_changed!(
-            500,
+        log_if_changed!(
             CONGESTION_TRACING_LOG_LEVEL,
             "on_retransmit:cwnd",
             self,
@@ -46,8 +45,7 @@ where
     }
 
     fn on_triple_duplicate_ack(&mut self, now: Instant) {
-        log_every_ms_if_changed!(
-            500,
+        log_if_changed!(
             CONGESTION_TRACING_LOG_LEVEL,
             "on_duplicate_ack:cwnd",
             self,

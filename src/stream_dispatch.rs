@@ -33,7 +33,7 @@ use crate::{
     stream_tx::{UserTx, UtpStreamWriteHalf},
     stream_tx_segments::{OnAckResult, Segments},
     traits::{Transport, UtpEnvironment},
-    utils::{log_before_and_after_if_changed, update_optional_waker, DropGuardSendBeforeDeath},
+    utils::{update_optional_waker, DropGuardSendBeforeDeath},
     UtpSocket,
 };
 
@@ -397,12 +397,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .on_rto_timeout(self.this_poll.now);
 
             // Inform RTTE to become more conservative.
-            log_before_and_after_if_changed(
+            log_if_changed!(
+                CONGESTION_TRACING_LOG_LEVEL,
                 "rtte:on_retransmit",
                 &mut self.rtte,
                 |r| r.roundtrip_time_estimate(),
-                |r| r.on_retransmit(),
-                |_, _| CONGESTION_TRACING_LOG_LEVEL,
+                |r| r.on_retransmit()
             );
         }
 
@@ -640,13 +640,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     debug!("can't receive messages anymore. Transitioning to Closed");
                     self.transition_to_fin_sent();
                     self.maybe_send_fin(cx)?;
-                    log_before_and_after_if_changed(
-                        "state",
-                        self,
-                        |s| s.state,
-                        |s| s.state = VirtualSocketState::Closed,
-                        |_, _| Level::DEBUG,
-                    );
+                    log_if_changed!(Level::DEBUG, "state", self, |s| s.state, |s| s.state =
+                        VirtualSocketState::Closed);
                     return Ok(());
                 }
             };
@@ -680,12 +675,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // Update RTO and congestion controller.
             if let Some(rtt) = on_ack_result.new_rtt {
                 METRICS.rtt.record(rtt.as_secs_f64());
-                log_before_and_after_if_changed(
+                log_if_changed!(
+                    RTTE_TRACING_LOG_LEVEL,
                     "rtte:sample",
                     self,
                     |s| s.rtte.roundtrip_time_estimate(),
-                    |s| s.rtte.sample(rtt),
-                    |_, _| RTTE_TRACING_LOG_LEVEL,
+                    |s| s.rtte.sample(rtt)
                 );
             }
 
@@ -1096,17 +1091,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn transition_to_fin_sent(&mut self) {
-        log_before_and_after_if_changed(
-            "state",
-            self,
-            |s| s.state,
-            |s| {
-                if s.state.transition_to_fin_sent(s.seq_nr) {
-                    s.seq_nr += 1;
-                }
-            },
-            |_, _| Level::DEBUG,
-        );
+        log_if_changed!(Level::DEBUG, "state", self, |s| s.state, |s| {
+            if s.state.transition_to_fin_sent(s.seq_nr) {
+                s.seq_nr += 1;
+            }
+        });
     }
 
     fn poll(&mut self, cx: &mut std::task::Context<'_>) -> Poll<anyhow::Result<()>> {

@@ -56,6 +56,14 @@ macro_rules! log_every_ms_if_changed {
     };
 }
 
+macro_rules! log_if_changed {
+    ($level:expr, $name:expr, $obj:expr, $calc:expr, $maybe_change:expr) => {
+        crate::utils::run_before_and_after_if_changed($obj, $calc, $maybe_change, |_, before, after| {
+            tracing::event!($level, before=?before, after=?after, "{} changed", $name);
+        });
+    };
+}
+
 // Create a mock header that can be used to compare with others
 #[cfg(test)]
 macro_rules! cmphead {
