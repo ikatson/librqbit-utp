@@ -128,6 +128,8 @@ fn make_test_vsock_args(opts: SocketOpts, args: StreamArgs, env: MockUtpEnvironm
     }
 }
 
+// Remote's seq_nr == 1
+// Our seq_nr == 101
 fn make_test_vsock(opts: SocketOpts, is_incoming: bool) -> TestVsock {
     let env = MockUtpEnvironment::new();
     let args = if is_incoming {
@@ -135,7 +137,7 @@ fn make_test_vsock(opts: SocketOpts, is_incoming: bool) -> TestVsock {
             htype: ST_SYN,
             ..Default::default()
         };
-        StreamArgs::new_incoming(100.into(), &remote_syn)
+        StreamArgs::new_incoming(101.into(), &remote_syn)
     } else {
         let remote_ack = UtpHeader {
             htype: ST_STATE,
@@ -191,7 +193,7 @@ async fn test_doesnt_send_until_window_updated() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, ack_nr = 0)],
+        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 0)],
         "intial SYN-ACK should be sent"
     );
     assert_eq!(t.vsock.last_remote_window, 0);
@@ -209,7 +211,7 @@ async fn test_doesnt_send_until_window_updated() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: 100.into(),
             wnd_size: 1024,
             ..Default::default()
         },
@@ -248,7 +250,7 @@ async fn test_sends_up_to_remote_window_only_single_msg() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: 100.into(),
             wnd_size: 4,
             ..Default::default()
         },
@@ -258,7 +260,12 @@ async fn test_sends_up_to_remote_window_only_single_msg() {
 
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, ack_nr = 0, payload = "hell")]
+        vec![cmphead!(
+            ST_DATA,
+            seq_nr = 101,
+            ack_nr = 0,
+            payload = "hell"
+        )]
     );
 
     // Until window updates and/or we receive an ACK, we don't send anything
@@ -288,7 +295,7 @@ async fn test_sends_up_to_remote_window_only_multi_msg() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: 100.into(),
             // This is enough to send "hello" in 3 messages
             wnd_size: 5,
             ..Default::default()
@@ -299,9 +306,9 @@ async fn test_sends_up_to_remote_window_only_multi_msg() {
     assert_eq!(
         t.take_sent(),
         vec![
-            cmphead!(ST_DATA, seq_nr = 100, payload = "he"),
-            cmphead!(ST_DATA, seq_nr = 101, payload = "ll"),
-            cmphead!(ST_DATA, seq_nr = 102, payload = "o")
+            cmphead!(ST_DATA, seq_nr = 101, payload = "he"),
+            cmphead!(ST_DATA, seq_nr = 102, payload = "ll"),
+            cmphead!(ST_DATA, seq_nr = 103, payload = "o")
         ]
     );
 
@@ -366,7 +373,7 @@ async fn test_fast_retransmit() {
     let mut ack = UtpHeader {
         htype: ST_STATE,
         seq_nr: 0.into(),
-        ack_nr: t.vsock.seq_nr,
+        ack_nr: 99.into(),
         wnd_size: 1024,
         ..Default::default()
     };
@@ -588,7 +595,7 @@ async fn test_out_of_order_delivery() {
     // We should send an immediate ACK due to out-of-order delivery
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 100, ack_nr = 0)]
+        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 0)]
     );
 
     // Send seq 3
@@ -609,7 +616,7 @@ async fn test_out_of_order_delivery() {
     // Another immediate ACK due to out-of-order
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 100, ack_nr = 0)]
+        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 0)]
     );
 
     // Finally send seq 1
@@ -630,7 +637,7 @@ async fn test_out_of_order_delivery() {
     // And a final ACK for the in-order delivery
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 100, ack_nr = 3)]
+        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 3)]
     );
 }
 
@@ -831,7 +838,7 @@ async fn test_resource_cleanup_with_pending_data() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: 100.into(),
             wnd_size: 1024,
             ..Default::default()
         },
@@ -1079,8 +1086,8 @@ async fn test_congestion_control_basics() {
     t.send_msg(
         UtpHeader {
             htype: ST_STATE,
-            seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            seq_nr: 1.into(),
+            ack_nr: 99.into(),
             wnd_size: remote_wnd, // Large window to not interfere with congestion control
             ..Default::default()
         },
@@ -1128,7 +1135,7 @@ async fn test_congestion_control_basics() {
         t.send_msg(
             UtpHeader {
                 htype: ST_STATE,
-                seq_nr: 0.into(),
+                seq_nr: 1.into(),
                 ack_nr: *seq_nr,
                 wnd_size: remote_wnd,
                 ..Default::default()
@@ -1214,7 +1221,7 @@ async fn test_duplicate_ack_only_on_st_state() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: 100.into(),
+            ack_nr: 99.into(),
             wnd_size: 1024,
             ..Default::default()
         },
@@ -1325,13 +1332,12 @@ async fn test_finack_not_sent_until_all_data_consumed() {
         ..Default::default()
     };
 
-    header.seq_nr = 2.into();
     t.send_msg(header, "world");
     t.poll_once_assert_pending().await;
     assert!(!t.vsock.user_rx.assembler_empty());
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 100, ack_nr = 0)],
+        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 0)],
         "immediate ACK should have been sent"
     );
 
@@ -1351,7 +1357,7 @@ async fn test_finack_not_sent_until_all_data_consumed() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 100, ack_nr = 2)],
+        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 2)],
         "we should sent DATA ack as it was out of order"
     );
 
@@ -1382,13 +1388,16 @@ async fn test_flow_control() {
 
     let mut t = make_test_vsock(opts, true);
     t.poll_once_assert_pending().await;
-    assert_eq!(t.take_sent().len(), 1); // syn ack
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 0)]
+    ); // syn ack
 
     // Test assembly queue limit first
     // Send packets out of order to fill assembly queue
-    t.send_data(3, t.vsock.seq_nr, "third"); // Out of order
-    t.send_data(4, t.vsock.seq_nr, "fourth"); // Out of order
-    t.send_data(6, t.vsock.seq_nr, "sixth"); // Should be dropped - assembly queue full
+    t.send_data(3, 100, "third"); // Out of order
+    t.send_data(4, 100, "fourth"); // Out of order
+    t.send_data(6, 100, "sixth"); // Should be dropped - assembly queue full
 
     t.poll_once_assert_pending().await;
 
@@ -1858,7 +1867,7 @@ async fn test_window_update_sent_when_window_less_than_mss() {
         t.take_sent(),
         vec![cmphead!(
             ST_STATE,
-            seq_nr = 100,
+            seq_nr = 101,
             ack_nr = 2,
             wnd_size = 4u32
         )],
@@ -1880,7 +1889,7 @@ async fn test_window_update_sent_when_window_less_than_mss() {
         t.take_sent(),
         vec![cmphead!(
             ST_STATE,
-            seq_nr = 100,
+            seq_nr = 101,
             ack_nr = 2,
             wnd_size = 9u32
         )],
@@ -1904,11 +1913,10 @@ async fn test_window_update_ack_after_read_with_waking() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 100, ack_nr = 0)],
+        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 0)],
         "should have sent syn-ack"
     );
 
-    let ack_nr = 99.into();
     let connection_id = t.vsock.conn_id_send + 1;
     let make_msg = |seq_nr, payload| {
         make_msg(
@@ -1917,7 +1925,7 @@ async fn test_window_update_ack_after_read_with_waking() {
                 connection_id,
                 wnd_size: 1024 * 1024,
                 seq_nr,
-                ack_nr,
+                ack_nr: 100.into(),
                 ..Default::default()
             },
             payload,
@@ -1936,7 +1944,12 @@ async fn test_window_update_ack_after_read_with_waking() {
     let sent = t.transport.take_sent_utpmessages();
     assert_eq!(
         sent,
-        vec![cmphead!(ST_STATE, seq_nr = 99, ack_nr = 2, wnd_size = 0u32)],
+        vec![cmphead!(
+            ST_STATE,
+            seq_nr = 101,
+            ack_nr = 2,
+            wnd_size = 0u32
+        )],
         "should have sent zero-window ACK"
     );
 
@@ -1956,7 +1969,12 @@ async fn test_window_update_ack_after_read_with_waking() {
     let sent = t.transport.take_sent_utpmessages();
     assert_eq!(
         sent,
-        vec![cmphead!(ST_STATE, seq_nr = 99, ack_nr = 2, wnd_size = 5u32)],
+        vec![cmphead!(
+            ST_STATE,
+            seq_nr = 101,
+            ack_nr = 2,
+            wnd_size = 5u32
+        )],
         "should have sent zero-window ACK"
     );
 }
@@ -2082,7 +2100,7 @@ async fn test_inactivity_timeout_initial_synack() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 100, ack_nr = 0)],
+        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 0)],
         "Should send syn-ack"
     );
 
@@ -2252,7 +2270,7 @@ async fn test_wait_for_remote_fin_both_halves_dropped_quick_reply() {
     let result = t.poll_once().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 1)],
+        vec![cmphead!(ST_STATE, seq_nr = 102, ack_nr = 1)],
         "Should ACK remote FIN"
     );
     assert!(

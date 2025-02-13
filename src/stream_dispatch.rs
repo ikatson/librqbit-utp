@@ -1179,16 +1179,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             bail_if_err!(self.split_tx_queue_into_segments(cx));
 
-            if self.user_rx.is_closed() && self.user_tx.is_closed() {
-                self.transition_to_fin_sent();
-            }
-
             // If the retransmission timer expired and there's something to send,
             // set up state for retransmission.
             self.maybe_prepare_for_retransmission();
 
             // (Re)send tx queue.
             pending_if_cannot_send!(self.send_tx_queue(cx, socket));
+
+            if self.user_rx.is_closed() && self.user_tx.is_closed() {
+                self.transition_to_fin_sent();
+            }
 
             // (Re)send a pending FIN if needed.
             pending_if_cannot_send!(self.maybe_send_fin(cx, socket));
