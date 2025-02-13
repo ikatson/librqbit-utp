@@ -10,19 +10,14 @@ pub trait CongestionController: Send + Sync + core::fmt::Debug {
     /// Returns the number of bytes that can be sent.
     fn window(&self) -> usize;
 
-    /// Set the remote window size.
-    fn set_remote_window(&mut self, remote_window: usize);
-
+    /// Increase the window on ACK
     fn on_ack(&mut self, now: Instant, len: usize, rtt: &RttEstimator);
 
-    fn on_retransmit(&mut self, now: Instant);
+    // NOT fast retransmit
+    // flight_size per rfc5681
+    fn on_rto_timeout(&mut self, now: Instant);
 
-    fn on_duplicate_ack(&mut self, now: Instant);
+    fn on_triple_duplicate_ack(&mut self, now: Instant);
 
-    fn pre_transmit(&mut self, now: Instant);
-
-    // fn post_transmit(&mut self, now: Instant, len: usize) {}
-
-    /// Set the maximum segment size.
-    fn set_mss(&mut self, mss: usize);
+    fn set_remote_window(&mut self, win: usize);
 }

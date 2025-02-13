@@ -1,4 +1,7 @@
-use std::time::Instant;
+use std::{
+    f64,
+    time::{Duration, Instant},
+};
 
 use crate::rtte::RttEstimator;
 
@@ -11,324 +14,139 @@ const C: f64 = 0.4;
 
 #[derive(Clone, Copy)]
 pub struct Cubic {
-    cwnd: usize,     // Congestion window
-    min_cwnd: usize, // The minimum size of congestion window
-    w_max: usize,    // Window size just before congestion
-    recovery_start: Option<Instant>,
-    rwnd: usize, // Remote window
-    last_update: Instant,
-    ssthresh: usize,
+    // All wnd units are in mss, as per CUBIC
+    cwnd: f64,
+    ssthresh: f64,
+
+    k: f64, // CUBIC: time required to get to w_max
+    w_max: f64,
+
+    mss: usize,
+    last_congestion_event: Instant,
+
+    // Remote window. Limits the window size
+    rwnd: f64,
 }
 
 impl core::fmt::Debug for Cubic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cwnd={},w_max={},sshthresh:{}",
-            self.cwnd, self.w_max, self.ssthresh
+            "cwnd={},sshthresh:{}",
+            self.window(),
+            (self.ssthresh * self.mss as f64) as usize
         )
     }
 }
 
 impl PartialEq for Cubic {
     fn eq(&self, other: &Self) -> bool {
-        self.cwnd == other.cwnd && self.ssthresh == other.ssthresh && self.w_max == other.w_max
+        self.cwnd == other.cwnd && self.ssthresh == other.ssthresh
     }
 }
 
 impl Cubic {
-    pub fn new(now: Instant, rmss: usize) -> Cubic {
+    pub fn new(now: Instant, mss: usize) -> Cubic {
         Cubic {
-            cwnd: rmss * 2,
-            min_cwnd: rmss * 2,
-            w_max: rmss * 2,
-            recovery_start: None,
-            rwnd: 64 * 1024,
-            last_update: now,
-            ssthresh: usize::MAX,
+            cwnd: 2.,
+            ssthresh: f64::INFINITY,
+
+            k: 0.,
+            w_max: 0.,
+            last_congestion_event: now,
+
+            rwnd: 0.,
+            mss,
         }
     }
 }
 
 impl CongestionController for Cubic {
     fn window(&self) -> usize {
-        self.cwnd
+        (self.cwnd * self.mss as f64) as usize
     }
 
-    fn on_retransmit(&mut self, now: Instant) {
+    fn on_rto_timeout(&mut self, _now: Instant) {
+        // CUBIC https://datatracker.ietf.org/doc/html/rfc8312#section-4.7
+        self.ssthresh = (self.cwnd * BETA_CUBIC).max(2.);
+        self.cwnd = 1.
+    }
+
+    fn on_triple_duplicate_ack(&mut self, now: Instant) {
         self.w_max = self.cwnd;
-        self.ssthresh = self.cwnd >> 1;
-        self.recovery_start = Some(now);
+        self.k = calc_k(self.w_max);
+        self.ssthresh = (self.cwnd * BETA_CUBIC).max(2.);
+        self.cwnd *= BETA_CUBIC;
+        self.last_congestion_event = now;
     }
 
-    fn on_duplicate_ack(&mut self, now: Instant) {
-        self.w_max = self.cwnd;
-        self.ssthresh = self.cwnd >> 1;
-        self.recovery_start = Some(now);
-    }
-
-    fn set_remote_window(&mut self, remote_window: usize) {
-        if self.rwnd < remote_window {
-            self.rwnd = remote_window;
+    fn on_ack(&mut self, now: Instant, len: usize, rtte: &RttEstimator) {
+        if len == 0 {
+            return;
         }
-    }
 
-    fn on_ack(&mut self, _now: Instant, len: usize, _rtt: &RttEstimator) {
-        // Slow start.
         if self.cwnd < self.ssthresh {
-            self.cwnd = self
-                .cwnd
-                .saturating_add(len)
-                .min(self.rwnd)
-                .max(self.min_cwnd);
-        }
-    }
-
-    fn pre_transmit(&mut self, now: Instant) {
-        let Some(recovery_start) = self.recovery_start else {
-            // self.recovery_start = Some(now);
-            return;
-        };
-
-        // If the last update was less than 100ms ago, don't update the congestion window.
-        if self.last_update >= recovery_start && (now - self.last_update).as_millis() < 100 {
-            return;
-        }
-
-        // Elapsed time since the start of the recovery phase.
-        if now < recovery_start {
-            return;
-        }
-        let t = (now - recovery_start).as_millis();
-
-        // K = (w_max * (1 - beta) / C)^(1/3)
-        let k3 = ((self.w_max as f64) * (1.0 - BETA_CUBIC)) / C;
-        let k = if let Some(k) = cube_root(k3) {
-            k
+            // Slow start
+            self.cwnd += len as f64 / self.mss as f64;
         } else {
-            return;
-        };
+            // During congestion avoidance, window is computed using CUBIC. By the time we get here,
+            //
+            let t = now - self.last_congestion_event;
+            let w_cubic_v = w_cubic(t, self.k, self.w_max);
+            let rtt = rtte.roundtrip_time_estimate();
+            let w_est_v = w_est(t, rtt, self.w_max);
 
-        // cwnd = C(T - K)^3 + w_max
-        let s = t as f64 / 1000.0 - k;
-        let s = s * s * s;
-        let cwnd = C * s + self.w_max as f64;
+            if w_cubic_v < w_est_v {
+                // TCP friendly region
+                self.cwnd = w_est_v;
+            } else {
+                // Concave and convex regions
+                self.cwnd += (w_cubic(t + rtt, self.k, self.w_max) - self.cwnd) / self.cwnd;
+            }
+        }
 
-        self.last_update = now;
-
-        self.cwnd = (cwnd as usize).max(self.min_cwnd).min(self.rwnd);
+        self.cwnd = self.cwnd.min(self.rwnd)
     }
 
-    fn set_mss(&mut self, mss: usize) {
-        self.min_cwnd = mss;
+    fn set_remote_window(&mut self, win: usize) {
+        self.rwnd = win as f64 / self.mss as f64
     }
 }
 
-#[inline]
-fn abs(a: f64) -> f64 {
-    if a < 0.0 {
-        -a
-    } else {
-        a
-    }
+// K is the number of seconds required to get back to w_max.
+fn calc_k(w_max_in_mss_units: f64) -> f64 {
+    const FACTOR: f64 = (1. - BETA_CUBIC) / C;
+    (w_max_in_mss_units * FACTOR).cbrt()
 }
 
-/// Calculate cube root by using the Newton-Raphson method.
-fn cube_root(a: f64) -> Option<f64> {
-    if a <= 0.0 {
-        return None;
-    }
+fn w_cubic(t: Duration, k: f64, w_max_in_mss_units: f64) -> f64 {
+    C * (t.as_secs_f64() - k).powf(3.) + w_max_in_mss_units
+}
 
-    let (tolerance, init) = if a < 1_000.0 {
-        (1.0, 8.879040017426005) // cube_root(700.0)
-    } else if a < 1_000_000.0 {
-        (5.0, 88.79040017426004) // cube_root(700_000.0)
-    } else if a < 1_000_000_000.0 {
-        (50.0, 887.9040017426004) // cube_root(700_000_000.0)
-    } else if a < 1_000_000_000_000.0 {
-        (500.0, 8879.040017426003) // cube_root(700_000_000_000.0)
-    } else if a < 1_000_000_000_000_000.0 {
-        (5000.0, 88790.40017426001) // cube_root(700_000_000_000.0)
-    } else {
-        (50000.0, 887904.0017426) // cube_root(700_000_000_000_000.0)
-    };
-
-    let mut x = init; // initial value
-    let mut n = 20; // The maximum iteration
-    loop {
-        let next_x = (2.0 * x + a / (x * x)) / 3.0;
-        if abs(next_x - x) < tolerance {
-            return Some(next_x);
-        }
-        x = next_x;
-
-        if n == 0 {
-            return Some(next_x);
-        }
-
-        n -= 1;
-    }
+fn w_est(t: Duration, rtt: Duration, w_max_in_mss_units: f64) -> f64 {
+    // [3*(1-beta_cubic)/(1+beta_cubic)]
+    const FACTOR: f64 = 3. * (1. - BETA_CUBIC) / (1. + BETA_CUBIC); // 0.52
+    w_max_in_mss_units * BETA_CUBIC + FACTOR * (t.as_secs_f64() / rtt.as_secs_f64())
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use std::time::Duration;
 
-    use crate::rtte::RttEstimator;
+    use approx::assert_abs_diff_eq;
 
-    use super::*;
+    use crate::congestion::cubic::{calc_k, w_cubic, BETA_CUBIC};
 
     #[test]
-    fn test_cubic() {
-        let remote_window = 64 * 1024 * 1024;
-        let now = Instant::now();
-
-        for i in 0..10 {
-            for j in 0..9 {
-                let mut cubic = Cubic::new(now, 1024);
-                // Set remote window.
-                cubic.set_remote_window(remote_window);
-
-                cubic.set_mss(1480);
-
-                if i & 1 == 0 {
-                    cubic.on_retransmit(now);
-                } else {
-                    cubic.on_duplicate_ack(now);
-                }
-
-                cubic.pre_transmit(now);
-
-                let mut n = i;
-                for _ in 0..j {
-                    n *= i;
-                }
-
-                let elapsed = now + Duration::from_millis(n);
-                cubic.pre_transmit(elapsed);
-
-                let cwnd = cubic.window();
-                println!("Cubic: elapsed = {:?}, cwnd = {}", elapsed, cwnd);
-
-                assert!(cwnd >= cubic.min_cwnd);
-                assert!(cubic.window() <= remote_window);
-            }
+    fn test_w_cubic_zero() {
+        for w_max_mss in 0usize..=1000 {
+            let w_max_mss = w_max_mss as f64;
+            let k = calc_k(w_max_mss);
+            assert_abs_diff_eq!(
+                w_cubic(Duration::from_secs(0), k, w_max_mss),
+                w_max_mss * BETA_CUBIC,
+                epsilon = 0.01f64
+            );
         }
-    }
-
-    #[test]
-    fn cubic_time_inversion() {
-        let now = Instant::now();
-        let mut cubic = Cubic::new(now, 1024);
-
-        let t1 = now;
-        let t2 = t1 + Duration::from_secs(1);
-
-        cubic.on_retransmit(t2);
-        cubic.pre_transmit(t1);
-
-        let cwnd = cubic.window();
-        println!("Cubic:time_inversion: cwnd: {}, cubic: {cubic:?}", cwnd);
-
-        assert!(cwnd >= cubic.min_cwnd);
-        assert!(cwnd <= cubic.rwnd);
-    }
-
-    #[test]
-    fn cubic_long_elapsed_time() {
-        let now = Instant::now();
-        let mut cubic = Cubic::new(now, 1024);
-
-        let t1 = Instant::now();
-        let t2 = t1 + Duration::from_secs(1024);
-
-        cubic.on_retransmit(t1);
-        cubic.pre_transmit(t2);
-
-        let cwnd = cubic.window();
-        println!("Cubic:long_elapsed_time: cwnd: {}", cwnd);
-
-        assert!(cwnd >= cubic.min_cwnd);
-        assert!(cwnd <= cubic.rwnd);
-    }
-
-    #[test]
-    fn cubic_last_update() {
-        let now = Instant::now();
-        let mut cubic = Cubic::new(now, 1024);
-
-        let t1 = Duration::from_millis(0);
-        let t2 = Duration::from_millis(100);
-        let t3 = Duration::from_millis(199);
-        let t4 = Duration::from_millis(20000);
-
-        cubic.on_retransmit(now + t1);
-
-        cubic.pre_transmit(now + t2);
-        let cwnd2 = cubic.window();
-
-        cubic.pre_transmit(now + t3);
-        let cwnd3 = cubic.window();
-
-        cubic.pre_transmit(now + t4);
-        let cwnd4 = cubic.window();
-
-        println!(
-            "Cubic:last_update: cwnd2: {}, cwnd3: {}, cwnd4: {}",
-            cwnd2, cwnd3, cwnd4
-        );
-
-        assert_eq!(cwnd2, cwnd3);
-        assert_ne!(cwnd2, cwnd4);
-    }
-
-    #[test]
-    fn cubic_slow_start() {
-        let now = Instant::now();
-        let mut cubic = Cubic::new(now, 1024);
-
-        let t1 = Duration::from_micros(0);
-
-        let cwnd = cubic.window();
-        let ack_len = 1024;
-
-        cubic.on_ack(now + t1, ack_len, &RttEstimator::default());
-
-        assert!(cubic.window() > cwnd);
-
-        for i in 1..1000 {
-            let t2 = Duration::from_micros(i);
-            cubic.on_ack(now + t2, ack_len * 100, &RttEstimator::default());
-            assert!(cubic.window() <= cubic.rwnd);
-        }
-
-        let t3 = Duration::from_micros(2000);
-
-        let cwnd = cubic.window();
-        cubic.on_retransmit(now + t3);
-        assert_eq!(cwnd >> 1, cubic.ssthresh);
-    }
-
-    #[test]
-    fn cubic_pre_transmit() {
-        let now = Instant::now();
-        let mut cubic = Cubic::new(now, 1024);
-        cubic.pre_transmit(now + Duration::from_micros(2000));
-    }
-
-    #[test]
-    fn test_cube_root() {
-        for n in (1..1000000).step_by(99) {
-            let a = n as f64;
-            let a = a * a * a;
-            let result = cube_root(a);
-            println!("cube_root({a}) = {}", result.unwrap());
-        }
-    }
-
-    #[test]
-    #[should_panic]
-    fn cube_root_zero() {
-        cube_root(0.0).unwrap();
     }
 }

@@ -63,7 +63,7 @@ impl RttEstimator {
         self.forced_timeout = Some(duration);
     }
 
-    pub fn retransmission_timeout(&self) -> Duration {
+    pub fn roundtrip_time_estimate(&self) -> Duration {
         #[cfg(test)]
         if let Some(t) = self.forced_timeout {
             return t;

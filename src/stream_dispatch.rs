@@ -262,7 +262,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         let mut last_sent = None;
-        self.congestion_controller.pre_transmit(self.this_poll.now);
+        // self.congestion_controller.pre_transmit(self.this_poll.now);
         let mut recv_wnd = self.effective_remote_receive_window();
 
         let mut header = self.outgoing_header();
@@ -339,7 +339,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // rfc6298 5.1
             self.timers.retransmit.set_for_retransmit(
                 self.this_poll.now,
-                self.rtte.retransmission_timeout(),
+                self.rtte.roundtrip_time_estimate(),
                 false,
             );
         } else {
@@ -404,13 +404,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         log_before_and_after_if_changed(
             "rtte:on_retransmit",
             &mut self.rtte,
-            |r| r.retransmission_timeout(),
+            |r| r.roundtrip_time_estimate(),
             |r| r.on_retransmit(),
             |_, _| CONGESTION_TRACING_LOG_LEVEL,
         );
 
         // Inform the congestion controller that we're retransmitting.
-        self.congestion_controller.on_retransmit(self.this_poll.now);
+        self.congestion_controller
+            .on_rto_timeout(self.this_poll.now);
     }
 
     fn on_packet_sent(&mut self, header: &UtpHeader) {
@@ -491,7 +492,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if self.send_control_packet(cx, fin)? {
             self.timers.retransmit.set_for_retransmit(
                 self.this_poll.now,
-                self.rtte.retransmission_timeout(),
+                self.rtte.roundtrip_time_estimate(),
                 false,
             );
             self.timers.remote_inactivity_timer =
@@ -537,7 +538,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         let mut remaining = g.len() - tx_offset;
-        self.congestion_controller.pre_transmit(self.this_poll.now);
+        // self.congestion_controller.pre_transmit(self.this_poll.now);
         let mut remote_window_remaining = self
             .effective_remote_receive_window()
             .saturating_sub(self.user_tx_segments.total_len_bytes());
@@ -687,7 +688,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 log_before_and_after_if_changed(
                     "rtte:sample",
                     self,
-                    |s| s.rtte.retransmission_timeout(),
+                    |s| s.rtte.roundtrip_time_estimate(),
                     |s| s.rtte.sample(rtt),
                     |_, _| RTTE_TRACING_LOG_LEVEL,
                 );
@@ -701,7 +702,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 // rfc6298 5.3
                 self.timers.retransmit.set_for_retransmit(
                     self.this_poll.now,
-                    self.rtte.retransmission_timeout(),
+                    self.rtte.roundtrip_time_estimate(),
                     true,
                 );
             }
@@ -949,10 +950,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
                         METRICS.duplicate_acks_received.increment(1);
 
-                        // Inform congestion controller of duplicate ACK
-                        self.congestion_controller
-                            .on_duplicate_ack(self.this_poll.now);
-
                         trace!(
                             "received duplicate ACK for seq {} (duplicate nr {}{})",
                             msg.header.ack_nr,
@@ -965,6 +962,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         );
 
                         if self.local_rx_dup_acks == 3 {
+                            self.congestion_controller
+                                .on_triple_duplicate_ack(self.this_poll.now);
                             self.timers.retransmit.set_for_fast_retransmit();
                             debug!("started fast retransmit");
                         }
