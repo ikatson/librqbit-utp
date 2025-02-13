@@ -685,6 +685,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     |_, _| RTTE_TRACING_LOG_LEVEL,
                 );
             }
+
+            // TODO: this isn't entirely correct, as we should increase by up to 1 MSS for each received ACK.
+            // We aren't counting ACKs here, so we should call this more often probably or do some math to call
+            // once.
             self.congestion_controller.on_ack(
                 self.this_poll.now,
                 on_ack_result.acked_bytes,
