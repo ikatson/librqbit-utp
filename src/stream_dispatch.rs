@@ -365,8 +365,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn maybe_prepare_for_retransmission(&mut self) {
-        let Some(expired_delay) = self.timers.retransmit.should_retransmit(self.this_poll.now)
-        else {
+        let Some(reason) = self.timers.retransmit.should_retransmit(self.this_poll.now) else {
             return;
         };
 
@@ -385,19 +384,19 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         };
 
         // If a retransmit timer expired, we should resend data starting at the last ACK.
-        log_every_ms!(100, CONGESTION_TRACING_LOG_LEVEL, ?expired_delay, ?rewind_to, ?self.last_sent_seq_nr, "retransmitting");
+        log_every_ms!(100, CONGESTION_TRACING_LOG_LEVEL, ?reason, ?rewind_to, ?self.last_sent_seq_nr, "retransmitting");
 
         // Rewind "last sequence number sent", as if we never
         // had sent them. This will cause all data in the queue
         // to be sent again.
         self.last_sent_seq_nr = rewind_to;
 
-        // Clear the `should_retransmit` state. If we can't retransmit right
-        // now for whatever reason (like zero window), this avoids an
-        // infinite polling loop where `poll_at` returns `Now` but `dispatch`
-        // can't actually do anything.
-        //
-        // Ideally, we only clear it after we were able to send anything.
+        // Inform the congestion controller that we're retransmitting.
+        if !matches!(reason, ShouldRetransmitReason::FastRetransmit) {
+            self.congestion_controller
+                .on_rto_timeout(self.this_poll.now);
+        }
+
         self.timers.retransmit.set_for_idle();
 
         // Inform RTTE to become more conservative.
@@ -408,10 +407,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             |r| r.on_retransmit(),
             |_, _| CONGESTION_TRACING_LOG_LEVEL,
         );
-
-        // Inform the congestion controller that we're retransmitting.
-        self.congestion_controller
-            .on_rto_timeout(self.this_poll.now);
     }
 
     fn on_packet_sent(&mut self, header: &UtpHeader) {
@@ -1470,18 +1465,25 @@ struct Timers {
     ack_delay_timer: AckDelayTimer,
 }
 
+#[derive(Debug)]
+pub enum ShouldRetransmitReason {
+    #[allow(unused)]
+    ExpiredDelay(Duration),
+    FastRetransmit,
+}
+
 impl RetransmitTimer {
     fn new() -> RetransmitTimer {
         RetransmitTimer::Idle
     }
 
-    fn should_retransmit(&self, timestamp: Instant) -> Option<Duration> {
+    fn should_retransmit(&self, timestamp: Instant) -> Option<ShouldRetransmitReason> {
         match *self {
             RetransmitTimer::Retransmit { expires_at, delay } if timestamp >= expires_at => {
                 trace!("should retransmit, timer expired");
-                Some(delay)
+                Some(ShouldRetransmitReason::ExpiredDelay(delay))
             }
-            RetransmitTimer::FastRetransmit => Some(Duration::from_secs(0)),
+            RetransmitTimer::FastRetransmit => Some(ShouldRetransmitReason::FastRetransmit),
             _ => None,
         }
     }
