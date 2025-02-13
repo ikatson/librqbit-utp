@@ -693,15 +693,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 );
             }
 
-            // TODO: this isn't entirely correct, as we should increase by up to 1 MSS for each received ACK.
-            // We aren't counting ACKs here, so we should call this more often probably or do some math to call
-            // once.
-            self.congestion_controller.on_ack(
-                self.this_poll.now,
-                on_ack_result.acked_bytes,
-                &self.rtte,
-            );
-
             // Reset retransmit timer.
             if self.user_tx_segments.is_empty() {
                 // rfc6298 5.2
@@ -850,6 +841,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let on_ack_result = self
             .user_tx_segments
             .remove_up_to_ack(self.this_poll.now, &msg.header);
+
+        self.congestion_controller.on_ack(
+            self.this_poll.now,
+            on_ack_result.acked_bytes,
+            &self.rtte,
+        );
 
         self.last_remote_timestamp = msg.header.timestamp_microseconds;
 
