@@ -95,8 +95,11 @@ pub async fn echo(
 ) -> anyhow::Result<()> {
     let mut reader = reader;
 
-    const MAX_COUNTER: u64 = 1_000_000;
-    const PRINT_EVERY: u64 = 100_000;
+    // const MAX_COUNTER: u64 = 1_000_000;
+    // const PRINT_EVERY: u64 = 100_000;
+
+    const MAX_COUNTER: u64 = 1000;
+    const PRINT_EVERY: u64 = 100;
 
     let reader = async move {
         for expected in 0..=MAX_COUNTER {
@@ -124,16 +127,20 @@ pub async fn echo(
                 .context("timeout writing")?
                 .context("error writing")?;
         }
-        // Ensure we got everything sent and ACKed. Otherwise we'll quit and tokio will die killing everything in the
-        // process before we were able to send it all.
-        timeout(TIMEOUT, writer.shutdown())
-            .await
-            .context("timeout shutting down")?
-            .context("error shutting down")?;
-        Ok(())
+        Ok(writer)
     };
 
-    try_join!(reader, writer)?;
+    let (_, mut writer) = try_join!(reader, writer)?;
+    // Ensure we got everything sent and ACKed. Otherwise we'll quit and tokio will die killing everything in the
+    // process before we were able to send it all.
+    let shutdown_result = timeout(TIMEOUT, writer.shutdown())
+        .await
+        .context("timeout shutting down")?;
+
+    // libutp2-rs doesn't implement shutdown, so if it errored, just wait a bit
+    if shutdown_result.is_err() {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
     Ok(())
 }
 

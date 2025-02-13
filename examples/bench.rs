@@ -21,6 +21,13 @@ enum Mode {
 }
 
 #[derive(Debug, Clone, ValueEnum)]
+enum LibUtpRs2LogLevel {
+    None,
+    Normal,
+    Debug,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
 enum UtpKind {
     LibrqbitUtp,
     LibutpRs2,
@@ -55,6 +62,9 @@ struct BenchArgs {
     server_utp_kind: UtpKind,
     #[arg(long, default_value = "librqbit-utp")]
     client_utp_kind: UtpKind,
+
+    #[arg(long, default_value = "none")]
+    libutp_rs2_log_level: LibUtpRs2LogLevel,
 
     #[arg(long, default_value = "bench")]
     program: Program,
@@ -116,6 +126,17 @@ impl BenchArgs {
         }
     }
 
+    fn libutp_rs2_opts(&self) -> libutp_rs2::UtpOpts {
+        libutp_rs2::UtpOpts {
+            log_level: match self.libutp_rs2_log_level {
+                LibUtpRs2LogLevel::None => libutp_rs2::UtpLogLevel::None,
+                LibUtpRs2LogLevel::Normal => libutp_rs2::UtpLogLevel::Normal,
+                LibUtpRs2LogLevel::Debug => libutp_rs2::UtpLogLevel::Debug,
+            },
+            ..Default::default()
+        }
+    }
+
     async fn accept(&self) -> anyhow::Result<RW> {
         let listen = self.server_listen_addr;
         match &self.mode {
@@ -140,7 +161,7 @@ impl BenchArgs {
                 }
                 UtpKind::LibutpRs2 => {
                     info!(addr=?listen, "starting libutp-rs-2 server");
-                    libutp_rs2::UtpContext::new_udp(listen)
+                    libutp_rs2::UtpContext::new_udp_with_opts(listen, self.libutp_rs2_opts())
                         .await
                         .with_context(|| format!("error creating uTP socket at {listen}"))?
                         .accept()
@@ -176,7 +197,7 @@ impl BenchArgs {
                 }
                 UtpKind::LibutpRs2 => {
                     info!(addr=?remote, "connecting over uTP with libutp-rs-2");
-                    libutp_rs2::UtpContext::new_udp(listen)
+                    libutp_rs2::UtpContext::new_udp_with_opts(listen, self.libutp_rs2_opts())
                         .await
                         .with_context(|| format!("error creating uTP socket at {listen}"))?
                         .connect(remote)
