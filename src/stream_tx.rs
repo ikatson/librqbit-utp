@@ -1,7 +1,7 @@
 use std::{
     num::NonZeroUsize,
     sync::Arc,
-    task::{ready, Poll, Waker},
+    task::{Poll, Waker},
 };
 
 use anyhow::bail;
@@ -23,13 +23,9 @@ pub struct UserTxLocked {
 
     buffer: ringbuf::LocalRb<Heap<u8>>,
 
-    // This is woken up by dispatcher when the buffer has space if it didn't have it previously.
-    pub buffer_has_space: Option<Waker>,
-    // This is woken up by dispatcher when all outstanding packets where ACKed.
-    pub buffer_flushed: Option<Waker>,
-
-    // This is woken by by writer when it has put smth into the buffer.
-    pub buffer_has_data: Option<Waker>,
+    // Woken by by writer
+    pub dispatcher_waker: Option<Waker>,
+    pub writer_waker: Option<Waker>,
 }
 
 impl UserTxLocked {
@@ -69,18 +65,21 @@ impl UserTxLocked {
 
     fn mark_vsock_closed(&mut self) {
         self.vsock_closed = true;
-        if let Some(waker) = self.buffer_has_space.take() {
+        if let Some(waker) = self.writer_waker.take() {
             waker.wake();
         }
     }
 
-    pub fn close(&mut self) {
+    fn mark_writer_closed(&mut self) -> bool {
         if !self.writer_closed {
             trace!("closing writer");
             self.writer_closed = true;
-            if let Some(w) = self.buffer_has_data.take() {
+            if let Some(w) = self.dispatcher_waker.take() {
                 w.wake();
             }
+            true
+        } else {
+            false
         }
     }
 }
@@ -94,16 +93,15 @@ impl UserTx {
         Arc::new(UserTx {
             locked: Mutex::new(UserTxLocked {
                 buffer: ringbuf::LocalRb::new(capacity.get()),
-                buffer_has_space: None,
-                buffer_has_data: None,
-                buffer_flushed: None,
+                dispatcher_waker: None,
+                writer_waker: None,
                 vsock_closed: false,
                 writer_closed: false,
             }),
         })
     }
 
-    pub fn is_closed(&self) -> bool {
+    pub fn is_writer_closed(&self) -> bool {
         self.locked.lock().writer_closed
     }
 
@@ -124,15 +122,11 @@ impl UtpStreamWriteHalf {
             written_without_yield: 0,
         }
     }
-
-    fn close(&mut self) {
-        self.user_tx.locked.lock().close();
-    }
 }
 
 impl Drop for UtpStreamWriteHalf {
     fn drop(&mut self) {
-        self.close();
+        self.user_tx.locked.lock().mark_writer_closed();
     }
 }
 
@@ -168,12 +162,12 @@ impl AsyncWrite for UtpStreamWriteHalf {
         this.written_without_yield += count as u64;
         if count == 0 {
             assert!(g.is_full());
-            update_optional_waker(&mut g.buffer_has_space, cx);
+            update_optional_waker(&mut g.writer_waker, cx);
             this.written_without_yield = 0;
             return Poll::Pending;
         }
 
-        if let Some(w) = g.buffer_has_data.take() {
+        if let Some(w) = g.dispatcher_waker.take() {
             drop(g);
             w.wake()
         }
@@ -195,20 +189,31 @@ impl AsyncWrite for UtpStreamWriteHalf {
             return Poll::Ready(Err(std::io::Error::other("socket died")));
         }
 
-        update_optional_waker(&mut g.buffer_flushed, cx);
+        update_optional_waker(&mut g.writer_waker, cx);
 
         Poll::Pending
     }
 
     fn poll_shutdown(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        let flush_result = ready!(self.as_mut().poll_flush(cx));
-        if let Err(e) = flush_result {
-            return Poll::Ready(Err(e));
+        let mut g = self.user_tx.locked.lock();
+        if !g.buffer.is_empty() {
+            if g.vsock_closed {
+                return Poll::Ready(Err(std::io::Error::other("socket died")));
+            }
+
+            update_optional_waker(&mut g.writer_waker, cx);
+            return Poll::Pending;
         }
-        self.get_mut().close();
-        Poll::Ready(Ok(()))
+
+        if g.vsock_closed {
+            return Poll::Ready(Ok(()));
+        }
+
+        g.mark_writer_closed();
+        update_optional_waker(&mut g.writer_waker, cx);
+        Poll::Pending
     }
 }

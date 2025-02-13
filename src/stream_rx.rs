@@ -269,12 +269,12 @@ impl UserRx {
         (write_half, read_half)
     }
 
-    pub fn is_closed(&self) -> bool {
+    pub fn is_reader_closed(&self) -> bool {
         self.shared.locked.lock().reader_dead
     }
 
     pub fn remaining_rx_window(&self) -> usize {
-        if self.is_closed() {
+        if self.is_reader_closed() {
             0
         } else {
             self.last_remaining_rx_window

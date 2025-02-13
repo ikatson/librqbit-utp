@@ -1,9 +1,11 @@
 use std::{future::poll_fn, num::NonZeroUsize, pin::Pin, sync::Arc, task::Poll, time::Duration};
 
+use anyhow::Context;
 use futures::FutureExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWrite, AsyncWriteExt},
     sync::mpsc::{unbounded_channel, UnboundedSender},
+    time::timeout,
 };
 use tracing::trace;
 
@@ -470,15 +472,46 @@ async fn test_no_writes_allowed_after_explicit_shutdown() {
     );
     // Deliver the ACK.
     t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
 
-    // Initiate shutdown. It must complete immediately as all the data should have been flushed.
-    stream.shutdown().await.unwrap();
+    // Initiate shutdown. It must complete on next vsock poll immediately as all the data should have been flushed.
+    let (r, mut w) = stream.split();
+    let shutdown = w.shutdown();
+    tokio::pin!(shutdown);
+
+    // Poll shutdown once
+    std::future::poll_fn(|cx| match shutdown.poll_unpin(cx) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(v) => panic!("expected shutdown to return pending, but got {v:?}"),
+    })
+    .await;
 
     // Ensure we get error on calling "write" again.
-    assert!(stream.write(b"test").await.is_err());
+    assert!(w.write(b"test").await.is_err());
 
+    drop(r);
+
+    // Ensure we send FIN
     t.poll_once_assert_pending().await;
-    t.assert_sent_empty();
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_FIN, seq_nr = 102, ack_nr = 0)]
+    );
+
+    // 1 second later we should die and shutdown should complete.
+    t.env.increment_now(Duration::from_secs(1));
+    assert!(t
+        .poll_once_assert_ready()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("inactive"));
+    timeout(Duration::from_secs(1), w.shutdown())
+        .await
+        .context("timeout waiting for shutdown")
+        .unwrap()
+        .context("error in shutdown")
+        .unwrap();
 }
 
 #[tokio::test]

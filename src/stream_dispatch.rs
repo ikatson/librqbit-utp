@@ -511,7 +511,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let mut g = self.user_tx.locked.lock();
 
         if g.is_empty() {
-            update_optional_waker(&mut g.buffer_has_data, cx);
+            update_optional_waker(&mut g.dispatcher_waker, cx);
             return Ok(());
         }
 
@@ -644,26 +644,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         if on_ack_result.acked_segments_count > 0 {
+            self.timers.remote_inactivity_timer = None;
+
             // Cleanup user side of TX queue, remove the ACKed bytes from the front of it,
             // and notify the writer.
             {
                 let mut g = self.user_tx.locked.lock();
                 g.truncate_front(on_ack_result.acked_bytes)?;
 
-                let waker_1 = g.buffer_has_space.take();
-                let waker_2 = if g.is_empty() {
-                    self.timers.remote_inactivity_timer = None;
-                    g.buffer_flushed.take()
-                } else {
-                    None
-                };
+                let waker = g.writer_waker.take();
+
+                // Waking under lock may slow things down.
                 drop(g);
 
-                // Waking under lock slows things down.
-                if let Some(w) = waker_1 {
-                    w.wake();
-                }
-                if let Some(w) = waker_2 {
+                if let Some(w) = waker {
                     w.wake();
                 }
             }
@@ -1162,7 +1156,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // (Re)send tx queue.
             pending_if_cannot_send!(self.send_tx_queue(cx));
 
-            if self.user_rx.is_closed() && self.user_tx.is_closed() {
+            if self.user_rx.is_reader_closed() && self.user_tx.is_writer_closed() {
                 self.transition_to_fin_sent();
             }
 
