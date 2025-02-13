@@ -2676,7 +2676,6 @@ async fn test_sequence_numbers_incoming() {
 #[tokio::test]
 async fn test_sequence_numbers_outgoing() {
     // The same test as test_sequence_numbers_incoming but in reverse.
-
     tracing_subscriber::fmt::init();
     let env = MockUtpEnvironment::default();
     let mut t = make_test_vsock_args(
@@ -2700,7 +2699,12 @@ async fn test_sequence_numbers_outgoing() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 15090, ack_nr = 31419)]
+        vec![cmphead!(
+            ST_DATA,
+            seq_nr = 15090,
+            ack_nr = 31419,
+            payload = "hello"
+        )]
     );
     t.send_msg(
         UtpHeader {
@@ -2714,6 +2718,8 @@ async fn test_sequence_numbers_outgoing() {
     );
     t.send_data(31420, 15090, "hello");
     t.send_data(31421, 15090, "world");
+
+    t.vsock.force_immediate_ack();
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
