@@ -5,7 +5,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     pin::Pin,
-    sync::{Arc, Weak},
+    sync::Arc,
     task::Poll,
     time::{Duration, Instant},
 };
@@ -142,7 +142,7 @@ impl UserRxMessage {
 // An equivalent of a TCP socket for uTP.
 struct VirtualSocket<T, Env> {
     state: VirtualSocketState,
-    socket: Weak<UtpSocket<T, Env>>,
+    socket: Arc<UtpSocket<T, Env>>,
     socket_created: Instant,
     socket_opts: ValidatedSocketOpts,
 
@@ -251,11 +251,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     // Returns true if UDP socket is full
-    fn send_tx_queue(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T, Env>,
-    ) -> anyhow::Result<()> {
+    fn send_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
         if self.user_tx_segments.is_empty() {
             return Ok(());
         }
@@ -311,7 +307,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .context("bug: wasn't able to serialize the buffer")?;
 
             self.this_poll.transport_pending |=
-                socket.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.remote)?;
+                self.socket
+                    .try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.remote)?;
 
             trace!(
                 %header.seq_nr,
@@ -351,20 +348,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(())
     }
 
-    fn maybe_send_ack(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T, Env>,
-    ) -> anyhow::Result<bool> {
+    fn maybe_send_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
         if self.immediate_ack_to_transmit() {
             METRICS.immediate_acks.increment(1);
-            return self.send_ack(cx, socket);
+            return self.send_ack(cx);
         }
         let expired = self.delayed_ack_expired();
         if expired && self.ack_to_transmit() {
             METRICS.delayed_acks.increment(1);
             trace!("delayed ack expired, sending ACK");
-            self.send_ack(cx, socket)
+            self.send_ack(cx)
         } else {
             Ok(false)
         }
@@ -434,7 +427,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn send_control_packet(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T, Env>,
         header: UtpHeader,
     ) -> anyhow::Result<bool> {
         if self.this_poll.transport_pending {
@@ -454,7 +446,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .context("bug")?;
 
         self.this_poll.transport_pending =
-            socket.try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.remote)?;
+            self.socket
+                .try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.remote)?;
 
         let sent = !self.this_poll.transport_pending;
 
@@ -468,21 +461,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(sent)
     }
 
-    fn send_ack(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T, Env>,
-    ) -> anyhow::Result<bool> {
+    fn send_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
         let mut header = self.outgoing_header();
         header.extensions.selective_ack = self.user_rx.selective_ack();
-        self.send_control_packet(cx, socket, header)
+        self.send_control_packet(cx, header)
     }
 
-    fn maybe_send_fin(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T, Env>,
-    ) -> anyhow::Result<()> {
+    fn maybe_send_fin(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
         if self.this_poll.transport_pending {
             return Ok(());
         }
@@ -502,7 +487,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let mut fin = self.outgoing_header();
         fin.set_type(Type::ST_FIN);
         fin.seq_nr = seq_nr;
-        if self.send_control_packet(cx, socket, fin)? {
+        if self.send_control_packet(cx, fin)? {
             self.timers.retransmit.set_for_retransmit(
                 self.this_poll.now,
                 self.rtte.retransmission_timeout(),
@@ -614,10 +599,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             fin.set_type(Type::ST_FIN);
             fin.seq_nr = self.seq_nr;
             self.seq_nr += 1;
-            if let Some(socket) = self.socket.upgrade() {
-                if let Err(e) = self.send_control_packet(cx, &socket, fin) {
-                    debug!("error sending FIN: {e:#}")
-                }
+            if let Err(e) = self.send_control_packet(cx, fin) {
+                debug!("error sending FIN: {e:#}")
             }
         }
     }
@@ -629,28 +612,28 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn process_all_incoming_messages(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T, Env>,
     ) -> anyhow::Result<()> {
         let mut on_ack_result = OnAckResult::default();
         while let Poll::Ready(msg) = self.rx.poll_recv(cx) {
             let msg = match msg {
                 Some(msg) => msg,
                 None => {
-                    // This could happen in the following scenarios:
-                    // 1. The socket is dead. In this case any attempt to send() will result in poll() erroring out,
-                    //    as the Weak<socket>.upgrade() will fail.
-                    //    It's useless running dispatcher in this state, we can just quit.
-                    //
-                    // 2. We were removed from socket.streams().
-                    //    The only case this could happen is both reader and writer are dropped.
-                    //
-                    //    We need to send FIN in this case, but we can't wait for its ACK to arrive back, cause we can't
-                    //    receive any messages!
+                    // This could happen only when we were removed from socket.streams(), of if socket dispatcher is dead.
+                    // This should not have happened!
+                    // But if it did, we won't be able to receive any more messages.
+                    // We need to send FIN in this case, but we can't wait for its ACK to arrive back, cause we can't
+                    // receive any messages!
 
-                    trace!("no more data. transitioning to FINISHED");
+                    debug!("can't receive messages anymore. Transitioning to Closed");
                     self.transition_to_fin_sent();
-                    self.maybe_send_fin(cx, socket)?;
-                    self.state = VirtualSocketState::Closed;
+                    self.maybe_send_fin(cx)?;
+                    log_before_and_after_if_changed(
+                        "state",
+                        self,
+                        |s| s.state,
+                        |s| s.state = VirtualSocketState::Closed,
+                        |_, _| Level::DEBUG,
+                    );
                     return Ok(());
                 }
             };
@@ -1079,11 +1062,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .min(inactivity_poll)
     }
 
-    fn maybe_send_syn_ack(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        socket: &UtpSocket<T, Env>,
-    ) -> anyhow::Result<()> {
+    fn maybe_send_syn_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
         let sent_count = match self.state {
             VirtualSocketState::SynReceived => 0,
             VirtualSocketState::SynAckSent { expires_at, count }
@@ -1096,7 +1075,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if sent_count == self.socket_opts.max_segment_retransmissions.get() {
             bail!("too many syn-acks sent")
         }
-        if self.send_ack(cx, socket)? {
+        if self.send_ack(cx)? {
             self.state = VirtualSocketState::SynAckSent {
                 expires_at: self.this_poll.now + SYNACK_RESEND_INTERNAL,
                 count: sent_count + 1,
@@ -1148,22 +1127,19 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         // Doing this once here not to upgrade too often below.
-        let socket = bail_if_err!(self.socket.upgrade().context("device dead"));
-        let socket = &*socket;
-
         self.this_poll.transport_pending = false;
         self.this_poll.now = self.env.now();
 
         const MAX_ITERS: usize = 2;
 
         for _ in 0..MAX_ITERS {
-            pending_if_cannot_send!(self.maybe_send_syn_ack(cx, socket));
+            pending_if_cannot_send!(self.maybe_send_syn_ack(cx));
 
             // Flow control: flush as many out of order messages to user RX as possible.
             bail_if_err!(self.user_rx.flush(cx));
 
             // Read incoming stream.
-            pending_if_cannot_send!(self.process_all_incoming_messages(cx, socket));
+            pending_if_cannot_send!(self.process_all_incoming_messages(cx));
 
             if self
                 .timers
@@ -1184,17 +1160,17 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.maybe_prepare_for_retransmission();
 
             // (Re)send tx queue.
-            pending_if_cannot_send!(self.send_tx_queue(cx, socket));
+            pending_if_cannot_send!(self.send_tx_queue(cx));
 
             if self.user_rx.is_closed() && self.user_tx.is_closed() {
                 self.transition_to_fin_sent();
             }
 
             // (Re)send a pending FIN if needed.
-            pending_if_cannot_send!(self.maybe_send_fin(cx, socket));
+            pending_if_cannot_send!(self.maybe_send_fin(cx));
 
             // Send an ACK if nothing sent yet and sending an ACK is necessary.
-            pending_if_cannot_send!(self.maybe_send_ack(cx, socket));
+            pending_if_cannot_send!(self.maybe_send_ack(cx));
 
             // Quit normally if both sides sent FIN and ACKed each other.
             if self.state_is_closed() {
@@ -1440,7 +1416,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 0
             },
 
-            socket: Arc::downgrade(socket),
+            socket: socket.clone(),
         };
 
         METRICS.live_virtual_sockets.increment(1);

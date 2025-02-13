@@ -124,8 +124,13 @@ pub async fn echo(
                 .context("timeout writing")?
                 .context("error writing")?;
         }
-        #[allow(unreachable_code)]
-        Ok::<_, anyhow::Error>(())
+        // Ensure we got everything sent and ACKed. Otherwise we'll quit and tokio will die killing everything in the
+        // process before we were able to send it all.
+        timeout(TIMEOUT, writer.shutdown())
+            .await
+            .context("timeout shutting down")?
+            .context("error shutting down")?;
+        Ok(())
     };
 
     try_join!(reader, writer)?;

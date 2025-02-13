@@ -391,12 +391,6 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     next_connection_id: SeqNr,
 }
 
-impl<T: Transport, E: UtpEnvironment> Drop for Dispatcher<T, E> {
-    fn drop(&mut self) {
-        debug!("dropping dispatcher")
-    }
-}
-
 impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     pub(crate) async fn run_forever(mut self) -> anyhow::Result<()> {
         let mut read_buf = [0u8; 16384];
@@ -542,6 +536,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 };
             }
             ControlRequest::Shutdown(key) => {
+                debug!(?key, "removing stream");
                 self.streams.remove(&key);
             }
         }
