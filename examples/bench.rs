@@ -63,6 +63,9 @@ struct BenchArgs {
     #[arg(long, default_value = "librqbit-utp")]
     client_utp_kind: UtpKind,
 
+    #[arg(long)]
+    librqbit_utp_congestion_tracing: bool,
+
     #[arg(long, default_value = "none")]
     libutp_rs2_log_level: LibUtpRs2LogLevel,
 
@@ -126,6 +129,16 @@ impl BenchArgs {
         }
     }
 
+    fn librqbut_utp_socket_opts(&self) -> librqbit_utp::SocketOpts {
+        librqbit_utp::SocketOpts {
+            congestion: librqbit_utp::CongestionConfig {
+                tracing: self.librqbit_utp_congestion_tracing,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
     fn libutp_rs2_opts(&self) -> libutp_rs2::UtpOpts {
         #[allow(clippy::needless_update)]
         libutp_rs2::UtpOpts {
@@ -152,13 +165,16 @@ impl BenchArgs {
             Mode::Utp => match &self.server_utp_kind {
                 UtpKind::LibrqbitUtp => {
                     info!(addr=?listen, "starting librqbit-utp server");
-                    librqbit_utp::UtpSocketUdp::new_udp(listen)
-                        .await
-                        .with_context(|| format!("error creating uTP socket at {listen}"))?
-                        .accept()
-                        .await
-                        .context("error accepting")
-                        .map(|s| boxrw(s.split()))
+                    librqbit_utp::UtpSocketUdp::new_udp_with_opts(
+                        listen,
+                        self.librqbut_utp_socket_opts(),
+                    )
+                    .await
+                    .with_context(|| format!("error creating uTP socket at {listen}"))?
+                    .accept()
+                    .await
+                    .context("error accepting")
+                    .map(|s| boxrw(s.split()))
                 }
                 UtpKind::LibutpRs2 => {
                     info!(addr=?listen, "starting libutp-rs-2 server");
@@ -188,13 +204,16 @@ impl BenchArgs {
             Mode::Utp => match &self.client_utp_kind {
                 UtpKind::LibrqbitUtp => {
                     info!(addr=?remote, "connecting over uTP with librqbit-utp");
-                    librqbit_utp::UtpSocketUdp::new_udp(listen)
-                        .await
-                        .with_context(|| format!("error creating uTP socket at {listen}"))?
-                        .connect(remote)
-                        .await
-                        .with_context(|| format!("error connecting to {remote}"))
-                        .map(|s| boxrw(s.split()))
+                    librqbit_utp::UtpSocketUdp::new_udp_with_opts(
+                        listen,
+                        self.librqbut_utp_socket_opts(),
+                    )
+                    .await
+                    .with_context(|| format!("error creating uTP socket at {listen}"))?
+                    .connect(remote)
+                    .await
+                    .with_context(|| format!("error connecting to {remote}"))
+                    .map(|s| boxrw(s.split()))
                 }
                 UtpKind::LibutpRs2 => {
                     info!(addr=?remote, "connecting over uTP with libutp-rs-2");
