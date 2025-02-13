@@ -315,6 +315,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 %header.ack_nr,
                 payload_size = len,
                 socket_was_full = self.this_poll.transport_pending,
+                recv_wnd,
                 "attempted to send ST_DATA"
             );
 
@@ -567,6 +568,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             remote_window_remaining -= payload_size;
             trace!(bytes = payload_size, "segmented");
         }
+
+        trace!(
+            remaining,
+            remote_window_remaining,
+            user_tx_segments_segments = self.user_tx_segments.total_len_packets(),
+            user_tx_segments_bytes = self.user_tx_segments.total_len_bytes(),
+            user_tx_segments_full = self.user_tx_segments.is_full(),
+            "split_tx_queue_into_segments finished",
+        );
 
         Ok(())
     }
@@ -1382,7 +1392,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_sent_ack_nr,
             consumed_but_unacked_bytes: 0,
             rx,
-            user_tx_segments: Segments::new(seq_nr),
+            user_tx_segments: Segments::new(seq_nr, socket.opts().user_tx_segments_capacity.get()),
             local_rx_last_ack: None,
             local_rx_dup_acks: 0,
             user_tx,

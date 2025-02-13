@@ -198,6 +198,12 @@ impl SocketOpts {
         )
         .context("invalid configuration: virtual_socket_tx_bytes = 0")?;
 
+        let user_tx_segments_capacity =
+            NonZeroUsize::new(virtual_socket_tx_bytes.get() / outgoing.max_payload_size.get())
+                .context(
+                "user_tx_segments_capacity = 0. Incrase virtual_socket_tx_bytes, or decrease MTU",
+            )?;
+
         Ok(ValidatedSocketOpts {
             max_incoming_packet_size: incoming.max_packet_size,
             max_incoming_payload_size: incoming.max_payload_size,
@@ -217,6 +223,7 @@ impl SocketOpts {
                 .max_live_vsocks
                 .unwrap_or(DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET),
             wait_for_last_ack: !self.dont_wait_for_lastack,
+            user_tx_segments_capacity,
         })
     }
 }
@@ -238,6 +245,8 @@ pub(crate) struct ValidatedSocketOpts {
     pub max_active_streams: usize,
 
     pub wait_for_last_ack: bool,
+
+    pub user_tx_segments_capacity: NonZeroUsize,
 }
 
 pub(crate) struct RequestWithSpan<V> {

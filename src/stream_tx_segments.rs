@@ -134,11 +134,11 @@ impl core::fmt::Debug for OnAckResult {
 }
 
 impl Segments {
-    pub fn new(snd_una: SeqNr) -> Self {
+    pub fn new(snd_una: SeqNr, capacity: usize) -> Self {
         Segments {
             segments: VecDeque::new(),
             len_bytes: 0,
-            capacity: 64,
+            capacity,
             snd_una,
         }
     }
@@ -156,7 +156,6 @@ impl Segments {
         }
     }
 
-    #[cfg(test)]
     pub fn total_len_packets(&self) -> usize {
         self.segments.len()
     }
@@ -309,7 +308,7 @@ mod tests {
     use super::Segments;
 
     fn make_segmented_tx(start_seq_nr: u16, count: u16) -> Segments {
-        let mut ftx = Segments::new(start_seq_nr.into());
+        let mut ftx = Segments::new(start_seq_nr.into(), 64);
         for _ in 0..count {
             assert!(ftx.enqueue(1));
         }
