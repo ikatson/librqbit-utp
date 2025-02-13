@@ -95,8 +95,8 @@ pub async fn echo(
 ) -> anyhow::Result<()> {
     let mut reader = reader;
 
-    const MAX_COUNTER: u64 = 10_000;
-    const PRINT_EVERY: u64 = 1_000;
+    const MAX_COUNTER: u64 = 1000;
+    const PRINT_EVERY: u64 = 100;
 
     let reader = async move {
         for expected in 0..=MAX_COUNTER {

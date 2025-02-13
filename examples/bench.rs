@@ -13,7 +13,6 @@ use tokio::{
     time::timeout,
 };
 use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum Mode {
