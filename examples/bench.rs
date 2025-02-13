@@ -127,6 +127,7 @@ impl BenchArgs {
     }
 
     fn libutp_rs2_opts(&self) -> libutp_rs2::UtpOpts {
+        #[allow(clippy::needless_update)]
         libutp_rs2::UtpOpts {
             log_level: match self.libutp_rs2_log_level {
                 LibUtpRs2LogLevel::None => libutp_rs2::UtpLogLevel::None,

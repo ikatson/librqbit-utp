@@ -137,9 +137,13 @@ pub async fn echo(
         .await
         .context("timeout shutting down")?;
 
-    // libutp2-rs doesn't implement shutdown, so if it errored, just wait a bit
-    if shutdown_result.is_err() {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+    if let Err(e) = shutdown_result {
+        // libutp2-rs doesn't implement shutdown, so if it errored, just wait a bit, that's all we can do.
+        if e.to_string().contains("not implemented") {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        } else {
+            return Err(e).context("error shutting down");
+        }
     }
     Ok(())
 }
