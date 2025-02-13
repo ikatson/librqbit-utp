@@ -2620,7 +2620,8 @@ async fn test_sequence_numbers_incoming() {
     //
     // After that all the other packets have the actual last sent data sequence number in there.
 
-    tracing_subscriber::fmt::init();
+    setup_test_logging();
+
     let mut t = make_test_vsock_args(
         Default::default(),
         StreamArgs::new_incoming(
@@ -2641,6 +2642,7 @@ async fn test_sequence_numbers_incoming() {
     );
     // allow sending by setting the remote window
     t.send_data(15090, 31419, "hello");
+    t.vsock.force_immediate_ack();
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
@@ -2676,7 +2678,7 @@ async fn test_sequence_numbers_incoming() {
 #[tokio::test]
 async fn test_sequence_numbers_outgoing() {
     // The same test as test_sequence_numbers_incoming but in reverse.
-    tracing_subscriber::fmt::init();
+    setup_test_logging();
     let env = MockUtpEnvironment::default();
     let mut t = make_test_vsock_args(
         Default::default(),
