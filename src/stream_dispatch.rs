@@ -542,6 +542,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .effective_remote_receive_window()
             .saturating_sub(self.user_tx_segments.total_len_bytes());
 
+        trace!(
+            remote_window_remaining,
+            congestion_controller_window = self.congestion_controller.window(),
+            remaining,
+            self.last_remote_window
+        );
+
         while !self.user_tx_segments.is_full() && remaining > 0 && remote_window_remaining > 0 {
             let max_payload_size = self
                 .socket_opts
