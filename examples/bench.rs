@@ -223,21 +223,29 @@ impl BenchArgs {
         let args: Vec<String> = args.collect();
         match self.command {
             None => {
-                // If no arguments, spawn both client and server processes
-                let server_child = std::process::Command::new(&binary)
-                    .args(&args)
-                    .arg("server")
-                    .spawn()
-                    .context("Failed to spawn server process")?;
+                fn spawn(
+                    arg0: &'static str,
+                    binary: &str,
+                    args: &[String],
+                    final_arg: &str,
+                ) -> std::io::Result<std::process::Child> {
+                    let mut builder = std::process::Command::new(binary);
+                    builder.args(args).arg(final_arg);
+                    if cfg!(unix) {
+                        use std::os::unix::process::CommandExt;
+                        builder.arg0(arg0);
+                    }
+                    builder.spawn()
+                }
+
+                let server_child = spawn("utp-bench-server", &binary, &args, "server")
+                    .context("failed to spawn server process")?;
 
                 // Wait a bit for the server to start
                 std::thread::sleep(Duration::from_millis(500));
 
-                let client_child = std::process::Command::new(&binary)
-                    .args(&args)
-                    .arg("client")
-                    .spawn()
-                    .context("Failed to spawn client process")?;
+                let client_child = spawn("utp-bench-client", &binary, &args, "client")
+                    .context("failed to spawn client process")?;
 
                 // Wait for both processes to complete
                 server_child.wait_with_output()?;
