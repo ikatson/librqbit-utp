@@ -24,6 +24,7 @@ use crate::{
     message::UtpMessage,
     metrics::METRICS,
     raw::{Type, UtpHeader},
+    recovery::{NextSeg, Recovery},
     rtte::RttEstimator,
     seq_nr::SeqNr,
     socket::{ControlRequest, ValidatedSocketOpts},
@@ -31,7 +32,7 @@ use crate::{
     stream::UtpStream,
     stream_rx::{AssemblerAddRemoveResult, UserRx},
     stream_tx::{UserTx, UtpStreamWriteHalf},
-    stream_tx_segments::{rtt_min, OnAckResult, Segments},
+    stream_tx_segments::{rtt_min, OnAckResult, Segment, SegmentIterItem, Segments},
     traits::{Transport, UtpEnvironment},
     utils::{update_optional_waker, DropGuardSendBeforeDeath},
     UtpSocket,
@@ -139,85 +140,6 @@ impl UserRxMessage {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Recovery {
-    CountingDuplicates {
-        dup_acks: u8,
-    },
-    Recovery {
-        recovery_point: SeqNr,
-
-        // "HighRxt" is the highest sequence number which has been
-        //  retransmitted during the current loss recovery phase.
-        high_rxt: SeqNr,
-
-        pipe: usize,
-    },
-}
-
-impl Recovery {
-    fn on_ack(
-        &mut self,
-        header: &UtpHeader,
-        on_ack_result: &OnAckResult,
-        tx_segs: &mut Segments,
-        congestion_controller: &mut dyn CongestionController,
-        now: Instant,
-        last_consumed_remote_seq_nr: SeqNr,
-        last_sent_seq_nr: SeqNr,
-    ) {
-        match self {
-            Recovery::CountingDuplicates { dup_acks } => {
-                if header.extensions.selective_ack.is_none() {
-                    *dup_acks = 0;
-                    return;
-                }
-
-                let is_duplicate = on_ack_result.newly_sacked_segment_count > 0;
-                if !is_duplicate {
-                    return;
-                }
-
-                *dup_acks += 1;
-
-                let high_ack = last_consumed_remote_seq_nr;
-                let high_data = last_sent_seq_nr;
-
-                let should_enter_recovery = *dup_acks as usize >= SACK_DUP_THRESH
-                    || tx_segs.is_lost(high_ack + 1, SACK_DEPTH);
-
-                if !should_enter_recovery {
-                    return;
-                }
-
-                let high_rxt = high_ack;
-
-                // TODO: we are skipping the part 3
-                // "The TCP MAY transmit previously unsent data segments as per Limited transmit"
-                congestion_controller.on_triple_duplicate_ack(now);
-                *self = Recovery::Recovery {
-                    recovery_point: high_data, // HighData
-                    high_rxt,
-                    pipe: tx_segs.calc_sack_pipe(high_rxt),
-                };
-            }
-            Recovery::Recovery {
-                recovery_point,
-                high_rxt,
-                pipe,
-            } => {
-                if header.ack_nr >= *recovery_point {
-                    // We should get back to counting acks here.
-                    *self = Recovery::CountingDuplicates { dup_acks: 0 };
-                    return;
-                }
-
-                *pipe = tx_segs.calc_sack_pipe(*high_rxt);
-            }
-        }
-    }
-}
-
 // An equivalent of a TCP socket for uTP.
 struct VirtualSocket<T, Env> {
     state: VirtualSocketState,
@@ -301,17 +223,70 @@ struct ThisPoll {
 #[derive(Default)]
 struct ProcessIncomingMessageResult {
     on_ack_result: OnAckResult,
-    triple_duplicate_acks: Option<bool>,
 }
 
 impl ProcessIncomingMessageResult {
     pub(crate) fn update(&mut self, other: &ProcessIncomingMessageResult) {
         self.on_ack_result.update(&other.on_ack_result);
-        match other.triple_duplicate_acks {
-            Some(v) => self.triple_duplicate_acks = Some(v),
-            None => {}
-        }
     }
+}
+
+// TODO: this is nasty, but we can't make these methods as it borrows a bunch of fields, and this whole
+// section is run while user_tx_segments.iter_mut() is already borrowed.
+macro_rules! on_packet_sent {
+    ($self:expr, $header:expr) => {{
+        // Each packet sent can act as ACK so update related state.
+        $self.last_sent_ack_nr = $header.ack_nr;
+        $self.last_sent_window = $header.wnd_size;
+        $self.consumed_but_unacked_bytes = 0;
+        $self.timers.reset_delayed_ack_timer();
+        if matches!($header.get_type(), Type::ST_DATA) {
+            $self.timers.remote_inactivity_timer =
+                Some($self.this_poll.now + $self.socket_opts.remote_inactivity_timeout);
+        }
+    }};
+}
+
+macro_rules! send_data {
+    ($self:expr, $cx:expr, $header:expr, $segment_iter_item:expr) => {{
+        if $segment_iter_item.retransmit_count()
+            == $self.socket_opts.max_segment_retransmissions.get()
+        {
+            METRICS.max_retransmissions_reached.increment(1);
+            anyhow::bail!("max number of retransmissions reached");
+        }
+
+        $header.set_type(Type::ST_DATA);
+        $header.seq_nr = $segment_iter_item.seq_nr();
+
+        let len = $header
+            .serialize_with_payload(&mut $self.this_poll.tmp_buf, |b| {
+                let offset = $segment_iter_item.payload_offset();
+                let len = $segment_iter_item.payload_size();
+                let g = $self.user_tx.locked.lock();
+                g.fill_buffer_from_ring_buffer(b, offset, len)
+                    .context("error filling output buffer from user_tx")?;
+                Ok(len)
+            })
+            .context("bug: wasn't able to serialize the buffer")?;
+
+        $self.this_poll.transport_pending =
+            $self
+                .socket
+                .try_poll_send_to($cx, &$self.this_poll.tmp_buf[..len], $self.remote)?;
+        if !$self.this_poll.transport_pending {
+            $segment_iter_item.on_sent($self.this_poll.now);
+            on_packet_sent!($self, $header);
+
+            // rfc6298 5.1
+            $self.timers.retransmit.set_for_retransmit(
+                $self.this_poll.now,
+                $self.rtte.retransmission_timeout(),
+                false,
+            );
+        }
+        !$self.this_poll.transport_pending
+    }};
 }
 
 impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
@@ -343,6 +318,47 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.user_rx.remaining_rx_window() as u32
     }
 
+    fn send_in_recovery(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
+        let cwnd = self.effective_remote_receive_window();
+        let mut header = self.outgoing_header();
+        match &mut self.recovery {
+            Recovery::CountingDuplicates { .. } => {
+                bail!("bug: called send_in_recovery while not in recovery")
+            }
+            Recovery::Recovery(rec) => {
+                while cwnd.saturating_sub(rec.pipe)
+                    >= self.socket_opts.max_outgoing_payload_size.get()
+                {
+                    let Some(NextSeg {
+                        mut item,
+                        is_rescue,
+                    }) = rec.next_seg(&mut self.user_tx_segments)?
+                    else {
+                        return Ok(());
+                    };
+
+                    if send_data!(self, cx, header, item) {
+                        trace!(
+                            %header.seq_nr,
+                            %header.ack_nr,
+                            payload_size = item.payload_size(),
+                            socket_was_full = self.this_poll.transport_pending,
+                            cwnd,
+                            rec.pipe,
+                            "RECOVERY: sent ST_DATA"
+                        );
+
+                        // C.3
+                        rec.pipe += item.payload_size();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     // Returns true if UDP socket is full
     fn send_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
         if self.user_tx_segments.is_empty() {
@@ -354,15 +370,36 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(());
         }
 
-        let mut last_sent = None;
-        // self.congestion_controller.pre_transmit(self.this_poll.now);
-        let mut recv_wnd = self.effective_remote_receive_window();
-
         let mut header = self.outgoing_header();
 
-        // Send only the stuff we haven't sent yet, up to sender's window.
+        // Retransmit timer expired, resend the first unacked segment.
+        if self.timers.retransmit.expired(self.this_poll.now) {
+            if let Some(mut seg) = self.user_tx_segments.iter_mut().next() {
+                if send_data!(self, cx, header, seg) {
+                    trace!(
+                        %header.seq_nr,
+                        %header.ack_nr,
+                        payload_size = seg.payload_size(),
+                        "RTO: sent ST_DATA"
+                    );
+                    self.timers.retransmit.set_for_idle();
+                }
+                return Ok(());
+            } else {
+                debug!("retransmit timer expired, but nothing to send");
+                self.timers.retransmit.set_for_idle();
+            }
+        }
+
+        if self.recovery.is_recovery() {
+            return self.send_in_recovery(cx);
+        }
+
+        let mut last_sent = None;
+        let mut recv_wnd = self.effective_remote_receive_window();
+
+        // Send the stuff we haven't sent yet, up to sender's window.
         for mut item in self.user_tx_segments.iter_mut() {
-            // Re-delivery - don't send until retransmission happens (it will rewind self.last_sent_seq_nr).
             let already_sent = item.seq_nr() <= self.last_sent_seq_nr;
             if already_sent {
                 recv_wnd = recv_wnd.saturating_sub(item.payload_size());
@@ -374,55 +411,33 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 continue;
             }
 
-            // if item.retransmit_count() == self.socket_opts.max_segment_retransmissions.get() {
-            //     METRICS.max_retransmissions_reached.increment(1);
-            //     anyhow::bail!("max number of retransmissions reached");
-            // }
-
             if recv_wnd < item.payload_size() {
                 METRICS.send_window_exhausted.increment(1);
                 debug_every_ms!(100, "remote recv window exhausted, not sending anything");
                 break;
             }
 
-            header.set_type(Type::ST_DATA);
-            header.seq_nr = item.seq_nr();
+            if send_data!(self, cx, header, item) {
+                trace!(
+                    %header.seq_nr,
+                    %header.ack_nr,
+                    payload_size = item.payload_size(),
+                    recv_wnd,
+                    "sent ST_DATA"
+                );
 
-            let len = header
-                .serialize_with_payload(&mut self.this_poll.tmp_buf, |b| {
-                    let offset = item.payload_offset();
-                    let len = item.payload_size();
-                    let g = self.user_tx.locked.lock();
-                    g.fill_buffer_from_ring_buffer(b, offset, len)
-                        .context("error filling output buffer from user_tx")?;
-                    Ok(len)
-                })
-                .context("bug: wasn't able to serialize the buffer")?;
+                self.last_sent_seq_nr = item.seq_nr();
+                self.seq_nr = item.seq_nr() + 1;
 
-            self.this_poll.transport_pending |=
-                self.socket
-                    .try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.remote)?;
-
-            trace!(
-                %header.seq_nr,
-                %header.ack_nr,
-                payload_size = len,
-                socket_was_full = self.this_poll.transport_pending,
-                recv_wnd,
-                "attempted to send ST_DATA"
-            );
+                recv_wnd = recv_wnd.saturating_sub(item.payload_size());
+                last_sent = Some(header);
+            } else {
+                break;
+            }
 
             if self.this_poll.transport_pending {
                 break;
             }
-
-            item.on_sent(self.this_poll.now);
-            self.last_sent_seq_nr = item.seq_nr();
-            self.seq_nr = item.seq_nr() + 1;
-
-            recv_wnd = recv_wnd.saturating_sub(item.payload_size());
-
-            last_sent = Some(header);
         }
 
         trace!(recv_wnd, "remaining recv_wnd after sending");
@@ -457,61 +472,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
     }
 
-    fn maybe_prepare_for_retransmission(&mut self) {
-        let Some(reason) = self.timers.retransmit.should_retransmit(self.this_poll.now) else {
-            return;
-        };
-
-        let rewind_to = self
-            .user_tx_segments
-            .first_seq_nr()
-            .or_else(|| self.state.our_fin_if_unacked())
-            .map(|rw| rw - 1);
-        let rewind_to = match rewind_to {
-            Some(v) => v,
-            None => {
-                trace!("nowhere to rewind to, resetting retransmit timer");
-                self.timers.retransmit.set_for_idle();
-                return;
-            }
-        };
-
-        // If a retransmit timer expired, we should resend data starting at the last ACK.
-        log_every_ms!(100, CONGESTION_TRACING_LOG_LEVEL, ?reason, ?rewind_to, ?self.last_sent_seq_nr, "retransmitting");
-
-        // Rewind "last sequence number sent", as if we never
-        // had sent them. This will cause all data in the queue
-        // to be sent again.
-        self.last_sent_seq_nr = rewind_to;
-
-        // Inform the congestion controller and RTTE that we're retransmitting.
-        if !matches!(reason, ShouldRetransmitReason::FastRetransmit) {
-            self.congestion_controller
-                .on_rto_timeout(self.this_poll.now);
-
-            // Inform RTTE to become more conservative.
-            log_if_changed!(
-                CONGESTION_TRACING_LOG_LEVEL,
-                "rtte:on_retransmit",
-                &mut self.rtte,
-                |r| r.retransmission_timeout(),
-                |r| r.on_retransmit()
-            );
-        }
-
-        self.timers.retransmit.set_for_idle();
-    }
-
     fn on_packet_sent(&mut self, header: &UtpHeader) {
-        // Each packet sent can act as ACK so update related state.
-        self.last_sent_ack_nr = header.ack_nr;
-        self.last_sent_window = header.wnd_size;
-        self.consumed_but_unacked_bytes = 0;
-        self.timers.reset_delayed_ack_timer();
-        if matches!(header.get_type(), Type::ST_DATA) {
-            self.timers.remote_inactivity_timer =
-                Some(self.this_poll.now + self.socket_opts.remote_inactivity_timeout);
-        }
+        on_packet_sent!(self, header)
     }
 
     fn send_control_packet(
@@ -626,7 +588,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         let mut remaining = g.len() - tx_offset;
-        // self.congestion_controller.pre_transmit(self.this_poll.now);
+
+        // TODO: need to refactor this to play nicely with recovery etc
         let mut remote_window_remaining = self
             .effective_remote_receive_window()
             .saturating_sub(self.user_tx_segments.total_len_bytes());
@@ -744,9 +707,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         }
 
-        if result.on_ack_result.acked_segments_count > 0 {
+        if result.on_ack_result.acked_segments_count > 0
+            || result.on_ack_result.newly_sacked_segment_count > 0
+        {
             self.timers.remote_inactivity_timer = None;
+        }
 
+        if result.on_ack_result.acked_segments_count > 0 {
             // Cleanup user side of TX queue, remove the ACKed bytes from the front of it,
             // and notify the writer.
             {
@@ -765,7 +732,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             trace!(?result.on_ack_result, "removed ACKed tx messages");
 
-            // Update RTO and congestion controller.
+            // Update RTO
             if let Some(rtt) = result.on_ack_result.new_rtt {
                 METRICS.rtt.record(rtt.as_secs_f64());
                 log_every_ms_if_changed!(
@@ -789,17 +756,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     self.rtte.retransmission_timeout(),
                     true,
                 );
-            }
-        } else {
-            match result.triple_duplicate_acks {
-                None => {}
-                Some(true) => {
-                    // self.congestion_controller
-                    //     .on_triple_duplicate_ack(self.this_poll.now);
-                    self.timers.retransmit.set_for_fast_retransmit();
-                    debug!("started fast retransmit");
-                }
-                Some(false) => {}
             }
         }
 
@@ -937,11 +893,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (LastAck { .. }, _) => {}
         }
 
-        let mut result = ProcessIncomingMessageResult {
+        let result = ProcessIncomingMessageResult {
             on_ack_result: self
                 .user_tx_segments
                 .remove_up_to_ack(self.this_poll.now, &msg.header),
-            ..Default::default()
         };
 
         self.congestion_controller.on_ack(
@@ -1227,10 +1182,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             bail_if_err!(self.split_tx_queue_into_segments(cx));
-
-            // If the retransmission timer expired and there's something to send,
-            // set up state for retransmission.
-            self.maybe_prepare_for_retransmission();
 
             // (Re)send tx queue.
             pending_if_cannot_send!(self.send_tx_queue(cx));
@@ -1521,7 +1472,6 @@ enum RetransmitTimer {
         expires_at: Instant,
         delay: Duration,
     },
-    FastRetransmit,
 }
 
 struct Timers {
@@ -1531,26 +1481,18 @@ struct Timers {
     ack_delay_timer: AckDelayTimer,
 }
 
-#[derive(Debug)]
-pub enum ShouldRetransmitReason {
-    #[allow(unused)]
-    ExpiredDelay(Duration),
-    FastRetransmit,
-}
-
 impl RetransmitTimer {
     fn new() -> RetransmitTimer {
         RetransmitTimer::Idle
     }
 
-    fn should_retransmit(&self, timestamp: Instant) -> Option<ShouldRetransmitReason> {
+    fn expired(&self, now: Instant) -> bool {
         match *self {
-            RetransmitTimer::Retransmit { expires_at, delay } if timestamp >= expires_at => {
+            RetransmitTimer::Retransmit { expires_at, .. } if now >= expires_at => {
                 trace!("should retransmit, timer expired");
-                Some(ShouldRetransmitReason::ExpiredDelay(delay))
+                true
             }
-            RetransmitTimer::FastRetransmit => Some(ShouldRetransmitReason::FastRetransmit),
-            _ => None,
+            _ => false,
         }
     }
 
@@ -1560,10 +1502,6 @@ impl RetransmitTimer {
             RetransmitTimer::Retransmit { expires_at, .. } => {
                 trace!(expires=?expires_at - now, "retransmit timer");
                 PollAt::Time(expires_at)
-            }
-            RetransmitTimer::FastRetransmit => {
-                trace!("fast restransmit: now");
-                PollAt::Now
             }
         }
     }
@@ -1588,13 +1526,7 @@ impl RetransmitTimer {
             RetransmitTimer::Retransmit { expires_at, delay } => {
                 RetransmitTimer::Retransmit { expires_at, delay }
             }
-            RetransmitTimer::FastRetransmit => RetransmitTimer::FastRetransmit,
         };
-    }
-
-    fn set_for_fast_retransmit(&mut self) {
-        trace!("setting for fast retransmit");
-        *self = RetransmitTimer::FastRetransmit
     }
 }
 

@@ -18,6 +18,7 @@ mod e2e_tests;
 mod message;
 mod metrics;
 pub mod raw;
+mod recovery;
 mod rtte;
 mod seq_nr;
 mod socket;

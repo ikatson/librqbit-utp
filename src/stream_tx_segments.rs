@@ -23,6 +23,10 @@ pub struct Segment {
     payload_size: usize,
     is_delivered: bool,
     sent: SentStatus,
+
+    // For SACK recovery purposes
+    pub is_lost: bool,
+    pub has_sacks_after_it: bool,
 }
 
 pub fn rtt_min(rtt1: Option<Duration>, rtt2: Option<Duration>) -> Option<Duration> {
@@ -34,7 +38,7 @@ pub fn rtt_min(rtt1: Option<Duration>, rtt2: Option<Duration>) -> Option<Duratio
 }
 
 impl Segment {
-    fn is_sent(&self) -> bool {
+    pub fn is_sent(&self) -> bool {
         !matches!(self.sent, SentStatus::NotSent)
     }
 
@@ -67,6 +71,10 @@ pub struct SegmentIterItem<T> {
 }
 
 impl<T: Borrow<Segment>> SegmentIterItem<T> {
+    pub fn segment(&self) -> &Segment {
+        self.segment.borrow()
+    }
+
     pub fn seq_nr(&self) -> SeqNr {
         self.seq_nr
     }
@@ -219,6 +227,8 @@ impl Segments {
             payload_size: payload_len,
             is_delivered: false,
             sent: SentStatus::NotSent,
+            is_lost: false,
+            has_sacks_after_it: false,
         });
         self.len_bytes += payload_len;
         true
@@ -311,7 +321,7 @@ impl Segments {
     }
 
     // rfc6675 SetPipe
-    pub fn calc_sack_pipe(&self, high_rxt: SeqNr) -> usize {
+    pub fn calc_sack_pipe(&mut self, high_rxt: SeqNr) -> usize {
         let mut in_contig = false;
         let mut non_contig_count = 0;
         let mut sacked_bytes = 0usize;
@@ -321,15 +331,17 @@ impl Segments {
 
         for (seq_nr, seg) in self
             .segments
-            .iter()
+            .iter_mut()
             .enumerate()
             .rev()
             .skip_while(|(_, s)| !s.is_sent())
             .map(|(idx, seg)| (self.snd_una + idx as u16, seg))
         {
-            let is_lost = !seg.is_delivered
+            seg.is_lost = !seg.is_delivered
                 && (non_contig_count >= SACK_DUP_THRESH || sacked_bytes >= sacked_bytes_limit);
-            if !seg.is_delivered && !is_lost {
+            seg.has_sacks_after_it = sacked_bytes > 0;
+
+            if !seg.is_delivered && !seg.is_lost {
                 pipe += seg.payload_size;
             }
             if seq_nr <= high_rxt {
@@ -355,6 +367,7 @@ impl Segments {
     }
 
     // rfc6675 IsLost
+    // TODO: use pre-calculated values from set_pipe
     pub fn is_lost(&self, seq_nr: SeqNr, sack_len: usize) -> bool {
         let mss = self.smss();
         let mut it = self
