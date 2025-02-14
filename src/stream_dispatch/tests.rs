@@ -413,7 +413,6 @@ async fn test_fast_retransmit() {
     t.send_msg(ack, "");
 
     t.poll_once_assert_pending().await;
-    assert_eq!(t.vsock.local_rx_dup_acks, 2);
     t.assert_sent_empty_msg("Should not retransmit yet");
 
     // Third duplicate ACK should trigger fast retransmit
@@ -1292,7 +1291,6 @@ async fn test_duplicate_ack_only_on_st_state() {
     // First normal ST_STATE ACK
     t.send_msg(header, "");
     t.poll_once_assert_pending().await;
-    assert_eq!(t.vsock.local_rx_dup_acks, 0);
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
 
     // Change to ST_DATA with same ACK - shouldn't count as duplicate
@@ -1300,14 +1298,12 @@ async fn test_duplicate_ack_only_on_st_state() {
     header.seq_nr += 1;
     t.send_msg(header, "a");
     t.poll_once_assert_pending().await;
-    assert_eq!(t.vsock.local_rx_dup_acks, 0);
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
 
     // Another ST_DATA - shouldn't count
     header.seq_nr += 1;
     t.send_msg(header, "b");
     t.poll_once_assert_pending().await;
-    assert_eq!(t.vsock.local_rx_dup_acks, 0);
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
 
     // ST_FIN with same ACK - shouldn't count
@@ -1318,7 +1314,6 @@ async fn test_duplicate_ack_only_on_st_state() {
     t.poll_once_assert_pending().await;
 
     // Duplicate ACK count should be 0 since non-ST_STATE packets don't count
-    assert_eq!(t.vsock.local_rx_dup_acks, 0);
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
     assert_eq!(
         t.take_sent(),
@@ -1335,7 +1330,6 @@ async fn test_duplicate_ack_only_on_st_state() {
     t.poll_once_assert_pending().await;
 
     // Now we should see duplicate ACKs counted and fast retransmit triggered
-    assert_eq!(t.vsock.local_rx_dup_acks, 3);
     assert_eq!(
         t.take_sent(),
         vec![

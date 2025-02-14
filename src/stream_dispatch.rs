@@ -150,6 +150,8 @@ enum Recovery {
         // "HighRxt" is the highest sequence number which has been
         //  retransmitted during the current loss recovery phase.
         high_rxt: SeqNr,
+
+        pipe: usize,
     },
 }
 
@@ -178,31 +180,39 @@ impl Recovery {
 
                 *dup_acks += 1;
 
+                let high_ack = last_consumed_remote_seq_nr;
+                let high_data = last_sent_seq_nr;
+
                 let should_enter_recovery = *dup_acks as usize >= SACK_DUP_THRESH
-                    || tx_segs.is_lost(last_consumed_remote_seq_nr + 1, SACK_DEPTH);
+                    || tx_segs.is_lost(high_ack + 1, SACK_DEPTH);
 
                 if !should_enter_recovery {
                     return;
                 }
 
+                let high_rxt = high_ack;
+
                 // TODO: we are skipping the part 3
                 // "The TCP MAY transmit previously unsent data segments as per Limited transmit"
                 congestion_controller.on_triple_duplicate_ack(now);
                 *self = Recovery::Recovery {
-                    recovery_point: last_sent_seq_nr, // HighData
-                    high_rxt: last_consumed_remote_seq_nr,
+                    recovery_point: high_data, // HighData
+                    high_rxt,
+                    pipe: tx_segs.calc_sack_pipe(high_rxt),
                 };
-
-                // TODO: Run SetPipe ()
             }
             Recovery::Recovery {
                 recovery_point,
                 high_rxt,
+                pipe,
             } => {
                 if header.ack_nr >= *recovery_point {
                     // We should get back to counting acks here.
                     *self = Recovery::CountingDuplicates { dup_acks: 0 };
+                    return;
                 }
+
+                *pipe = tx_segs.calc_sack_pipe(*high_rxt);
             }
         }
     }
@@ -1480,9 +1490,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             },
 
             socket: socket.clone(),
-            recovery: Recovery {
-                // todo!()
-            },
+            recovery: Recovery::CountingDuplicates { dup_acks: 0 },
         };
 
         METRICS.live_virtual_sockets.increment(1);

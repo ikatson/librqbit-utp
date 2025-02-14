@@ -311,17 +311,54 @@ impl Segments {
     }
 
     // rfc6675 SetPipe
-    // TODO: we don't need &mut, add non-mut iterator
-    pub fn calc_sack_pipe(&self) -> usize {
-        let mut it = self.iter().take_while(|s| s.segment.is_sent());
+    pub fn calc_sack_pipe(&self, high_rxt: SeqNr) -> usize {
+        let mut in_contig = false;
+        let mut non_contig_count = 0;
+        let mut sacked_bytes = 0usize;
+        let sacked_bytes_limit = (SACK_DUP_THRESH - 1) * self.smss();
+
+        let mut pipe = 0;
+
+        for (seq_nr, seg) in self
+            .segments
+            .iter()
+            .enumerate()
+            .rev()
+            .skip_while(|(_, s)| !s.is_sent())
+            .map(|(idx, seg)| (self.snd_una + idx as u16, seg))
+        {
+            let is_lost = !seg.is_delivered
+                && (non_contig_count >= SACK_DUP_THRESH || sacked_bytes >= sacked_bytes_limit);
+            if !seg.is_delivered && !is_lost {
+                pipe += seg.payload_size;
+            }
+            if seq_nr <= high_rxt {
+                pipe += seg.payload_size;
+            }
+
+            if seg.is_delivered {
+                sacked_bytes += seg.payload_size;
+            }
+
+            match (in_contig, seg.is_delivered) {
+                (true, true) | (false, false) => continue,
+                (true, false) => {
+                    in_contig = false;
+                }
+                (false, true) => {
+                    in_contig = true;
+                    non_contig_count += 1;
+                }
+            }
+        }
+        pipe
     }
 
     // rfc6675 IsLost
-    // TODO: we don't need &mut, add non-mut iterator
-    pub fn is_lost(&mut self, seq_nr: SeqNr, sack_len: usize) -> bool {
+    pub fn is_lost(&self, seq_nr: SeqNr, sack_len: usize) -> bool {
         let mss = self.smss();
         let mut it = self
-            .iter_mut()
+            .iter()
             .take(sack_len + 1) // TODO: ensure this doesn't cause issues for later segs
             .skip_while(|s| s.seq_nr() < seq_nr);
         let Some(seg) = it.next() else {
@@ -385,7 +422,7 @@ impl Segments {
         )
     }
 
-    pub fn iter(&mut self) -> impl Iterator<Item = SegmentIterItem<&Segment>> {
+    pub fn iter(&self) -> impl Iterator<Item = SegmentIterItem<&Segment>> {
         self.segments.iter().scan(
             SegmentIterState {
                 seq_nr: self.snd_una,
