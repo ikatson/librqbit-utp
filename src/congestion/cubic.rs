@@ -33,7 +33,7 @@ impl core::fmt::Debug for Cubic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "window={},cwnd={},sshthresh:{}",
+            "window={},cwnd={:.2},sshthresh:{:.2}",
             self.window(),
             self.cwnd,
             self.ssthresh

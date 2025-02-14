@@ -27,7 +27,7 @@ where
         log_every_ms_if_changed!(
             500,
             CONGESTION_TRACING_LOG_LEVEL,
-            "on_ack:cwnd",
+            "on_ack",
             self,
             |s| s.inner,
             |s| s.inner.on_ack(now, len, rtt)
@@ -37,7 +37,7 @@ where
     fn on_rto_timeout(&mut self, now: Instant) {
         log_if_changed!(
             CONGESTION_TRACING_LOG_LEVEL,
-            "on_retransmit:cwnd",
+            "on_rto_timeout",
             self,
             |s| s.inner,
             |s| s.inner.on_rto_timeout(now)
@@ -47,7 +47,7 @@ where
     fn on_triple_duplicate_ack(&mut self, now: Instant) {
         log_if_changed!(
             CONGESTION_TRACING_LOG_LEVEL,
-            "on_duplicate_ack:cwnd",
+            "on_triple_duplicate_ack",
             self,
             |s| s.inner,
             |s| s.inner.on_triple_duplicate_ack(now)
