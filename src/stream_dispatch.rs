@@ -287,7 +287,7 @@ macro_rules! send_data {
             $self.timers.retransmit.set_for_retransmit(
                 $self.this_poll.now,
                 $self.rtte.retransmission_timeout(),
-                false,
+                true,
             );
         }
         !$self.this_poll.transport_pending

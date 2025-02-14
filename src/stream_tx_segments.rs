@@ -294,21 +294,21 @@ impl Segments {
                         process_sack(segment, acked);
                     }
                 }
-
-                // Cleanup the beginning of the queue if an older ACK ends up marking it delivered.
-                while let Some(segment) = self.segments.front() {
-                    if !segment.is_delivered {
-                        break;
-                    }
-                    removed += 1;
-                    payload_size += segment.payload_size;
-                    self.len_bytes -= segment.payload_size;
-                    self.snd_una += 1;
-                    self.segments.pop_front().unwrap();
-                }
             }
             _ => {}
         };
+
+        // Cleanup the beginning of the queue if an older ACK ends up marking it delivered.
+        while let Some(segment) = self.segments.front() {
+            if !segment.is_delivered {
+                break;
+            }
+            removed += 1;
+            payload_size += segment.payload_size;
+            self.len_bytes -= segment.payload_size;
+            self.snd_una += 1;
+            self.segments.pop_front().unwrap();
+        }
 
         OnAckResult {
             acked_segments_count: removed,

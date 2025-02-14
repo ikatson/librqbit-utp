@@ -1637,18 +1637,6 @@ async fn test_selective_ack_retransmission() {
     const FORCED_RETRANSMISSION_TIME: Duration = Duration::from_secs(1);
     t.vsock.rtte.force_timeout(FORCED_RETRANSMISSION_TIME);
 
-    // Allow sending by setting window size
-    t.send_msg(
-        UtpHeader {
-            htype: ST_STATE,
-            seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
-            wnd_size: 1024,
-            ..Default::default()
-        },
-        "",
-    );
-
     // Write enough data to generate multiple packets
     t.stream
         .as_mut()
