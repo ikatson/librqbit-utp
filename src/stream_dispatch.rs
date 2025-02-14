@@ -31,7 +31,7 @@ use crate::{
     stream::UtpStream,
     stream_rx::{AssemblerAddRemoveResult, UserRx},
     stream_tx::{UserTx, UtpStreamWriteHalf},
-    stream_tx_segments::{OnAckResult, Segments},
+    stream_tx_segments::{rtt_min, OnAckResult, Segments},
     traits::{Transport, UtpEnvironment},
     utils::{update_optional_waker, DropGuardSendBeforeDeath},
     UtpSocket,
@@ -219,6 +219,22 @@ struct ThisPoll {
 
     // Set if the transport can't send anything this poll.
     transport_pending: bool,
+}
+
+#[derive(Default)]
+struct ProcessIncomingMessageResult {
+    on_ack_result: OnAckResult,
+    triple_duplicate_acks: Option<bool>,
+}
+
+impl ProcessIncomingMessageResult {
+    pub(crate) fn update(&mut self, other: &ProcessIncomingMessageResult) {
+        self.on_ack_result.update(&other.on_ack_result);
+        match other.triple_duplicate_acks {
+            Some(v) => self.triple_duplicate_acks = Some(v),
+            None => {}
+        }
+    }
 }
 
 impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
@@ -626,7 +642,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> anyhow::Result<()> {
-        let mut on_ack_result = OnAckResult::default();
+        let mut result = ProcessIncomingMessageResult::default();
         while let Poll::Ready(msg) = self.rx.poll_recv(cx) {
             let msg = match msg {
                 Some(msg) => msg,
@@ -645,20 +661,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     return Ok(());
                 }
             };
-            on_ack_result.update(&self.process_incoming_message(cx, msg)?);
+            result.update(&self.process_incoming_message(cx, msg)?);
             if self.state_is_closed() {
                 break;
             }
         }
 
-        if on_ack_result.acked_segments_count > 0 {
+        if result.on_ack_result.acked_segments_count > 0 {
             self.timers.remote_inactivity_timer = None;
 
             // Cleanup user side of TX queue, remove the ACKed bytes from the front of it,
             // and notify the writer.
             {
                 let mut g = self.user_tx.locked.lock();
-                g.truncate_front(on_ack_result.acked_bytes)?;
+                g.truncate_front(result.on_ack_result.acked_bytes)?;
 
                 let waker = g.writer_waker.take();
 
@@ -670,10 +686,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
-            trace!(?on_ack_result, "removed ACKed tx messages");
+            trace!(?result.on_ack_result, "removed ACKed tx messages");
 
             // Update RTO and congestion controller.
-            if let Some(rtt) = on_ack_result.new_rtt {
+            if let Some(rtt) = result.on_ack_result.new_rtt {
                 METRICS.rtt.record(rtt.as_secs_f64());
                 log_if_changed!(
                     RTTE_TRACING_LOG_LEVEL,
@@ -696,6 +712,17 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     true,
                 );
             }
+        } else {
+            match result.triple_duplicate_acks {
+                None => {}
+                Some(true) => {
+                    self.congestion_controller
+                        .on_triple_duplicate_ack(self.this_poll.now);
+                    self.timers.retransmit.set_for_fast_retransmit();
+                    debug!("started fast retransmit");
+                }
+                Some(false) => {}
+            }
         }
 
         Ok(())
@@ -711,7 +738,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         &mut self,
         cx: &mut std::task::Context<'_>,
         msg: UtpMessage,
-    ) -> anyhow::Result<OnAckResult> {
+    ) -> anyhow::Result<ProcessIncomingMessageResult> {
         trace!("processing message");
 
         // Process state changes and invalid packets.
@@ -829,13 +856,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (LastAck { .. }, _) => {}
         }
 
-        let on_ack_result = self
-            .user_tx_segments
-            .remove_up_to_ack(self.this_poll.now, &msg.header);
+        let mut result = ProcessIncomingMessageResult {
+            on_ack_result: self
+                .user_tx_segments
+                .remove_up_to_ack(self.this_poll.now, &msg.header),
+            ..Default::default()
+        };
 
         self.congestion_controller.on_ack(
             self.this_poll.now,
-            on_ack_result.acked_bytes,
+            result.on_ack_result.acked_bytes,
             &self.rtte,
         );
 
@@ -860,7 +890,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     );
                     METRICS.incoming_already_acked_data_packets.increment(1);
                     self.force_immediate_ack();
-                    return Ok(on_ack_result);
+                    return Ok(result);
                 }
 
                 trace!(
@@ -952,10 +982,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         );
 
                         if self.local_rx_dup_acks == 3 {
-                            self.congestion_controller
-                                .on_triple_duplicate_ack(self.this_poll.now);
-                            self.timers.retransmit.set_for_fast_retransmit();
-                            debug!("started fast retransmit");
+                            result.triple_duplicate_acks = Some(true)
                         }
                     }
                     // No duplicate ACK -> Reset state and update last received ACK
@@ -964,6 +991,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                             self.local_rx_dup_acks = 0;
                             trace!("reset duplicate ACK count");
                         }
+                        result.triple_duplicate_acks = Some(false);
                         self.local_rx_last_ack = Some(msg.header.ack_nr);
                     }
                 };
@@ -987,7 +1015,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 debug!("ignoring unexpected ST_SYN packet: {:?}", msg.header);
             }
         }
-        Ok(on_ack_result)
+        Ok(result)
     }
 
     fn should_send_window_update(&self) -> bool {
