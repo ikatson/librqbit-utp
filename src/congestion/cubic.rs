@@ -105,7 +105,7 @@ impl CongestionController for Cubic {
             //
             let t = now - self.last_congestion_event;
             let w_cubic_v = w_cubic(t, self.k, self.w_max);
-            let rtt = rtte.roundtrip_time_estimate();
+            let rtt = rtte.roundtrip_time();
             let w_est_v = w_est(t, rtt, self.w_max);
 
             if w_cubic_v < w_est_v {

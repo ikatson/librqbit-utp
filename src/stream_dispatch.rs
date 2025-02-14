@@ -355,7 +355,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // rfc6298 5.1
             self.timers.retransmit.set_for_retransmit(
                 self.this_poll.now,
-                self.rtte.roundtrip_time_estimate(),
+                self.rtte.retransmission_timeout(),
                 false,
             );
         } else {
@@ -417,7 +417,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 CONGESTION_TRACING_LOG_LEVEL,
                 "rtte:on_retransmit",
                 &mut self.rtte,
-                |r| r.roundtrip_time_estimate(),
+                |r| r.retransmission_timeout(),
                 |r| r.on_retransmit()
             );
         }
@@ -503,7 +503,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if self.send_control_packet(cx, fin)? {
             self.timers.retransmit.set_for_retransmit(
                 self.this_poll.now,
-                self.rtte.roundtrip_time_estimate(),
+                self.rtte.retransmission_timeout(),
                 false,
             );
             self.timers.remote_inactivity_timer =
@@ -691,11 +691,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // Update RTO and congestion controller.
             if let Some(rtt) = result.on_ack_result.new_rtt {
                 METRICS.rtt.record(rtt.as_secs_f64());
-                log_if_changed!(
+                log_every_ms_if_changed!(
+                    500,
                     RTTE_TRACING_LOG_LEVEL,
                     "rtte:sample",
                     self,
-                    |s| s.rtte.roundtrip_time_estimate(),
+                    |s| s.rtte,
                     |s| s.rtte.sample(rtt)
                 );
             }
@@ -708,7 +709,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 // rfc6298 5.3
                 self.timers.retransmit.set_for_retransmit(
                     self.this_poll.now,
-                    self.rtte.roundtrip_time_estimate(),
+                    self.rtte.retransmission_timeout(),
                     true,
                 );
             }

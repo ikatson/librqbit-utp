@@ -24,7 +24,7 @@ fn calc_rto(srtt: Duration, rttvar: Duration) -> Duration {
 
 const K: u32 = 4;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 enum RttState {
     Initial {
         rto: Duration,
@@ -36,12 +36,23 @@ enum RttState {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct RttEstimator {
     state: RttState,
 
     #[cfg(test)]
     forced_timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for RttEstimator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "rtt:{:?},rto:{:?}",
+            self.roundtrip_time(),
+            self.retransmission_timeout()
+        )
+    }
 }
 
 impl Default for RttEstimator {
@@ -57,13 +68,27 @@ impl Default for RttEstimator {
     }
 }
 
+impl PartialEq for RttEstimator {
+    fn eq(&self, other: &Self) -> bool {
+        (self.roundtrip_time(), self.retransmission_timeout())
+            == (other.roundtrip_time(), other.retransmission_timeout())
+    }
+}
+
 impl RttEstimator {
     #[cfg(test)]
     pub fn force_timeout(&mut self, duration: Duration) {
         self.forced_timeout = Some(duration);
     }
 
-    pub fn roundtrip_time_estimate(&self) -> Duration {
+    pub fn roundtrip_time(&self) -> Duration {
+        match self.state {
+            RttState::Initial { rto } => rto,
+            RttState::Subsequent { srtt, .. } => srtt,
+        }
+    }
+
+    pub fn retransmission_timeout(&self) -> Duration {
         #[cfg(test)]
         if let Some(t) = self.forced_timeout {
             return t;
