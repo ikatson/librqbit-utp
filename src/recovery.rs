@@ -2,6 +2,8 @@
 /// Some other parts are in user_tx_segments and stream_dispatch
 use std::time::Instant;
 
+use tracing::debug;
+
 use crate::{
     congestion::CongestionController,
     constants::{SACK_DEPTH, SACK_DUP_THRESH},
@@ -156,8 +158,18 @@ impl Recovery {
                 let high_ack = last_consumed_remote_seq_nr;
                 let high_data = last_sent_seq_nr;
 
-                let should_enter_recovery = *dup_acks as usize >= SACK_DUP_THRESH
-                    || tx_segs.is_lost(high_ack + 1, SACK_DEPTH);
+                let is_lost = tx_segs.is_lost(high_ack + 1, SACK_DEPTH);
+
+                let should_enter_recovery = *dup_acks as usize >= SACK_DUP_THRESH || is_lost;
+
+                debug!(
+                    should_enter_recovery,
+                    first_is_lost = is_lost,
+                    dup_acks,
+                    ?high_ack,
+                    ?high_data,
+                    "counting duplicate acks"
+                );
 
                 if !should_enter_recovery {
                     return;
@@ -168,20 +180,26 @@ impl Recovery {
                 // TODO: we are skipping the part 3
                 // "The TCP MAY transmit previously unsent data segments as per Limited transmit"
                 congestion_controller.on_triple_duplicate_ack(now);
-                *self = Recovery::Recovery(RecoveryPhase {
+                let rec = RecoveryPhase {
                     recovery_point: high_data,
                     high_rxt,
                     pipe: tx_segs.calc_sack_pipe(high_rxt),
                     rescue_rxt_used: false,
-                });
+                };
+                debug!(
+                    ?rec.recovery_point,
+                    ?rec.high_rxt, rec.pipe, "entered recovery"
+                );
+                *self = Recovery::Recovery(rec);
             }
             Recovery::Recovery(rec) => {
                 if header.ack_nr >= rec.recovery_point {
-                    // We should get back to counting acks here.
+                    debug!(?rec.recovery_point, ?header.ack_nr, "exited recovery");
                     *self = Recovery::CountingDuplicates { dup_acks: 0 };
                     return;
                 }
                 rec.pipe = tx_segs.calc_sack_pipe(rec.high_rxt);
+                debug!(rec.pipe, "recovery: updated pipe");
             }
         }
     }
