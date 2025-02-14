@@ -278,6 +278,11 @@ macro_rules! send_data {
             $segment_iter_item.on_sent($self.this_poll.now);
             on_packet_sent!($self, $header);
 
+            if $segment_iter_item.seq_nr() > $self.last_sent_seq_nr {
+                $self.last_sent_seq_nr = $segment_iter_item.seq_nr();
+                $self.seq_nr = $segment_iter_item.seq_nr() + 1;
+            }
+
             // rfc6298 5.1
             $self.timers.retransmit.set_for_retransmit(
                 $self.this_poll.now,
@@ -348,6 +353,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                             "RECOVERY: sent ST_DATA"
                         );
 
+                        if !is_rescue {
+                            rec.high_rxt = rec.high_rxt.max(item.seq_nr())
+                        }
+
                         // C.3
                         rec.pipe += item.payload_size();
                     } else {
@@ -376,18 +385,32 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if self.timers.retransmit.expired(self.this_poll.now) {
             if let Some(mut seg) = self.user_tx_segments.iter_mut().next() {
                 if send_data!(self, cx, header, seg) {
+                    self.congestion_controller
+                        .on_rto_timeout(self.this_poll.now);
+                    self.rtte.on_retransmit();
+                    if let Recovery::Recovery(rec) = &mut self.recovery {
+                        rec.high_rxt = rec.high_rxt.max(seg.seq_nr());
+                    }
                     trace!(
                         %header.seq_nr,
                         %header.ack_nr,
                         payload_size = seg.payload_size(),
                         "RTO: sent ST_DATA"
                     );
-                    self.timers.retransmit.set_for_idle();
                 }
                 return Ok(());
             } else {
-                debug!("retransmit timer expired, but nothing to send");
-                self.timers.retransmit.set_for_idle();
+                // There's no data to send. Maybe we need to resend FIN? Check.
+                match self.state.our_fin_if_unacked() {
+                    Some(our_fin_seq_nr) if self.last_sent_seq_nr == our_fin_seq_nr => {
+                        debug!("RTO: rewinding self.last_sent_seq_nr to retransmit FIN");
+                        self.last_sent_seq_nr -= 1;
+                    }
+                    _ => {
+                        debug!("retransmit timer expired, but nothing to send");
+                        self.timers.retransmit.set_for_idle();
+                    }
+                }
             }
         }
 
@@ -395,7 +418,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return self.send_in_recovery(cx);
         }
 
-        let mut last_sent = None;
+        let mut sent = false;
         let mut recv_wnd = self.effective_remote_receive_window();
 
         // Send the stuff we haven't sent yet, up to sender's window.
@@ -425,12 +448,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     recv_wnd,
                     "sent ST_DATA"
                 );
-
-                self.last_sent_seq_nr = item.seq_nr();
-                self.seq_nr = item.seq_nr() + 1;
-
                 recv_wnd = recv_wnd.saturating_sub(item.payload_size());
-                last_sent = Some(header);
+                sent = true;
             } else {
                 break;
             }
@@ -440,18 +459,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         }
 
-        trace!(recv_wnd, "remaining recv_wnd after sending");
-
-        if let Some(header) = last_sent {
-            self.on_packet_sent(&header);
-            // rfc6298 5.1
-            self.timers.retransmit.set_for_retransmit(
-                self.this_poll.now,
-                self.rtte.retransmission_timeout(),
-                false,
-            );
-        } else {
+        if !sent {
             trace!(recv_wnd, "did not send anything");
+        } else {
+            trace!(recv_wnd, "remaining recv_wnd after sending");
         }
 
         Ok(())
@@ -530,8 +541,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         };
 
         // Only send fin after all the outstanding data was sent.
-        // TODO: move last_sent_seq_nr even if packets were delivered previously
-        // in "send_tx_queue"
         if seq_nr - self.last_sent_seq_nr != 1 {
             return Ok(());
         }
@@ -1412,7 +1421,11 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_sent_ack_nr,
             consumed_but_unacked_bytes: 0,
             rx,
-            user_tx_segments: Segments::new(seq_nr, socket.opts().user_tx_segments_capacity.get()),
+            user_tx_segments: Segments::new(
+                seq_nr,
+                socket.opts().virtual_socket_tx_bytes.get(),
+                socket.opts().max_outgoing_payload_size.get(),
+            ),
             user_tx,
             rtte: {
                 let mut rtte = RttEstimator::default();

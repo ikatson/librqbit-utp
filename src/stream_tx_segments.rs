@@ -62,6 +62,7 @@ pub struct Segments {
     // If all acknowledged, this is the same as SND.NEXT.
     // Name is the same as in https://datatracker.ietf.org/doc/html/rfc9293#section-3.3.1
     snd_una: SeqNr,
+    smss: usize,
 }
 
 pub struct SegmentIterItem<T> {
@@ -170,12 +171,13 @@ impl core::fmt::Debug for OnAckResult {
 }
 
 impl Segments {
-    pub fn new(snd_una: SeqNr, capacity: usize) -> Self {
+    pub fn new(snd_una: SeqNr, tx_bytes: usize, smss: usize) -> Self {
         Segments {
             segments: VecDeque::new(),
             // TODO: store total sacked (marked delivered through sack)
             len_bytes: 0,
-            capacity,
+            capacity: tx_bytes / smss,
+            smss,
             snd_una,
         }
     }
@@ -317,7 +319,7 @@ impl Segments {
     }
 
     fn smss(&self) -> usize {
-        todo!()
+        self.smss
     }
 
     // rfc6675 SetPipe
@@ -455,7 +457,7 @@ mod tests {
     use super::Segments;
 
     fn make_segmented_tx(start_seq_nr: u16, count: u16) -> Segments {
-        let mut ftx = Segments::new(start_seq_nr.into(), 64);
+        let mut ftx = Segments::new(start_seq_nr.into(), 64, 1);
         for _ in 0..count {
             assert!(ftx.enqueue(1));
         }

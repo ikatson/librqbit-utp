@@ -18,14 +18,6 @@ pub struct RecoveryPhase {
     // retransmitted during the current loss recovery phase.
     pub high_rxt: SeqNr,
 
-    // "HighACK" is the sequence number of the highest byte of data that
-    // has been cumulatively ACKed at a given point.
-    pub high_ack: SeqNr,
-
-    // "HighData" is the highest sequence number transmitted at a given
-    // point.
-    pub high_data: SeqNr,
-
     // "RescueRxt" is the highest sequence number which has been
     // optimistically retransmitted to prevent stalling of the ACK clock
     // when there is loss at the end of the window and no new data is
@@ -180,8 +172,6 @@ impl Recovery {
                     recovery_point: high_data,
                     high_rxt,
                     pipe: tx_segs.calc_sack_pipe(high_rxt),
-                    high_data,
-                    high_ack,
                     rescue_rxt_used: false,
                 });
             }
@@ -191,7 +181,6 @@ impl Recovery {
                     *self = Recovery::CountingDuplicates { dup_acks: 0 };
                     return;
                 }
-                rec.high_ack = last_sent_seq_nr;
                 rec.pipe = tx_segs.calc_sack_pipe(rec.high_rxt);
             }
         }
