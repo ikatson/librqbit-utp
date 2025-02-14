@@ -5,6 +5,7 @@
 // remove from the actual TX (bytes) that are stored in struct UserTx.
 
 use std::{
+    borrow::{Borrow, BorrowMut},
     collections::VecDeque,
     time::{Duration, Instant},
 };
@@ -18,7 +19,7 @@ enum SentStatus {
     Retransmitted { count: usize },
 }
 
-struct Segment {
+pub struct Segment {
     payload_size: usize,
     is_delivered: bool,
     sent: SentStatus,
@@ -55,56 +56,78 @@ pub struct Segments {
     snd_una: SeqNr,
 }
 
-pub struct SegmentIterItem<'a> {
-    segment: &'a mut Segment,
+pub struct SegmentIterItem<T> {
+    segment: T,
     seq_nr: SeqNr,
     payload_offset: usize,
 }
 
-impl SegmentIterItem<'_> {
+impl<T: Borrow<Segment>> SegmentIterItem<T> {
     pub fn seq_nr(&self) -> SeqNr {
         self.seq_nr
     }
     pub fn is_delivered(&self) -> bool {
-        self.segment.is_delivered
+        self.segment.borrow().is_delivered
     }
     pub fn payload_size(&self) -> usize {
-        self.segment.payload_size
+        self.segment.borrow().payload_size
     }
     pub fn payload_offset(&self) -> usize {
         self.payload_offset
     }
 
     pub fn retransmit_count(&self) -> usize {
-        match self.segment.sent {
+        match self.segment.borrow().sent {
             SentStatus::NotSent => 0,
             SentStatus::SentTime(..) => 0,
             SentStatus::Retransmitted { count } => count,
         }
     }
+}
 
+impl<T: BorrowMut<Segment>> SegmentIterItem<T> {
     pub fn on_sent(&mut self, now: Instant) {
-        self.segment.sent = match self.segment.sent {
+        let seg = self.segment.borrow_mut();
+        seg.sent = match seg.sent {
             SentStatus::NotSent => {
                 METRICS.send_count.increment(1);
-                METRICS.sent_bytes.increment(self.payload_size() as u64);
+                METRICS.sent_bytes.increment(seg.payload_size as u64);
                 SentStatus::SentTime(now)
             }
             SentStatus::SentTime(_) => {
                 METRICS.data_retransmissions.increment(1);
                 METRICS
                     .retransmitted_bytes
-                    .increment(self.payload_size() as u64);
+                    .increment(seg.payload_size as u64);
                 SentStatus::Retransmitted { count: 1 }
             }
             SentStatus::Retransmitted { count } => {
                 METRICS.data_retransmissions.increment(1);
                 METRICS
                     .retransmitted_bytes
-                    .increment(self.payload_size() as u64);
+                    .increment(seg.payload_size as u64);
                 SentStatus::Retransmitted { count: count + 1 }
             }
         };
+    }
+}
+
+struct SegmentIterState {
+    seq_nr: SeqNr,
+    payload_offset: usize,
+}
+
+impl SegmentIterState {
+    fn on_scan<T: Borrow<Segment>>(&mut self, segment: T) -> Option<SegmentIterItem<T>> {
+        let ps = segment.borrow().payload_size;
+        let item = SegmentIterItem {
+            segment,
+            payload_offset: self.payload_offset,
+            seq_nr: self.seq_nr,
+        };
+        self.payload_offset += ps;
+        self.seq_nr += 1;
+        Some(item)
     }
 }
 
@@ -274,27 +297,23 @@ impl Segments {
     }
 
     // Iterate stored data - headers and their payload offsets (as a function to copy payload to some other buffer).
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = SegmentIterItem<'_>> {
-        struct State {
-            seq_nr: SeqNr,
-            payload_offset: usize,
-        }
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = SegmentIterItem<&mut Segment>> {
         self.segments.iter_mut().scan(
-            State {
+            SegmentIterState {
                 seq_nr: self.snd_una,
                 payload_offset: 0,
             },
-            |state, segment| {
-                let ps = segment.payload_size;
-                let item = SegmentIterItem {
-                    segment,
-                    payload_offset: state.payload_offset,
-                    seq_nr: state.seq_nr,
-                };
-                state.payload_offset += ps;
-                state.seq_nr += 1;
-                Some(item)
+            SegmentIterState::on_scan,
+        )
+    }
+
+    pub fn iter(&mut self) -> impl Iterator<Item = SegmentIterItem<&Segment>> {
+        self.segments.iter().scan(
+            SegmentIterState {
+                seq_nr: self.snd_una,
+                payload_offset: 0,
             },
+            SegmentIterState::on_scan,
         )
     }
 }
