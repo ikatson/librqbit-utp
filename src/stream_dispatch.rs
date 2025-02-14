@@ -13,13 +13,13 @@ use std::{
 use anyhow::{bail, Context};
 use tokio::{sync::mpsc::UnboundedReceiver, time::Sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error_span, trace, warn, Level};
+use tracing::{debug, error_span, trace, trace_span, warn, Level};
 
 use crate::{
     congestion::CongestionController,
     constants::{
         ACK_DELAY, CONGESTION_TRACING_LOG_LEVEL, IMMEDIATE_ACK_EVERY_RMSS, RTTE_TRACING_LOG_LEVEL,
-        SYNACK_RESEND_INTERNAL,
+        SACK_DEPTH, SACK_DUP_THRESH, SYNACK_RESEND_INTERNAL,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -139,6 +139,75 @@ impl UserRxMessage {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Recovery {
+    CountingDuplicates {
+        dup_acks: u8,
+    },
+    Recovery {
+        recovery_point: SeqNr,
+
+        // "HighRxt" is the highest sequence number which has been
+        //  retransmitted during the current loss recovery phase.
+        high_rxt: SeqNr,
+    },
+}
+
+impl Recovery {
+    fn on_ack(
+        &mut self,
+        header: &UtpHeader,
+        on_ack_result: &OnAckResult,
+        tx_segs: &mut Segments,
+        congestion_controller: &mut dyn CongestionController,
+        now: Instant,
+        last_consumed_remote_seq_nr: SeqNr,
+        last_sent_seq_nr: SeqNr,
+    ) {
+        match self {
+            Recovery::CountingDuplicates { dup_acks } => {
+                if header.extensions.selective_ack.is_none() {
+                    *dup_acks = 0;
+                    return;
+                }
+
+                let is_duplicate = on_ack_result.newly_sacked_segment_count > 0;
+                if !is_duplicate {
+                    return;
+                }
+
+                *dup_acks += 1;
+
+                let should_enter_recovery = *dup_acks as usize >= SACK_DUP_THRESH
+                    || tx_segs.is_lost(last_consumed_remote_seq_nr + 1, SACK_DEPTH);
+
+                if !should_enter_recovery {
+                    return;
+                }
+
+                // TODO: we are skipping the part 3
+                // "The TCP MAY transmit previously unsent data segments as per Limited transmit"
+                congestion_controller.on_triple_duplicate_ack(now);
+                *self = Recovery::Recovery {
+                    recovery_point: last_sent_seq_nr, // HighData
+                    high_rxt: last_consumed_remote_seq_nr,
+                };
+
+                // TODO: Run SetPipe ()
+            }
+            Recovery::Recovery {
+                recovery_point,
+                high_rxt,
+            } => {
+                if header.ack_nr >= *recovery_point {
+                    // We should get back to counting acks here.
+                    *self = Recovery::CountingDuplicates { dup_acks: 0 };
+                }
+            }
+        }
+    }
+}
+
 // An equivalent of a TCP socket for uTP.
 struct VirtualSocket<T, Env> {
     state: VirtualSocketState,
@@ -187,10 +256,6 @@ struct VirtualSocket<T, Env> {
     rx: UnboundedReceiver<UtpMessage>,
     user_rx: UserRx,
 
-    // Last received ACK for fast retransmit
-    local_rx_last_ack: Option<SeqNr>,
-    local_rx_dup_acks: u8,
-
     // The user ppayload that we haven't yet segmented into uTP messages.
     // This is what "UtpStream::poll_write" writes to.
     user_tx: Arc<UserTx>,
@@ -199,6 +264,8 @@ struct VirtualSocket<T, Env> {
 
     rtte: RttEstimator,
     congestion_controller: Box<dyn CongestionController>,
+
+    recovery: Recovery,
 
     this_poll: ThisPoll,
 
@@ -717,8 +784,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             match result.triple_duplicate_acks {
                 None => {}
                 Some(true) => {
-                    self.congestion_controller
-                        .on_triple_duplicate_ack(self.this_poll.now);
+                    // self.congestion_controller
+                    //     .on_triple_duplicate_ack(self.this_poll.now);
                     self.timers.retransmit.set_for_fast_retransmit();
                     debug!("started fast retransmit");
                 }
@@ -729,17 +796,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(())
     }
 
-    #[tracing::instrument(level = "trace", name="msg", skip_all, fields(
-        seq_nr=%msg.header.seq_nr,
-        ack_nr=%msg.header.ack_nr,
-        len=msg.payload().len(),
-        msgtype=?msg.header.get_type()
-    ))]
     fn process_incoming_message(
         &mut self,
         cx: &mut std::task::Context<'_>,
         msg: UtpMessage,
     ) -> anyhow::Result<ProcessIncomingMessageResult> {
+        // We are not using tracing::instrument here as it makes rust-analyzer work worse
+        let span = trace_span!("msg",
+            seq_nr=%msg.header.seq_nr,
+            ack_nr=%msg.header.ack_nr,
+            len=msg.payload().len(),
+            msgtype=?msg.header.get_type()
+        );
+        let _span_g = span.enter();
+
         trace!("processing message");
 
         // Process state changes and invalid packets.
@@ -872,7 +942,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         self.last_remote_timestamp = msg.header.timestamp_microseconds;
 
-        let is_window_update = self.last_remote_window != msg.header.wnd_size;
         self.last_remote_window = msg.header.wnd_size;
         self.congestion_controller
             .set_remote_window(msg.header.wnd_size as usize);
@@ -957,45 +1026,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
             ST_STATE => {
-                // Fast retransmit in case of duplicate ACKs
-                match self.local_rx_last_ack {
-                    // Duplicate ACK if payload empty and ACK doesn't move send window ->
-                    // Increment duplicate ACK count and set for retransmit if we just received
-                    // the third duplicate ACK
-                    Some(last_rx_ack)
-                        if last_rx_ack == msg.header.ack_nr
-                            && self.last_sent_seq_nr > msg.header.ack_nr
-                            && !is_window_update =>
-                    {
-                        // Increment duplicate ACK count
-                        self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
-                        METRICS.duplicate_acks_received.increment(1);
-
-                        trace!(
-                            "received duplicate ACK for seq {} (duplicate nr {}{})",
-                            msg.header.ack_nr,
-                            self.local_rx_dup_acks,
-                            if self.local_rx_dup_acks == u8::MAX {
-                                "+"
-                            } else {
-                                ""
-                            }
-                        );
-
-                        if self.local_rx_dup_acks == 3 {
-                            result.triple_duplicate_acks = Some(true)
-                        }
-                    }
-                    // No duplicate ACK -> Reset state and update last received ACK
-                    _ => {
-                        if self.local_rx_dup_acks > 0 {
-                            self.local_rx_dup_acks = 0;
-                            trace!("reset duplicate ACK count");
-                        }
-                        result.triple_duplicate_acks = Some(false);
-                        self.local_rx_last_ack = Some(msg.header.ack_nr);
-                    }
-                };
+                self.recovery.on_ack(
+                    &msg.header,
+                    &result.on_ack_result,
+                    &mut self.user_tx_segments,
+                    &mut *self.congestion_controller,
+                    self.this_poll.now,
+                    self.last_consumed_remote_seq_nr,
+                    self.last_sent_seq_nr,
+                );
             }
             ST_RESET => bail!("ST_RESET received"),
             ST_FIN => {
@@ -1413,8 +1452,6 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             consumed_but_unacked_bytes: 0,
             rx,
             user_tx_segments: Segments::new(seq_nr, socket.opts().user_tx_segments_capacity.get()),
-            local_rx_last_ack: None,
-            local_rx_dup_acks: 0,
             user_tx,
             rtte: {
                 let mut rtte = RttEstimator::default();
@@ -1443,6 +1480,9 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             },
 
             socket: socket.clone(),
+            recovery: Recovery {
+                // todo!()
+            },
         };
 
         METRICS.live_virtual_sockets.increment(1);

@@ -1,6 +1,8 @@
 use bitvec::{order::Lsb0, BitArr};
 
-type SelectiveAckData = BitArr!(for 64, in u8, Lsb0);
+use crate::constants::SACK_DEPTH;
+
+type SelectiveAckData = BitArr!(for SACK_DEPTH, in u8, Lsb0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectiveAck {
@@ -11,7 +13,7 @@ impl SelectiveAck {
     pub fn new(unacked: impl Iterator<Item = usize>) -> Option<Self> {
         let mut data = SelectiveAckData::default();
 
-        for idx in unacked.take_while(|i| *i < 64) {
+        for idx in unacked.take_while(|i| *i < SACK_DEPTH) {
             data.set(idx, true);
         }
         Some(Self { data })

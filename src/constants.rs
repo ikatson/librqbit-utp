@@ -44,3 +44,6 @@ pub const RTTE_TRACING_LOG_LEVEL: Level = Level::TRACE;
 pub const DEFAULT_REMOTE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET: usize = 512;
+
+pub const SACK_DUP_THRESH: usize = 3;
+pub const SACK_DEPTH: usize = 64;

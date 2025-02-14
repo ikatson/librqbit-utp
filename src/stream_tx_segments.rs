@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
+use crate::{constants::SACK_DUP_THRESH, metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
 
 #[derive(Clone, Copy)]
 enum SentStatus {
@@ -34,6 +34,10 @@ pub fn rtt_min(rtt1: Option<Duration>, rtt2: Option<Duration>) -> Option<Duratio
 }
 
 impl Segment {
+    fn is_sent(&self) -> bool {
+        !matches!(self.sent, SentStatus::NotSent)
+    }
+
     fn update_rtt(&self, now: Instant, rtt: &mut Option<Duration>) {
         match self.sent {
             // This should not happen.
@@ -135,6 +139,7 @@ impl SegmentIterState {
 pub struct OnAckResult {
     pub acked_segments_count: usize,
     pub acked_bytes: usize,
+    pub newly_sacked_segment_count: usize,
     pub new_rtt: Option<Duration>,
 }
 
@@ -160,6 +165,7 @@ impl Segments {
     pub fn new(snd_una: SeqNr, capacity: usize) -> Self {
         Segments {
             segments: VecDeque::new(),
+            // TODO: store total sacked (marked delivered through sack)
             len_bytes: 0,
             capacity,
             snd_una,
@@ -228,6 +234,7 @@ impl Segments {
     pub fn remove_up_to_ack(&mut self, now: Instant, ack_header: &UtpHeader) -> OnAckResult {
         let mut removed = 0;
         let mut payload_size = 0;
+        let mut newly_sacked_segment_count: usize = 0;
 
         let mut new_rtt: Option<Duration> = None;
 
@@ -249,6 +256,14 @@ impl Segments {
                 let sack_start = ack_header.ack_nr + 2;
                 let sack_start_offset = sack_start - first_seq_nr;
 
+                let mut process_sack = |segment: &mut Segment, is_sacked: bool| {
+                    if !segment.is_delivered && is_sacked {
+                        segment.is_delivered = true;
+                        segment.update_rtt(now, &mut new_rtt);
+                        newly_sacked_segment_count += 1;
+                    }
+                };
+
                 if sack_start_offset >= 0 {
                     for (segment, acked) in self
                         .segments
@@ -256,10 +271,7 @@ impl Segments {
                         .skip(sack_start_offset as usize)
                         .zip(sack.iter())
                     {
-                        segment.is_delivered |= acked;
-                        if acked {
-                            segment.update_rtt(now, &mut new_rtt);
-                        }
+                        process_sack(segment, acked);
                     }
                 } else {
                     for (segment, acked) in self
@@ -267,10 +279,7 @@ impl Segments {
                         .iter_mut()
                         .zip(sack.iter().skip((-sack_start_offset) as usize))
                     {
-                        segment.is_delivered |= acked;
-                        if acked {
-                            segment.update_rtt(now, &mut new_rtt);
-                        }
+                        process_sack(segment, acked);
                     }
                 }
 
@@ -292,8 +301,77 @@ impl Segments {
         OnAckResult {
             acked_segments_count: removed,
             acked_bytes: payload_size,
+            newly_sacked_segment_count,
             new_rtt,
         }
+    }
+
+    fn smss(&self) -> usize {
+        todo!()
+    }
+
+    // rfc6675 SetPipe
+    // TODO: we don't need &mut, add non-mut iterator
+    pub fn calc_sack_pipe(&self) -> usize {
+        let mut it = self.iter().take_while(|s| s.segment.is_sent());
+    }
+
+    // rfc6675 IsLost
+    // TODO: we don't need &mut, add non-mut iterator
+    pub fn is_lost(&mut self, seq_nr: SeqNr, sack_len: usize) -> bool {
+        let mss = self.smss();
+        let mut it = self
+            .iter_mut()
+            .take(sack_len + 1) // TODO: ensure this doesn't cause issues for later segs
+            .skip_while(|s| s.seq_nr() < seq_nr);
+        let Some(seg) = it.next() else {
+            return false;
+        };
+
+        if seg.seq_nr() != seq_nr {
+            return false;
+        }
+
+        if seg.is_delivered() {
+            return false;
+        }
+
+        // This routine returns whether the given sequence number is
+        // considered to be lost.  The routine returns true when either
+        // DupThresh discontiguous SACKed sequences have arrived above
+        // 'SeqNum' or more than (DupThresh - 1) * SMSS bytes with sequence
+        // numbers greater than 'SeqNum' have been SACKed.  Otherwise, the
+        // routine returns false.
+
+        let mut in_contig = false;
+        let mut non_contig_count = 0;
+        let mut sacked_bytes = 0usize;
+        let sacked_bytes_limit = (SACK_DUP_THRESH - 1) * mss;
+
+        for later_seg in it {
+            if later_seg.is_delivered() {
+                sacked_bytes += later_seg.payload_size();
+                if sacked_bytes >= sacked_bytes_limit {
+                    return true;
+                }
+            }
+            match (in_contig, later_seg.is_delivered()) {
+                (false, true) => {
+                    non_contig_count += 1;
+                    if non_contig_count == SACK_DUP_THRESH {
+                        return true;
+                    }
+                    in_contig = true;
+                }
+                (false, false) => continue,
+                (true, true) => continue,
+                (true, false) => {
+                    in_contig = false;
+                }
+            }
+        }
+
+        return false;
     }
 
     // Iterate stored data - headers and their payload offsets (as a function to copy payload to some other buffer).

@@ -77,8 +77,9 @@ impl CongestionController for Cubic {
 
     fn on_triple_duplicate_ack(&mut self, now: Instant) {
         self.w_max = self.cwnd;
-        self.ssthresh = (self.cwnd * BETA_CUBIC).max(2.);
         self.cwnd *= BETA_CUBIC;
+        self.ssthresh = self.cwnd.max(2.);
+
         self.last_congestion_event = now;
 
         // Fast convergence https://datatracker.ietf.org/doc/html/rfc8312#section-4.6
