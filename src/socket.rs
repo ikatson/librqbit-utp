@@ -63,6 +63,7 @@ impl CongestionConfig {
 
         match (self.kind, self.tracing) {
             (CongestionControllerKind::Cubic, true) => {
+                tracing::debug!("enabling congestion tracing");
                 Box::new(TracingController::new(Cubic::new(now, rmss)))
             }
             (CongestionControllerKind::Cubic, false) => Box::new(Cubic::new(now, rmss)),

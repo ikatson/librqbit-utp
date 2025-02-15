@@ -336,7 +336,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     let item = self.user_tx_segments.iter_mut().next();
                     if let Some(mut item) = item {
                         if send_data!(self, cx, header, item) {
-                            debug!(
+                            trace!(
                                 %header.seq_nr,
                                 %header.ack_nr,
                                 payload_size = item.payload_size(),
@@ -353,7 +353,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                             return Ok(());
                         }
                     } else {
-                        debug!("bug: we are in recovery, but there's no outstanding data! exiting recovery");
+                        warn!("bug: we are in recovery, but there's no outstanding data! exiting recovery");
                         self.recovery = Recovery::CountingDuplicates { dup_acks: 0 };
                         return Ok(());
                     }
@@ -369,12 +369,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         is_rescue,
                     }) = rec.next_seg(&mut self.user_tx_segments)?
                     else {
-                        debug!(?rec, "recovery: NextSeg returned None");
+                        trace!(?rec, "recovery: NextSeg returned None");
                         return Ok(());
                     };
 
                     if send_data!(self, cx, header, item) {
-                        debug!(
+                        trace!(
                             %header.seq_nr,
                             %header.ack_nr,
                             payload_size = item.payload_size(),
@@ -726,6 +726,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         cx: &mut std::task::Context<'_>,
     ) -> anyhow::Result<()> {
         let mut result = ProcessIncomingMessageResult::default();
+        let was_in_recovery = self.recovery.is_recovery();
+
         while let Poll::Ready(msg) = self.rx.poll_recv(cx) {
             let msg = match msg {
                 Some(msg) => msg,
@@ -748,6 +750,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if self.state_is_closed() {
                 break;
             }
+        }
+
+        if !was_in_recovery && self.recovery.is_recovery() {
+            self.congestion_controller
+                .on_congestion_event(self.this_poll.now);
         }
 
         if result.on_ack_result.acked_segments_count > 0
@@ -1038,8 +1045,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     &msg.header,
                     &result.on_ack_result,
                     &mut self.user_tx_segments,
-                    &mut *self.congestion_controller,
-                    self.this_poll.now,
                     self.last_sent_seq_nr,
                 );
             }

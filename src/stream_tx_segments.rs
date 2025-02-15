@@ -380,6 +380,8 @@ impl Segments {
                 // This is minor, but will prevent re-sending it too early.
                 seg.is_lost = false;
 
+                pipe += seg.payload_size;
+
                 continue;
             }
 

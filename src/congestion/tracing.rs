@@ -24,7 +24,8 @@ where
     }
 
     fn on_ack(&mut self, now: Instant, len: usize, rtt: &RttEstimator) {
-        log_if_changed!(
+        log_every_ms_if_changed!(
+            500,
             CONGESTION_TRACING_LOG_LEVEL,
             "on_ack",
             self,
@@ -43,13 +44,13 @@ where
         );
     }
 
-    fn on_triple_duplicate_ack(&mut self, now: Instant) {
+    fn on_congestion_event(&mut self, now: Instant) {
         log_if_changed!(
             CONGESTION_TRACING_LOG_LEVEL,
-            "on_triple_duplicate_ack",
+            "on_congestion_event",
             self,
             |s| s.inner,
-            |s| s.inner.on_triple_duplicate_ack(now)
+            |s| s.inner.on_congestion_event(now)
         );
     }
 

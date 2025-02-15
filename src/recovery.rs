@@ -2,7 +2,7 @@
 /// Some other parts are in user_tx_segments and stream_dispatch
 use std::time::Instant;
 
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use crate::{
     congestion::CongestionController,
@@ -139,8 +139,6 @@ impl Recovery {
         header: &UtpHeader,
         on_ack_result: &OnAckResult,
         tx_segs: &mut Segments,
-        congestion_controller: &mut dyn CongestionController,
-        now: Instant,
         last_sent_seq_nr: SeqNr,
     ) {
         match self {
@@ -183,9 +181,6 @@ impl Recovery {
 
                 let high_rxt = high_ack;
 
-                // TODO: we are skipping the part 3
-                // "The TCP MAY transmit previously unsent data segments as per Limited transmit"
-                congestion_controller.on_triple_duplicate_ack(now);
                 let rec = RecoveryPhase {
                     recovery_point: high_data,
                     high_rxt,
@@ -193,7 +188,7 @@ impl Recovery {
                     rescue_rxt_used: false,
                     first_sent: false,
                 };
-                debug!(?rec.recovery_point, ?rec.high_rxt, cwnd=congestion_controller.window(), "entered recovery");
+                debug!(?rec.recovery_point, ?rec.high_rxt, "entered recovery");
                 *self = Recovery::Recovery(rec);
             }
             Recovery::Recovery(rec) => {
@@ -203,7 +198,7 @@ impl Recovery {
                     return;
                 }
                 rec.pipe = tx_segs.calc_sack_pipe(rec.high_rxt);
-                debug!(rec.pipe, "recovery: updated pipe");
+                trace!(rec.pipe, "recovery: updated pipe");
             }
         }
     }

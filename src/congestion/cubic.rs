@@ -75,7 +75,7 @@ impl CongestionController for Cubic {
         self.cwnd = 1.
     }
 
-    fn on_triple_duplicate_ack(&mut self, now: Instant) {
+    fn on_congestion_event(&mut self, now: Instant) {
         self.w_max = self.cwnd;
         self.cwnd *= BETA_CUBIC;
         self.ssthresh = self.cwnd.max(2.);
@@ -193,7 +193,7 @@ mod tests {
         trace!(?cubic, "cubic after 50 MSS packets");
 
         now += rtt * 3;
-        cubic.on_triple_duplicate_ack(now);
+        cubic.on_congestion_event(now);
         trace!(?cubic, "cubic after triple duplicate acks");
         // Pretend there was a fast retransmit here.
 
