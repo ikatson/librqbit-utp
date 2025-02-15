@@ -2,7 +2,7 @@
 /// Some other parts are in user_tx_segments and stream_dispatch
 use std::time::Instant;
 
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     congestion::CongestionController,
@@ -25,6 +25,9 @@ pub struct RecoveryPhase {
     // when there is loss at the end of the window and no new data is
     // available for transmission.
     pub rescue_rxt_used: bool,
+
+    // Upon entering recovery, we MUST retransmit the first outstanding packet.
+    pub first_sent: bool,
 
     // "Pipe" is a sender's estimate of the number of bytes outstanding
     // in the network.
@@ -138,24 +141,25 @@ impl Recovery {
         tx_segs: &mut Segments,
         congestion_controller: &mut dyn CongestionController,
         now: Instant,
-        last_consumed_remote_seq_nr: SeqNr,
         last_sent_seq_nr: SeqNr,
     ) {
         match self {
             Recovery::CountingDuplicates { dup_acks } => {
-                if header.extensions.selective_ack.is_none() {
+                if !on_ack_result.is_duplicate() {
                     *dup_acks = 0;
-                    return;
-                }
-
-                let is_duplicate = on_ack_result.newly_sacked_segment_count > 0;
-                if !is_duplicate {
                     return;
                 }
 
                 *dup_acks += 1;
 
-                let high_ack = last_consumed_remote_seq_nr;
+                let high_ack = match tx_segs.first_seq_nr() {
+                    Some(s) => s - 1,
+                    None => {
+                        warn!("bug: first_seq_nr() expected to return something");
+                        *dup_acks = 0;
+                        return;
+                    }
+                };
                 let high_data = last_sent_seq_nr;
 
                 let is_lost = tx_segs.is_lost(high_ack + 1, SACK_DEPTH);
@@ -183,13 +187,11 @@ impl Recovery {
                 let rec = RecoveryPhase {
                     recovery_point: high_data,
                     high_rxt,
-                    pipe: tx_segs.calc_sack_pipe(high_rxt),
+                    pipe: 0,
                     rescue_rxt_used: false,
+                    first_sent: false,
                 };
-                debug!(
-                    ?rec.recovery_point,
-                    ?rec.high_rxt, rec.pipe, "entered recovery"
-                );
+                debug!(?rec.recovery_point, ?rec.high_rxt, cwnd=congestion_controller.window(), "entered recovery");
                 *self = Recovery::Recovery(rec);
             }
             Recovery::Recovery(rec) => {

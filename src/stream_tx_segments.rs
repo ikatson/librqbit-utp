@@ -10,7 +10,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{constants::SACK_DUP_THRESH, metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
+use crate::{
+    constants::{SACK_DEPTH, SACK_DUP_THRESH},
+    metrics::METRICS,
+    raw::UtpHeader,
+    seq_nr::SeqNr,
+};
 
 #[derive(Clone, Copy)]
 enum SentStatus {
@@ -146,8 +151,13 @@ impl SegmentIterState {
 
 #[derive(Default)]
 pub struct OnAckResult {
+    // How many segments we can remove from the beginning of TX queue.
     pub acked_segments_count: usize,
+
+    // How many bytes we can remove from the beginning of TX queue.
     pub acked_bytes: usize,
+
+    // How many segments in TX queue were marked delivered by SACK.
     pub newly_sacked_segment_count: usize,
     pub new_rtt: Option<Duration>,
 }
@@ -157,6 +167,14 @@ impl OnAckResult {
         self.acked_segments_count += other.acked_segments_count;
         self.acked_bytes += other.acked_bytes;
         self.new_rtt = rtt_min(self.new_rtt, other.new_rtt);
+    }
+
+    // Check if it's a duplicate ACK per rfc6298
+    pub fn is_duplicate(&self) -> bool {
+        if self.newly_sacked_segment_count > 0 {
+            return true; // Any new SACK data means a duplicate ACK
+        }
+        self.acked_segments_count == 0
     }
 }
 
@@ -333,7 +351,7 @@ impl Segments {
 
         for (seq_nr, seg) in self
             .segments
-            .iter_mut()
+            .range_mut(0..SACK_DEPTH)
             .enumerate()
             .rev()
             .skip_while(|(_, s)| !s.is_sent())

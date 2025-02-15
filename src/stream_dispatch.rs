@@ -330,6 +330,37 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 bail!("bug: called send_in_recovery while not in recovery")
             }
             Recovery::Recovery(rec) => {
+                // 4.3. Retransmit the first data segment presumed dropped -- the
+                // segment starting with sequence number HighACK + 1
+                if !rec.first_sent {
+                    let item = self.user_tx_segments.iter_mut().next();
+                    if let Some(mut item) = item {
+                        if send_data!(self, cx, header, item) {
+                            debug!(
+                                %header.seq_nr,
+                                %header.ack_nr,
+                                payload_size = item.payload_size(),
+                                socket_was_full = self.this_poll.transport_pending,
+                                cwnd,
+                                rec.pipe,
+                                "RECOVERY: sent first ST_DATA"
+                            );
+
+                            rec.high_rxt = item.seq_nr();
+                            rec.pipe = self.user_tx_segments.calc_sack_pipe(rec.high_rxt);
+                            rec.first_sent = true;
+                        } else {
+                            return Ok(());
+                        }
+                    } else {
+                        debug!("bug: we are in recovery, but there's no outstanding data! exiting recovery");
+                        self.recovery = Recovery::CountingDuplicates { dup_acks: 0 };
+                        return Ok(());
+                    }
+                }
+
+                debug!(cwnd, rec.pipe, "recovery pre-send");
+
                 while cwnd.saturating_sub(rec.pipe)
                     >= self.socket_opts.max_outgoing_payload_size.get()
                 {
@@ -342,18 +373,21 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     };
 
                     if send_data!(self, cx, header, item) {
-                        trace!(
+                        debug!(
                             %header.seq_nr,
                             %header.ack_nr,
                             payload_size = item.payload_size(),
                             socket_was_full = self.this_poll.transport_pending,
                             cwnd,
                             rec.pipe,
+                            is_rescue,
                             "RECOVERY: sent ST_DATA"
                         );
 
                         if !is_rescue {
                             rec.high_rxt = rec.high_rxt.max(item.seq_nr())
+                        } else {
+                            rec.rescue_rxt_used = true;
                         }
 
                         // C.3
@@ -387,7 +421,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     if let Recovery::Recovery(rec) = &mut self.recovery {
                         rec.high_rxt = rec.high_rxt.max(seg.seq_nr());
                     }
-                    trace!(
+                    debug!(
                         %header.seq_nr,
                         %header.ack_nr,
                         payload_size = seg.payload_size(),
@@ -1004,7 +1038,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     &mut self.user_tx_segments,
                     &mut *self.congestion_controller,
                     self.this_poll.now,
-                    self.last_consumed_remote_seq_nr,
                     self.last_sent_seq_nr,
                 );
             }
