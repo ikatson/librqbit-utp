@@ -253,7 +253,10 @@ impl UserRx {
             shared: shared.clone(),
             is_eof: false,
         };
-        let out_of_order_queue = OutOfOrderQueue::new(out_of_order_max_packets);
+        let ooq_capacity = max_rx_bytes.get() / max_incoming_payload.get();
+        let out_of_order_queue = OutOfOrderQueue::new(
+            NonZeroUsize::new(ooq_capacity).unwrap_or_else(|| NonZeroUsize::new(64).unwrap()),
+        );
         let write_half = UserRx {
             shared,
             ooq: out_of_order_queue,

@@ -24,8 +24,7 @@ where
     }
 
     fn on_ack(&mut self, now: Instant, len: usize, rtt: &RttEstimator) {
-        log_every_ms_if_changed!(
-            500,
+        log_if_changed!(
             CONGESTION_TRACING_LOG_LEVEL,
             "on_ack",
             self,

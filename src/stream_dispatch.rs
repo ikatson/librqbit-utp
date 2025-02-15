@@ -369,7 +369,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         is_rescue,
                     }) = rec.next_seg(&mut self.user_tx_segments)?
                     else {
-                        debug!("recovery: NextSeg returned None");
+                        debug!(?rec, "recovery: NextSeg returned None");
                         return Ok(());
                     };
 
@@ -419,15 +419,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     self.congestion_controller
                         .on_rto_timeout(self.this_poll.now);
                     self.rtte.on_retransmit();
-                    if let Recovery::Recovery(rec) = &mut self.recovery {
-                        rec.high_rxt = rec.high_rxt.max(seg.seq_nr());
-                    }
+                    self.recovery.on_retransmit();
                     debug!(
                         %header.seq_nr,
                         %header.ack_nr,
                         payload_size = seg.payload_size(),
                         "RTO: sent ST_DATA"
                     );
+
+                    // Rewind back last sent seq_nr so that normal sending resumes.
+                    self.last_sent_seq_nr = seg.seq_nr();
                 }
                 return Ok(());
             } else {

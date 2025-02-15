@@ -155,20 +155,22 @@ impl Recovery {
                 let high_ack = match tx_segs.first_seq_nr() {
                     Some(s) => s - 1,
                     None => {
-                        warn!("bug: first_seq_nr() expected to return something");
+                        // Everything got ACKed.
                         *dup_acks = 0;
                         return;
                     }
                 };
+
                 let high_data = last_sent_seq_nr;
 
-                let is_lost = tx_segs.is_lost(high_ack + 1, SACK_DEPTH);
-
-                let should_enter_recovery = *dup_acks as usize >= SACK_DUP_THRESH || is_lost;
+                let mut should_enter_recovery = *dup_acks as usize >= SACK_DUP_THRESH;
+                if !should_enter_recovery {
+                    tx_segs.calc_sack_pipe(high_ack);
+                    should_enter_recovery = tx_segs.first_is_lost();
+                }
 
                 debug!(
                     should_enter_recovery,
-                    first_is_lost = is_lost,
                     dup_acks,
                     ?high_ack,
                     ?high_data,
@@ -204,5 +206,10 @@ impl Recovery {
                 debug!(rec.pipe, "recovery: updated pipe");
             }
         }
+    }
+
+    pub(crate) fn on_retransmit(&mut self) {
+        // TODO: the RFC says we must not enter recovery again until high_data + some other tweaks.
+        *self = Recovery::CountingDuplicates { dup_acks: 0 }
     }
 }

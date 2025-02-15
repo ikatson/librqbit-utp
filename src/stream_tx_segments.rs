@@ -349,16 +349,45 @@ impl Segments {
 
         let mut pipe = 0;
 
-        for (seq_nr, seg) in self
+        // The max seq_nr that we could have seen in a SACK.
+        // Everything past it is considered not lost, and SACKed, as we just don't know.
+        //
+        // TODO: maybe track this more precisely from the sender's sack?
+
+        // The information below is governing re-sending.
+
+        for (offset, seq_nr, seg) in self
             .segments
-            .range_mut(0..SACK_DEPTH)
+            // .range_mut(0..SACK_DEPTH)
+            .iter_mut()
             .enumerate()
             .rev()
             .skip_while(|(_, s)| !s.is_sent())
-            .map(|(idx, seg)| (self.snd_una + idx as u16, seg))
+            .map(|(offset, seg)| (offset, self.snd_una + offset as u16, seg))
         {
+            if offset > SACK_DEPTH + 1 {
+                assert!(!seg.is_delivered);
+
+                // We have no idea about this packet. So we treat it very specially.
+
+                // We assume they are in one contiguous sequence. So that all actually unSACKed packets.
+                // assume they have SACks after them for NextSeg().
+                in_contig = true;
+
+                // This will influence is_lost calculation for packets in the SACK block
+                sacked_bytes += seg.payload_size;
+
+                // This is minor, but will prevent re-sending it too early.
+                seg.is_lost = false;
+
+                continue;
+            }
+
             seg.is_lost = !seg.is_delivered
                 && (non_contig_count >= SACK_DUP_THRESH || sacked_bytes >= sacked_bytes_limit);
+            // if seg.is_lost {
+            //     tracing::debug!(?seq_nr, "lost");
+            // }
             seg.has_sacks_after_it = sacked_bytes > 0;
 
             if !seg.is_delivered && !seg.is_lost {
@@ -388,60 +417,8 @@ impl Segments {
 
     // rfc6675 IsLost
     // TODO: use pre-calculated values from set_pipe
-    pub fn is_lost(&self, seq_nr: SeqNr, sack_len: usize) -> bool {
-        let mss = self.smss();
-        let mut it = self
-            .iter()
-            .take(sack_len + 1) // TODO: ensure this doesn't cause issues for later segs
-            .skip_while(|s| s.seq_nr() < seq_nr);
-        let Some(seg) = it.next() else {
-            return false;
-        };
-
-        if seg.seq_nr() != seq_nr {
-            return false;
-        }
-
-        if seg.is_delivered() {
-            return false;
-        }
-
-        // This routine returns whether the given sequence number is
-        // considered to be lost.  The routine returns true when either
-        // DupThresh discontiguous SACKed sequences have arrived above
-        // 'SeqNum' or more than (DupThresh - 1) * SMSS bytes with sequence
-        // numbers greater than 'SeqNum' have been SACKed.  Otherwise, the
-        // routine returns false.
-
-        let mut in_contig = false;
-        let mut non_contig_count = 0;
-        let mut sacked_bytes = 0usize;
-        let sacked_bytes_limit = (SACK_DUP_THRESH - 1) * mss;
-
-        for later_seg in it {
-            if later_seg.is_delivered() {
-                sacked_bytes += later_seg.payload_size();
-                if sacked_bytes >= sacked_bytes_limit {
-                    return true;
-                }
-            }
-            match (in_contig, later_seg.is_delivered()) {
-                (false, true) => {
-                    non_contig_count += 1;
-                    if non_contig_count == SACK_DUP_THRESH {
-                        return true;
-                    }
-                    in_contig = true;
-                }
-                (false, false) => continue,
-                (true, true) => continue,
-                (true, false) => {
-                    in_contig = false;
-                }
-            }
-        }
-
-        false
+    pub fn first_is_lost(&self) -> bool {
+        self.segments.iter().next().is_some_and(|seg| seg.is_lost)
     }
 
     // Iterate stored data - headers and their payload offsets (as a function to copy payload to some other buffer).
