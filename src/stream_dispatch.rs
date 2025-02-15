@@ -284,11 +284,10 @@ macro_rules! send_data {
             }
 
             // rfc6298 5.1
-            $self.timers.retransmit.set_for_retransmit(
-                $self.this_poll.now,
-                $self.rtte.retransmission_timeout(),
-                true,
-            );
+            $self
+                .timers
+                .retransmit
+                .arm($self.this_poll.now, $self.rtte.retransmission_timeout());
         }
         !$self.this_poll.transport_pending
     }};
@@ -370,10 +369,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
     // Returns true if UDP socket is full
     fn send_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
-        if self.user_tx_segments.is_empty() {
-            return Ok(());
-        }
-
         // No reason to send anything, we'll get polled next time.
         if self.this_poll.transport_pending {
             return Ok(());
@@ -383,6 +378,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         // Retransmit timer expired, resend the first unacked segment.
         if self.timers.retransmit.expired(self.this_poll.now) {
+            debug!("retransmit timer expired");
             if let Some(mut seg) = self.user_tx_segments.iter_mut().next() {
                 if send_data!(self, cx, header, seg) {
                     self.congestion_controller
@@ -408,10 +404,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     }
                     _ => {
                         debug!("retransmit timer expired, but nothing to send");
-                        self.timers.retransmit.set_for_idle();
+                        self.timers.retransmit.turn_off();
                     }
                 }
             }
+        }
+
+        if self.user_tx_segments.is_empty() {
+            return Ok(());
         }
 
         if self.recovery.is_recovery() {
@@ -549,11 +549,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         fin.set_type(Type::ST_FIN);
         fin.seq_nr = seq_nr;
         if self.send_control_packet(cx, fin)? {
-            self.timers.retransmit.set_for_retransmit(
-                self.this_poll.now,
-                self.rtte.retransmission_timeout(),
-                false,
-            );
+            self.timers
+                .retransmit
+                .arm(self.this_poll.now, self.rtte.retransmission_timeout());
             self.timers.remote_inactivity_timer =
                 Some(self.this_poll.now + self.socket_opts.remote_inactivity_timeout);
             self.last_sent_seq_nr = seq_nr;
@@ -719,7 +717,33 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if result.on_ack_result.acked_segments_count > 0
             || result.on_ack_result.newly_sacked_segment_count > 0
         {
+            // TODO: figure out why did I put this here?
             self.timers.remote_inactivity_timer = None;
+
+            // Update RTO
+            if let Some(rtt) = result.on_ack_result.new_rtt {
+                METRICS.rtt.record(rtt.as_secs_f64());
+                log_every_ms_if_changed!(
+                    500,
+                    RTTE_TRACING_LOG_LEVEL,
+                    "rtte:sample",
+                    self,
+                    |s| s.rtte,
+                    |s| s.rtte.sample(rtt)
+                );
+            }
+
+            // Reset retransmit timer.
+            if self.user_tx_segments.is_empty() && self.state.our_fin_if_unacked().is_none() {
+                // rfc6298 5.2. If all outstanding data ACKed, turn off the timer.
+                self.timers.retransmit.turn_off();
+            } else {
+                // rfc6298 5.3. When an ACK is received that acknowledges new data, restart the
+                // retransmission timer.
+                self.timers
+                    .retransmit
+                    .arm(self.this_poll.now, self.rtte.retransmission_timeout());
+            }
         }
 
         if result.on_ack_result.acked_segments_count > 0 {
@@ -740,32 +764,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             trace!(?result.on_ack_result, "removed ACKed tx messages");
-
-            // Update RTO
-            if let Some(rtt) = result.on_ack_result.new_rtt {
-                METRICS.rtt.record(rtt.as_secs_f64());
-                log_every_ms_if_changed!(
-                    500,
-                    RTTE_TRACING_LOG_LEVEL,
-                    "rtte:sample",
-                    self,
-                    |s| s.rtte,
-                    |s| s.rtte.sample(rtt)
-                );
-            }
-
-            // Reset retransmit timer.
-            if self.user_tx_segments.is_empty() {
-                // rfc6298 5.2
-                self.timers.retransmit.set_for_idle();
-            } else {
-                // rfc6298 5.3
-                self.timers.retransmit.set_for_retransmit(
-                    self.this_poll.now,
-                    self.rtte.retransmission_timeout(),
-                    true,
-                );
-            }
         }
 
         Ok(())
@@ -1519,11 +1517,12 @@ impl RetransmitTimer {
         }
     }
 
-    fn set_for_idle(&mut self) {
+    fn turn_off(&mut self) {
+        trace!("turning off retransmit timer");
         *self = RetransmitTimer::Idle
     }
 
-    fn set_for_retransmit(&mut self, now: Instant, delay: Duration, restart: bool) {
+    fn arm(&mut self, now: Instant, delay: Duration) {
         *self = match *self {
             // rfc6298 5.1
             RetransmitTimer::Idle => RetransmitTimer::Retransmit {
@@ -1531,14 +1530,10 @@ impl RetransmitTimer {
                 delay,
             },
             // rfc6298 5.3
-            RetransmitTimer::Retransmit { .. } if restart => RetransmitTimer::Retransmit {
+            RetransmitTimer::Retransmit { .. } => RetransmitTimer::Retransmit {
                 expires_at: now + delay,
                 delay,
             },
-            // If timer already present, leave as is, even if expired.
-            RetransmitTimer::Retransmit { expires_at, delay } => {
-                RetransmitTimer::Retransmit { expires_at, delay }
-            }
         };
     }
 }

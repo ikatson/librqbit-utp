@@ -864,6 +864,8 @@ async fn test_resource_cleanup_both_sides_dropped_abruptly() {
 async fn test_resource_cleanup_with_pending_data() {
     setup_test_logging();
     let mut t = make_test_vsock(Default::default(), false);
+    let rto = Duration::from_millis(100);
+    t.vsock.rtte.force_timeout(rto);
 
     // Allow sending by setting window size
     t.send_msg(
@@ -901,22 +903,24 @@ async fn test_resource_cleanup_with_pending_data() {
     t.assert_sent_empty();
 
     // Data should be retransmitted
-    t.env.increment_now(Duration::from_secs(2));
+    t.env.increment_now(rto);
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![
-            cmphead!(ST_DATA, seq_nr = 101, ack_nr = 0, payload = "hello"),
-            cmphead!(ST_FIN, seq_nr = 102, ack_nr = 0)
-        ]
+        vec![cmphead!(
+            ST_DATA,
+            seq_nr = 101,
+            ack_nr = 0,
+            payload = "hello"
+        ),]
     );
 
-    // Send ACK
+    // Send ACK for DATA
     t.send_msg(
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: 102.into(),
+            ack_nr: 101.into(),
             wnd_size: 1024,
             ..Default::default()
         },
@@ -925,9 +929,24 @@ async fn test_resource_cleanup_with_pending_data() {
 
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
-    assert_eq!(t.vsock.state, VirtualSocketState::FinWait2);
 
-    // We should die in 1 second now
+    tracing::trace!("waiting for FIN retransmission");
+    t.env.increment_now(rto);
+    t.poll_once_assert_pending().await;
+    // Should retransmit FIN
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_FIN, seq_nr = 102, ack_nr = 0)],
+        "should retransmit FIN"
+    );
+    assert_eq!(
+        t.vsock.state,
+        VirtualSocketState::FinWait1 {
+            our_fin: 102.into()
+        }
+    );
+
+    // We should die in ~1 second now
     t.env.increment_now(Duration::from_secs(1));
 
     let err = t.poll_once_assert_ready().await.unwrap_err();

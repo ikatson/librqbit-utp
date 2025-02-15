@@ -423,7 +423,7 @@ impl Segments {
             }
         }
 
-        return false;
+        false
     }
 
     // Iterate stored data - headers and their payload offsets (as a function to copy payload to some other buffer).
