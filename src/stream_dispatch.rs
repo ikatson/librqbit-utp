@@ -369,6 +369,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         is_rescue,
                     }) = rec.next_seg(&mut self.user_tx_segments)?
                     else {
+                        debug!("recovery: NextSeg returned None");
                         return Ok(());
                     };
 
