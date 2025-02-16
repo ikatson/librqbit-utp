@@ -423,7 +423,7 @@ impl Segments {
             }
         }
 
-        trace!(?pipe, ?recalc_timer, ?high_rxt, high_ack=?self.snd_una, ?high_data, "calc_pipe");
+        debug!(?pipe, ?recalc_timer, ?high_rxt, high_ack=?self.snd_una, ?high_data, "calc_pipe");
 
         Pipe { pipe, recalc_timer }
     }

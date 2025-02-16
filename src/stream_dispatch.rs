@@ -806,6 +806,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             trace!(?result.on_ack_result, "removed ACKed tx messages");
         }
 
+        if let Some(rec) = self.recovery.recovering_mut() {
+            rec.pipe_estimate = self.user_tx_segments.calc_pipe(
+                rec.high_rxt,
+                self.last_sent_seq_nr,
+                self.rtte.roundtrip_time(),
+                self.this_poll.now,
+            );
+        }
+
         Ok(())
     }
 

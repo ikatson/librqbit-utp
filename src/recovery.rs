@@ -239,11 +239,7 @@ impl Recovery {
                     debug!(?rec.recovery_point, ?header.ack_nr, prev_cwnd=rec.cwnd,
                         ?congestion_controller, ?rec.total_retransmitted_segments, "exited recovery");
                     self.phase = RecoveryPhase::CountingDuplicates { dup_acks: 0 };
-                    return;
                 }
-
-                // TODO: we can do this once per whole batch to optimize
-                rec.pipe_estimate = tx_segs.calc_pipe(rec.high_rxt, last_sent_seq_nr, rtt, now);
             }
         }
     }
