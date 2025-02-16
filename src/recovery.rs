@@ -221,7 +221,7 @@ impl Recovery {
                     cwnd,
                 };
 
-                debug!(?rec.recovery_point, ?high_ack, ack_nr=?header.ack_nr, ?pipe_estimate, ?cwnd, "entered recovery");
+                debug!(?rec.recovery_point, ?high_ack, high_data=?last_sent_seq_nr, ack_nr=?header.ack_nr, ?pipe_estimate, ?cwnd, "entered recovery");
                 self.phase = RecoveryPhase::Recovering(rec);
             }
             RecoveryPhase::Recovering(rec) => {

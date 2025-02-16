@@ -10,6 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use tracing::{debug, trace};
+
 use crate::{constants::SACK_DEPTH, metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
 
 #[derive(Clone, Copy)]
@@ -363,9 +365,9 @@ impl Segments {
         let mut delivered_segs = 0;
         let mut recalc_timer = None;
 
-        let halfrtt = rtt / 2;
-
-        let take = (high_data - self.snd_una) as usize;
+        let take = high_data - self.snd_una;
+        debug_assert!(take > 0);
+        let take = take as usize;
 
         for (offset, seq_nr, segment, last_sent) in self
             .segments
@@ -389,8 +391,8 @@ impl Segments {
             if offset > SACK_DEPTH + 1 {
                 // If a segment is past sack depth limit, we don't know anything about it.
                 // So assume like this: it's in the pipe if we last sent it in half RTT.
-                if now - last_sent < halfrtt {
-                    let expires_in = last_sent + halfrtt - now;
+                if now - last_sent < rtt {
+                    let expires_in = last_sent + rtt - now;
                     pipe += segment.payload_size;
                     recalc_timer = match recalc_timer {
                         Some(d) if d < expires_in => Some(d),
@@ -407,6 +409,8 @@ impl Segments {
                 }
             }
         }
+
+        trace!(?pipe, ?recalc_timer, ?high_rxt, high_ack=?self.snd_una, ?high_data, "calc_pipe");
 
         Pipe { pipe, recalc_timer }
     }

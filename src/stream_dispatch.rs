@@ -417,7 +417,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if sent == 0 {
                 debug!(
                     pipe = rec.pipe_estimate.pipe,
-                    cwnd, "recovery couldn't send anything"
+                    remaining_cwnd = cwnd,
+                    "recovery couldn't send anything"
                 );
             }
 
@@ -427,7 +428,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         self.timers.recovery_pipe_expiry = Some(t);
                     }
                     None if sent > 0 => {
-                        self.timers.recovery_pipe_expiry = Some(self.rtte.roundtrip_time() / 2);
+                        self.timers.recovery_pipe_expiry = Some(self.rtte.roundtrip_time());
                     }
                     _ => {}
                 }
