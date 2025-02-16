@@ -907,12 +907,10 @@ async fn test_resource_cleanup_with_pending_data() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 101,
-            ack_nr = 0,
-            payload = "hello"
-        ),]
+        vec![
+            cmphead!(ST_DATA, seq_nr = 101, ack_nr = 0, payload = "hello"),
+            cmphead!(ST_FIN, seq_nr = 102, ack_nr = 0)
+        ]
     );
 
     // Send ACK for DATA
@@ -1687,6 +1685,8 @@ async fn test_selective_ack_retransmission() {
         ..Default::default()
     };
     t.send_msg(header, "");
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
 
     // After receiving selective ACK and waiting for retransmit
     t.env.increment_now(FORCED_RETRANSMISSION_TIME);
@@ -1717,7 +1717,7 @@ async fn test_selective_ack_retransmission() {
     t.poll_once_assert_pending().await;
 
     // No more retransmissions should occur
-    t.env.increment_now(Duration::from_secs(1));
+    t.env.increment_now(FORCED_RETRANSMISSION_TIME);
     t.poll_once_assert_pending().await;
     t.assert_sent_empty_msg("Should not retransmit after both packets acknowledged");
 }

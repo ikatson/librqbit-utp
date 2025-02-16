@@ -13,18 +13,17 @@ use std::{
 use anyhow::{bail, Context};
 use tokio::{sync::mpsc::UnboundedReceiver, time::Sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error_span, trace, trace_span, warn, Level};
+use tracing::{debug, error_span, trace, trace_span, Level};
 
 use crate::{
     congestion::CongestionController,
     constants::{
-        ACK_DELAY, CONGESTION_TRACING_LOG_LEVEL, IMMEDIATE_ACK_EVERY_RMSS, RTTE_TRACING_LOG_LEVEL,
-        SACK_DEPTH, SACK_DUP_THRESH, SYNACK_RESEND_INTERNAL,
+        ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RTTE_TRACING_LOG_LEVEL, SYNACK_RESEND_INTERNAL,
     },
     message::UtpMessage,
     metrics::METRICS,
     raw::{Type, UtpHeader},
-    recovery::{NextSeg, Recovery},
+    recovery::Recovery,
     rtte::RttEstimator,
     seq_nr::SeqNr,
     socket::{ControlRequest, ValidatedSocketOpts},
@@ -32,7 +31,7 @@ use crate::{
     stream::UtpStream,
     stream_rx::{AssemblerAddRemoveResult, UserRx},
     stream_tx::{UserTx, UtpStreamWriteHalf},
-    stream_tx_segments::{rtt_min, OnAckResult, Segment, SegmentIterItem, Segments},
+    stream_tx_segments::{OnAckResult, Segments},
     traits::{Transport, UtpEnvironment},
     utils::{update_optional_waker, DropGuardSendBeforeDeath},
     UtpSocket,
@@ -664,7 +663,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         cx: &mut std::task::Context<'_>,
     ) -> anyhow::Result<()> {
         let mut result = ProcessIncomingMessageResult::default();
-        let was_in_recovery = self.recovery.is_recovery();
 
         while let Poll::Ready(msg) = self.rx.poll_recv(cx) {
             let msg = match msg {
@@ -688,11 +686,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if self.state_is_closed() {
                 break;
             }
-        }
-
-        if !was_in_recovery && self.recovery.is_recovery() {
-            self.congestion_controller
-                .on_enter_fast_retransmit(self.this_poll.now);
         }
 
         if result.on_ack_result.acked_segments_count > 0

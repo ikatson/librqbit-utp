@@ -126,10 +126,10 @@ impl Recovery {
                 let total_acked_bytes = on_ack_result.total_acked_bytes();
 
                 if total_acked_bytes > 0 {
-                    rec.cwnd = rec.cwnd.saturating_sub(total_acked_bytes);
+                    // rec.cwnd = rec.cwnd.saturating_sub(total_acked_bytes);
                     if total_acked_bytes >= congestion_controller.smss() {
                         // This will let us send new data.
-                        rec.cwnd += congestion_controller.smss();
+                        // rec.cwnd += congestion_controller.smss();
 
                         // This will let us retransmit one more unacked segment.
                         rec.retransmit_tokens += 1;
@@ -140,6 +140,10 @@ impl Recovery {
     }
 
     pub(crate) fn on_rto_timeout(&mut self, last_sent_seq_nr: SeqNr) {
+        debug!(
+            recovery_point = ?last_sent_seq_nr,
+            "on_rto_timeout: ignoring duplicate acks until"
+        );
         *self = Recovery::IgnoringUntilRecoveryPoint {
             recovery_point: last_sent_seq_nr,
         }
