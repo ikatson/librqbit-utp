@@ -10,13 +10,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
+use crate::{constants::SACK_DEPTH, metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
 
 #[derive(Clone, Copy)]
 enum SentStatus {
     NotSent,
     SentTime(Instant),
-    Retransmitted { count: usize },
+    Retransmitted { count: usize, last_send_ts: Instant },
 }
 
 pub struct Segment {
@@ -45,6 +45,14 @@ impl Segment {
             SentStatus::SentTime(sent_ts) => {
                 *rtt = rtt_min(*rtt, Some(now - sent_ts));
             }
+        }
+    }
+
+    fn last_sent(&self) -> Option<Instant> {
+        match self.sent {
+            SentStatus::NotSent => None,
+            SentStatus::SentTime(instant) => Some(instant),
+            SentStatus::Retransmitted { last_send_ts, .. } => Some(last_send_ts),
         }
     }
 }
@@ -85,7 +93,7 @@ impl<T: Borrow<Segment>> SegmentIterItem<T> {
         match self.segment.borrow().sent {
             SentStatus::NotSent => 0,
             SentStatus::SentTime(..) => 0,
-            SentStatus::Retransmitted { count } => count,
+            SentStatus::Retransmitted { count, .. } => count,
         }
     }
 }
@@ -104,14 +112,20 @@ impl<T: BorrowMut<Segment>> SegmentIterItem<T> {
                 METRICS
                     .retransmitted_bytes
                     .increment(seg.payload_size as u64);
-                SentStatus::Retransmitted { count: 1 }
+                SentStatus::Retransmitted {
+                    count: 1,
+                    last_send_ts: now,
+                }
             }
-            SentStatus::Retransmitted { count } => {
+            SentStatus::Retransmitted { count, .. } => {
                 METRICS.data_retransmissions.increment(1);
                 METRICS
                     .retransmitted_bytes
                     .increment(seg.payload_size as u64);
-                SentStatus::Retransmitted { count: count + 1 }
+                SentStatus::Retransmitted {
+                    count: count + 1,
+                    last_send_ts: now,
+                }
             }
         };
     }
@@ -173,6 +187,12 @@ impl core::fmt::Debug for OnAckResult {
             self.acked_segments_count, self.acked_bytes, self.new_rtt
         )
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Pipe {
+    pub pipe: usize,
+    pub recalc_timer: Option<Duration>,
 }
 
 impl Segments {
@@ -329,6 +349,59 @@ impl Segments {
             .take_while(|s| !s.is_sent())
             .map(|s| if s.is_delivered { 0 } else { s.payload_size })
             .sum()
+    }
+
+    pub fn calc_pipe(&self, high_rxt: SeqNr, rtt: Duration, now: Instant) -> Pipe {
+        let mut pipe = 0;
+        let mut unknown_segs = 0;
+        let mut delivered_segs = 0;
+        let mut recalc_timer = None;
+
+        for (offset, seq_nr, segment, last_sent) in self
+            .segments
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(offset, seg)| {
+                seg.last_sent()
+                    .map(|ts| (offset, self.snd_una + offset as u16, seg, ts))
+            })
+        {
+            if segment.is_delivered {
+                delivered_segs += 1;
+                continue;
+            }
+
+            if seq_nr <= high_rxt {
+                pipe += segment.payload_size;
+            }
+
+            if offset > SACK_DEPTH + 1 {
+                // If a segment is past sack depth limit, we don't know anything about it.
+                // So assume like this: if it was last sent before RTT, it's in the pipe.
+                if now - last_sent < rtt {
+                    let expires_in = last_sent + rtt - now;
+                    pipe += segment.payload_size;
+                    recalc_timer = match recalc_timer {
+                        Some(d) if d < expires_in => Some(d),
+                        _ => Some(expires_in),
+                    }
+                }
+                unknown_segs += 1;
+            } else {
+                let is_lost = delivered_segs >= 3 || unknown_segs >= 3;
+                // If 3 or more past it are delivered, we consider it lost, it's not in the pipe.
+                // If 3 or more unknown segments past it, we consider it lost, it's not in the pipe.
+                if !is_lost {
+                    pipe += segment.payload_size;
+                }
+            }
+        }
+
+        Pipe {
+            pipe,
+            recalc_timer: recalc_timer,
+        }
     }
 
     // Iterate stored data - headers and their payload offsets (as a function to copy payload to some other buffer).

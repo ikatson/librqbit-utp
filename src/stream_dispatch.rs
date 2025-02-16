@@ -374,33 +374,66 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if let Some(rec) = self.recovery.recovering_mut() {
             let high_rxt = rec.high_rxt;
             let recovery_point = rec.recovery_point();
-            let it = self
+            let mut it = self
                 .user_tx_segments
                 .iter_mut()
                 .skip_while(|seg| seg.seq_nr() <= high_rxt)
                 .take_while(|seg| seg.seq_nr() <= recovery_point)
-                .filter(|s| !s.is_delivered())
-                .take(rec.retransmit_tokens);
-            for mut seg in it {
+                .filter(|s| !s.is_delivered());
+
+            let mut cwnd = rec.cwnd();
+            let mut sent = 0;
+            while rec.total_retransmitted_segments == 0
+                || cwnd > self.socket_opts.max_outgoing_payload_size.get()
+            {
+                let mut seg = match it.next() {
+                    Some(seg) => seg,
+                    None => break,
+                };
+
                 if send_data!(self, cx, header, seg) {
-                    trace!(
+                    debug!(
                         %header.seq_nr,
                         %header.ack_nr,
                         payload_size = seg.payload_size(),
+                        pipe = rec.pipe_estimate.pipe,
+                        cwnd,
                         "RECOVERY: sent ST_DATA"
                     );
                     rec.high_rxt = seg.seq_nr();
-                    rec.retransmit_tokens -= 1;
+                    rec.total_retransmitted_segments += 1;
+                    rec.pipe_estimate.pipe += seg.payload_size();
+                    cwnd = cwnd.saturating_sub(seg.payload_size());
+                    sent += 1;
                 } else {
                     return Ok(());
                 }
             }
 
+            if sent == 0 {
+                debug!(
+                    pipe = rec.pipe_estimate.pipe,
+                    cwnd, "recovery couldn't send anything"
+                );
+            }
+
+            match rec.pipe_estimate.recalc_timer {
+                Some(t) => {
+                    self.timers.recovery_pipe_expiry = Some(t);
+                }
+                None if sent > 0 => {
+                    self.timers.recovery_pipe_expiry = Some(self.rtte.roundtrip_time());
+                }
+                _ => {}
+            }
+
+            // Retransmit FIN if needed.
             if let Some(our_fin) = self.state.our_fin_if_unacked() {
                 if rec.high_rxt == our_fin - 1 {
                     // Rewind last_sent_seq_nr to re-send FIN
                     self.last_sent_seq_nr = our_fin - 1;
                     rec.high_rxt = our_fin;
+                    rec.total_retransmitted_segments += 1;
                     // No reason to do anything further.
                     return Ok(());
                 }
@@ -912,6 +945,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.congestion_controller
             .set_remote_window(msg.header.wnd_size as usize);
 
+        self.recovery.on_ack(
+            &msg.header,
+            &result.on_ack_result,
+            &mut self.user_tx_segments,
+            self.last_sent_seq_nr,
+            &mut *self.congestion_controller,
+            self.this_poll.now,
+            self.rtte.roundtrip_time(),
+        );
+
         match msg.header.get_type() {
             ST_DATA => {
                 trace!(payload_size = msg.payload().len(), "received ST_DATA");
@@ -994,16 +1037,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     self.force_immediate_ack();
                 }
             }
-            ST_STATE => {
-                self.recovery.on_ack(
-                    &msg.header,
-                    &result.on_ack_result,
-                    &mut self.user_tx_segments,
-                    self.last_sent_seq_nr,
-                    &mut *self.congestion_controller,
-                    self.this_poll.now,
-                );
-            }
+            ST_STATE => {}
             ST_RESET => bail!("ST_RESET received"),
             ST_FIN => {
                 if let Some(close_reason) = msg.header.extensions.close_reason {
@@ -1074,7 +1108,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     // When do we need to send smth timer-based next time.
-    fn next_poll_send_to_at(&self) -> PollAt {
+    fn next_poll_send_to_at(&mut self) -> PollAt {
         let want_ack = self.ack_to_transmit();
 
         let delayed_ack_poll_at = match (want_ack, self.timers.ack_delay_timer) {
@@ -1091,12 +1125,19 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .remote_inactivity_timer
             .map_or(PollAt::Ingress, PollAt::Time);
 
+        let pipe_expiry_timer = self
+            .timers
+            .recovery_pipe_expiry
+            .take()
+            .map_or(PollAt::Ingress, |p| PollAt::Time(self.this_poll.now + p));
+
         // We wait for the earliest of our timers to fire.
         self.timers
             .retransmit
             .poll_at(self.this_poll.now)
             .min(delayed_ack_poll_at)
             .min(inactivity_poll)
+            .min(pipe_expiry_timer)
     }
 
     fn maybe_send_syn_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
@@ -1395,6 +1436,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 retransmit: RetransmitTimer::new(),
                 sleep: Box::pin(tokio::time::sleep(Duration::from_secs(0))),
                 ack_delay_timer: AckDelayTimer::Idle,
+                recovery_pipe_expiry: None,
                 remote_inactivity_timer: if rtt.is_some() {
                     None
                 } else {
@@ -1478,6 +1520,7 @@ enum RetransmitTimer {
 struct Timers {
     sleep: Pin<Box<Sleep>>,
     remote_inactivity_timer: Option<Instant>,
+    recovery_pipe_expiry: Option<Duration>,
     retransmit: RetransmitTimer,
     ack_delay_timer: AckDelayTimer,
 }
