@@ -69,13 +69,17 @@ impl CongestionController for Cubic {
         (self.cwnd * self.mss as f64) as usize
     }
 
+    fn sshthresh(&self) -> usize {
+        (self.ssthresh * self.mss as f64) as usize
+    }
+
     fn on_rto_timeout(&mut self, _now: Instant) {
         // CUBIC https://datatracker.ietf.org/doc/html/rfc8312#section-4.7
         self.ssthresh = (self.cwnd * BETA_CUBIC).max(2.);
         self.cwnd = 1.
     }
 
-    fn on_congestion_event(&mut self, now: Instant) {
+    fn on_enter_fast_retransmit(&mut self, now: Instant) {
         self.w_max = self.cwnd;
         self.cwnd *= BETA_CUBIC;
         self.ssthresh = self.cwnd.max(2.);
@@ -91,6 +95,11 @@ impl CongestionController for Cubic {
         }
 
         self.k = calc_k(self.w_max);
+    }
+
+    fn on_recovered(&mut self, recovery_cwnd_bytes: usize) {
+        let rec_cwnd = recovery_cwnd_bytes as f64 / self.mss as f64;
+        self.cwnd = rec_cwnd.min(self.rwnd).max(2.);
     }
 
     fn on_ack(&mut self, now: Instant, len: usize, rtte: &RttEstimator) {
@@ -123,6 +132,10 @@ impl CongestionController for Cubic {
 
     fn set_remote_window(&mut self, win: usize) {
         self.rwnd = win as f64 / self.mss as f64
+    }
+
+    fn smss(&self) -> usize {
+        self.mss
     }
 }
 
@@ -193,7 +206,7 @@ mod tests {
         trace!(?cubic, "cubic after 50 MSS packets");
 
         now += rtt * 3;
-        cubic.on_congestion_event(now);
+        cubic.on_enter_fast_retransmit(now);
         trace!(?cubic, "cubic after triple duplicate acks");
         // Pretend there was a fast retransmit here.
 

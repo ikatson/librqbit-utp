@@ -44,17 +44,35 @@ where
         );
     }
 
-    fn on_congestion_event(&mut self, now: Instant) {
+    fn on_enter_fast_retransmit(&mut self, now: Instant) {
         log_if_changed!(
             CONGESTION_TRACING_LOG_LEVEL,
-            "on_congestion_event",
+            "on_enter_fast_retransmit",
             self,
             |s| s.inner,
-            |s| s.inner.on_congestion_event(now)
+            |s| s.inner.on_enter_fast_retransmit(now)
         );
     }
 
     fn set_remote_window(&mut self, win: usize) {
         self.inner.set_remote_window(win);
+    }
+
+    fn sshthresh(&self) -> usize {
+        self.inner.sshthresh()
+    }
+
+    fn on_recovered(&mut self, recovery_cwnd_bytes: usize) {
+        log_if_changed!(
+            CONGESTION_TRACING_LOG_LEVEL,
+            "on_recovered",
+            self,
+            |s| s.inner,
+            |s| s.inner.on_recovered(recovery_cwnd_bytes)
+        );
+    }
+
+    fn smss(&self) -> usize {
+        self.inner.smss()
     }
 }

@@ -60,6 +60,7 @@ impl Segment {
 
 pub struct Segments {
     segments: VecDeque<Segment>,
+    // This is including unsent. So it's not FlightSize
     len_bytes: usize,
     capacity: usize,
 
@@ -159,6 +160,8 @@ pub struct OnAckResult {
 
     // How many segments in TX queue were marked delivered by SACK.
     pub newly_sacked_segment_count: usize,
+
+    pub newly_sacked_byte_count: usize,
     pub new_rtt: Option<Duration>,
 }
 
@@ -167,6 +170,12 @@ impl OnAckResult {
         self.acked_segments_count += other.acked_segments_count;
         self.acked_bytes += other.acked_bytes;
         self.new_rtt = rtt_min(self.new_rtt, other.new_rtt);
+        self.newly_sacked_segment_count += other.newly_sacked_segment_count;
+        self.newly_sacked_byte_count += other.newly_sacked_byte_count;
+    }
+
+    pub fn total_acked_bytes(&self) -> usize {
+        self.newly_sacked_byte_count + self.acked_bytes
     }
 
     // Check if it's a duplicate ACK per rfc6298
@@ -265,6 +274,7 @@ impl Segments {
         let mut removed = 0;
         let mut payload_size = 0;
         let mut newly_sacked_segment_count: usize = 0;
+        let mut newly_sacked_byte_count: usize = 0;
 
         let mut new_rtt: Option<Duration> = None;
 
@@ -291,6 +301,7 @@ impl Segments {
                         segment.is_delivered = true;
                         segment.update_rtt(now, &mut new_rtt);
                         newly_sacked_segment_count += 1;
+                        newly_sacked_byte_count += segment.payload_size;
                     }
                 };
 
@@ -332,6 +343,7 @@ impl Segments {
             acked_segments_count: removed,
             acked_bytes: payload_size,
             newly_sacked_segment_count,
+            newly_sacked_byte_count,
             new_rtt,
         }
     }
@@ -340,81 +352,12 @@ impl Segments {
         self.smss
     }
 
-    // rfc6675 SetPipe
-    pub fn calc_sack_pipe(&mut self, high_rxt: SeqNr) -> usize {
-        let mut in_contig = false;
-        let mut non_contig_count = 0;
-        let mut sacked_bytes = 0usize;
-        let sacked_bytes_limit = (SACK_DUP_THRESH - 1) * self.smss();
-
-        let mut pipe = 0;
-
-        // The max seq_nr that we could have seen in a SACK.
-        // Everything past it is considered not lost, and SACKed, as we just don't know.
-        //
-        // TODO: maybe track this more precisely from the sender's sack?
-
-        // The information below is governing re-sending.
-
-        for (offset, seq_nr, seg) in self
-            .segments
-            // .range_mut(0..SACK_DEPTH)
-            .iter_mut()
-            .enumerate()
-            .rev()
-            .skip_while(|(_, s)| !s.is_sent())
-            .map(|(offset, seg)| (offset, self.snd_una + offset as u16, seg))
-        {
-            if offset > SACK_DEPTH + 1 {
-                assert!(!seg.is_delivered);
-
-                // We have no idea about this packet. So we treat it very specially.
-
-                // We assume they are in one contiguous sequence. So that all actually unSACKed packets.
-                // assume they have SACks after them for NextSeg().
-                in_contig = true;
-
-                // This will influence is_lost calculation for packets in the SACK block
-                sacked_bytes += seg.payload_size;
-
-                // This is minor, but will prevent re-sending it too early.
-                seg.is_lost = false;
-
-                pipe += seg.payload_size;
-
-                continue;
-            }
-
-            seg.is_lost = !seg.is_delivered
-                && (non_contig_count >= SACK_DUP_THRESH || sacked_bytes >= sacked_bytes_limit);
-            // if seg.is_lost {
-            //     tracing::debug!(?seq_nr, "lost");
-            // }
-            seg.has_sacks_after_it = sacked_bytes > 0;
-
-            if !seg.is_delivered && !seg.is_lost {
-                pipe += seg.payload_size;
-            }
-            if seq_nr <= high_rxt {
-                pipe += seg.payload_size;
-            }
-
-            if seg.is_delivered {
-                sacked_bytes += seg.payload_size;
-            }
-
-            match (in_contig, seg.is_delivered) {
-                (true, true) | (false, false) => continue,
-                (true, false) => {
-                    in_contig = false;
-                }
-                (false, true) => {
-                    in_contig = true;
-                    non_contig_count += 1;
-                }
-            }
-        }
-        pipe
+    pub fn calc_flight_size(&self) -> usize {
+        self.segments
+            .iter()
+            .take_while(|s| !s.is_sent())
+            .map(|s| if s.is_delivered { 0 } else { s.payload_size })
+            .sum()
     }
 
     // rfc6675 IsLost

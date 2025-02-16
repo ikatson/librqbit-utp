@@ -15,116 +15,18 @@ use crate::{
 #[derive(Debug, Clone, Copy)]
 pub struct RecoveryPhase {
     pub recovery_point: SeqNr,
-
-    // "HighRxt" is the highest sequence number which has been
-    // retransmitted during the current loss recovery phase.
     pub high_rxt: SeqNr,
+    pub retransmit_tokens: usize,
 
-    // "RescueRxt" is the highest sequence number which has been
-    // optimistically retransmitted to prevent stalling of the ACK clock
-    // when there is loss at the end of the window and no new data is
-    // available for transmission.
-    pub rescue_rxt_used: bool,
-
-    // Upon entering recovery, we MUST retransmit the first outstanding packet.
-    pub first_sent: bool,
-
-    // "Pipe" is a sender's estimate of the number of bytes outstanding
-    // in the network.
-    pub pipe: usize,
+    // During recovery we manage cwnd, not congestion controller.
+    pub cwnd: usize,
 }
 
-pub struct NextSeg<'a> {
-    pub item: SegmentIterItem<&'a mut Segment>,
-    pub is_rescue: bool,
-}
-
-impl RecoveryPhase {
-    // The caller must set high_rxt after successfully sending.
-    pub fn next_seg<'s>(&self, tx_segs: &'s mut Segments) -> anyhow::Result<Option<NextSeg<'s>>> {
-        fn erase_lifetime<'o>(s: &mut Segments) -> &'o mut Segments {
-            unsafe { &mut *{ s as *mut _ } }
-        }
-
-        // Rule "0" (i.e. section 4.3) - retransmit the first segment if not yet.
-        if let Some(seg) = erase_lifetime(tx_segs)
-            .iter_mut()
-            .next()
-            .filter(|s| s.seq_nr() > self.high_rxt)
-        {
-            if seg.is_delivered() {
-                anyhow::bail!("RecoveryPhase::next_seg: first segment in Segments is delivered, this shouldn't happen!")
-            }
-            return Ok(Some(NextSeg {
-                item: seg,
-                is_rescue: false,
-            }));
-        }
-
-        let rule_1a = |seg: &SegmentIterItem<&mut Segment>| seg.seq_nr() > self.high_rxt;
-        let rule_1b = |seg: &SegmentIterItem<&mut Segment>| seg.segment().has_sacks_after_it;
-        let rule_1c = |seg: &SegmentIterItem<&mut Segment>| seg.segment().is_lost;
-
-        // Rule 1.
-        //
-        // Safety: this is just a hack to satisfy borrow checker not coping with early returns from loops.
-        for seg in erase_lifetime(tx_segs)
-            .iter_mut()
-            .filter(|s| !s.is_delivered())
-        {
-            if rule_1a(&seg) && rule_1b(&seg) && rule_1c(&seg) {
-                return Ok(Some(NextSeg {
-                    item: seg,
-                    is_rescue: false,
-                }));
-            }
-        }
-
-        // Rule 2.
-        if let Some(seg) = erase_lifetime(tx_segs)
-            .iter_mut()
-            .filter(|s| !s.is_delivered())
-            .find(|s| !s.segment().is_sent())
-        {
-            return Ok(Some(NextSeg {
-                item: seg,
-                is_rescue: false,
-            }));
-        }
-
-        // Rule 3.
-        for seg in erase_lifetime(tx_segs)
-            .iter_mut()
-            .filter(|s| !s.is_delivered())
-        {
-            if rule_1a(&seg) && rule_1b(&seg) {
-                return Ok(Some(NextSeg {
-                    item: seg,
-                    is_rescue: false,
-                }));
-            }
-        }
-
-        // Rule 4
-        if !self.rescue_rxt_used {
-            if let Some(seg) = tx_segs
-                .iter_mut()
-                .take(SACK_DEPTH)
-                .filter(|s| !s.is_delivered())
-                .last()
-            {
-                return Ok(Some(NextSeg {
-                    item: seg,
-                    is_rescue: true,
-                }));
-            }
-        }
-        Ok(None)
-    }
-}
+impl RecoveryPhase {}
 
 #[derive(Debug, Clone, Copy)]
 pub enum Recovery {
+    IgnoringUntilRecoveryPoint { recovery_point: SeqNr },
     CountingDuplicates { dup_acks: u8 },
     Recovery(RecoveryPhase),
 }
@@ -134,14 +36,28 @@ impl Recovery {
         matches!(self, Recovery::Recovery { .. })
     }
 
+    pub fn recovery_cwnd(&self) -> Option<usize> {
+        match self {
+            Recovery::Recovery(rec) => Some(rec.cwnd),
+            _ => None,
+        }
+    }
+
     pub fn on_ack(
         &mut self,
         header: &UtpHeader,
         on_ack_result: &OnAckResult,
         tx_segs: &mut Segments,
         last_sent_seq_nr: SeqNr,
+        congestion_controller: &mut dyn CongestionController,
+        now: Instant,
     ) {
         match self {
+            Recovery::IgnoringUntilRecoveryPoint { recovery_point } => {
+                if header.ack_nr >= *recovery_point {
+                    *self = Recovery::CountingDuplicates { dup_acks: 0 }
+                }
+            }
             Recovery::CountingDuplicates { dup_acks } => {
                 if !on_ack_result.is_duplicate() {
                     *dup_acks = 0;
@@ -159,19 +75,13 @@ impl Recovery {
                     }
                 };
 
-                let high_data = last_sent_seq_nr;
-
-                let mut should_enter_recovery = *dup_acks as usize >= SACK_DUP_THRESH;
-                if !should_enter_recovery {
-                    tx_segs.calc_sack_pipe(high_ack);
-                    should_enter_recovery = tx_segs.first_is_lost();
-                }
+                let should_enter_recovery = *dup_acks as usize >= SACK_DUP_THRESH;
 
                 debug!(
                     should_enter_recovery,
                     dup_acks,
                     ?high_ack,
-                    ?high_data,
+                    high_data = ?last_sent_seq_nr,
                     "counting duplicate acks"
                 );
 
@@ -179,32 +89,59 @@ impl Recovery {
                     return;
                 }
 
-                let high_rxt = high_ack;
+                congestion_controller.on_enter_fast_retransmit(now);
 
                 let rec = RecoveryPhase {
-                    recovery_point: high_data,
-                    high_rxt,
-                    pipe: 0,
-                    rescue_rxt_used: false,
-                    first_sent: false,
+                    recovery_point: last_sent_seq_nr,
+
+                    // These 2 will allow us to fast retransmit the first missing packet right away
+                    high_rxt: high_ack,
+                    retransmit_tokens: 1,
+
+                    cwnd: congestion_controller.sshthresh(),
                 };
-                debug!(?rec.recovery_point, ?rec.high_rxt, "entered recovery");
+
+                // TODO: we need to inform congestion controller
+                // decrease sshthresh, maybe cwnd too?
+
+                debug!(?rec.recovery_point, "entered recovery");
                 *self = Recovery::Recovery(rec);
             }
             Recovery::Recovery(rec) => {
                 if header.ack_nr >= rec.recovery_point {
+                    // TODO: we need to inform congestion controller
+                    // Set cwnd to either (1) to min (ssthresh, max(FlightSize, SMSS) + SMSS)
                     debug!(?rec.recovery_point, ?header.ack_nr, "exited recovery");
+                    congestion_controller.on_recovered(rec.cwnd);
                     *self = Recovery::CountingDuplicates { dup_acks: 0 };
                     return;
                 }
-                rec.pipe = tx_segs.calc_sack_pipe(rec.high_rxt);
-                trace!(rec.pipe, "recovery: updated pipe");
+
+                // partial ACK
+                // In this case,
+                //        retransmit the first unacknowledged segment.  Deflate the
+                //        congestion window by the amount of new data acknowledged by the
+                //        Cumulative Acknowledgment field.
+
+                let total_acked_bytes = on_ack_result.total_acked_bytes();
+
+                if total_acked_bytes > 0 {
+                    rec.cwnd = rec.cwnd.saturating_sub(total_acked_bytes);
+                    if total_acked_bytes >= congestion_controller.smss() {
+                        // This will let us send new data.
+                        rec.cwnd += congestion_controller.smss();
+
+                        // This will let us retransmit one more unacked segment.
+                        rec.retransmit_tokens += 1;
+                    }
+                }
             }
         }
     }
 
-    pub(crate) fn on_retransmit(&mut self) {
-        // TODO: the RFC says we must not enter recovery again until high_data + some other tweaks.
-        *self = Recovery::CountingDuplicates { dup_acks: 0 }
+    pub(crate) fn on_rto_timeout(&mut self, last_sent_seq_nr: SeqNr) {
+        *self = Recovery::IgnoringUntilRecoveryPoint {
+            recovery_point: last_sent_seq_nr,
+        }
     }
 }

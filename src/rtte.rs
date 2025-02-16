@@ -122,7 +122,7 @@ impl RttEstimator {
         }
     }
 
-    pub fn on_retransmit(&mut self) {
+    pub fn on_rto_timeout(&mut self) {
         // rfc6298 section 5.5
         match &mut self.state {
             RttState::Initial { rto } => {

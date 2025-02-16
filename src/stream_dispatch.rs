@@ -322,86 +322,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.user_rx.remaining_rx_window() as u32
     }
 
-    fn send_in_recovery(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
-        let cwnd = self.effective_remote_receive_window();
-        let mut header = self.outgoing_header();
-        match &mut self.recovery {
-            Recovery::CountingDuplicates { .. } => {
-                bail!("bug: called send_in_recovery while not in recovery")
-            }
-            Recovery::Recovery(rec) => {
-                // 4.3. Retransmit the first data segment presumed dropped -- the
-                // segment starting with sequence number HighACK + 1
-                if !rec.first_sent {
-                    let item = self.user_tx_segments.iter_mut().next();
-                    if let Some(mut item) = item {
-                        if send_data!(self, cx, header, item) {
-                            trace!(
-                                %header.seq_nr,
-                                %header.ack_nr,
-                                payload_size = item.payload_size(),
-                                socket_was_full = self.this_poll.transport_pending,
-                                cwnd,
-                                rec.pipe,
-                                "RECOVERY: sent first ST_DATA"
-                            );
-
-                            rec.high_rxt = item.seq_nr();
-                            rec.pipe = self.user_tx_segments.calc_sack_pipe(rec.high_rxt);
-                            rec.first_sent = true;
-                        } else {
-                            return Ok(());
-                        }
-                    } else {
-                        warn!("bug: we are in recovery, but there's no outstanding data! exiting recovery");
-                        self.recovery = Recovery::CountingDuplicates { dup_acks: 0 };
-                        return Ok(());
-                    }
-                }
-
-                debug!(cwnd, rec.pipe, "recovery pre-send");
-
-                while cwnd.saturating_sub(rec.pipe)
-                    >= self.socket_opts.max_outgoing_payload_size.get()
-                {
-                    let Some(NextSeg {
-                        mut item,
-                        is_rescue,
-                    }) = rec.next_seg(&mut self.user_tx_segments)?
-                    else {
-                        trace!(?rec, "recovery: NextSeg returned None");
-                        return Ok(());
-                    };
-
-                    if send_data!(self, cx, header, item) {
-                        trace!(
-                            %header.seq_nr,
-                            %header.ack_nr,
-                            payload_size = item.payload_size(),
-                            socket_was_full = self.this_poll.transport_pending,
-                            cwnd,
-                            rec.pipe,
-                            is_rescue,
-                            "RECOVERY: sent ST_DATA"
-                        );
-
-                        if !is_rescue {
-                            rec.high_rxt = rec.high_rxt.max(item.seq_nr())
-                        } else {
-                            rec.rescue_rxt_used = true;
-                        }
-
-                        // C.3
-                        rec.pipe += item.payload_size();
-                    } else {
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
     // Returns true if UDP socket is full
     fn send_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
         // No reason to send anything, we'll get polled next time.
@@ -411,26 +331,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         let mut header = self.outgoing_header();
 
-        // Retransmit timer expired, resend the first unacked segment.
+        // Retransmit timer expired, rewind state backwards.
         if self.timers.retransmit.expired(self.this_poll.now) {
-            debug!("retransmit timer expired");
-            if let Some(mut seg) = self.user_tx_segments.iter_mut().next() {
-                if send_data!(self, cx, header, seg) {
-                    self.congestion_controller
-                        .on_rto_timeout(self.this_poll.now);
-                    self.rtte.on_retransmit();
-                    self.recovery.on_retransmit();
-                    debug!(
-                        %header.seq_nr,
-                        %header.ack_nr,
-                        payload_size = seg.payload_size(),
-                        "RTO: sent ST_DATA"
-                    );
-
-                    // Rewind back last sent seq_nr so that normal sending resumes.
-                    self.last_sent_seq_nr = seg.seq_nr();
-                }
-                return Ok(());
+            if let Some(first_unacked) = self.user_tx_segments.first_seq_nr() {
+                debug!("retransmit timer expired, will resend");
+                self.congestion_controller
+                    .on_rto_timeout(self.this_poll.now);
+                self.rtte.on_rto_timeout();
+                self.recovery.on_rto_timeout(self.last_sent_seq_nr);
+                // Rewind back last sent seq_nr so that normal sending resumes.
+                self.last_sent_seq_nr = first_unacked - 1;
             } else {
                 // There's no data to send. Maybe we need to resend FIN? Check.
                 match self.state.our_fin_if_unacked() {
@@ -450,15 +360,47 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(());
         }
 
-        if self.recovery.is_recovery() {
-            return self.send_in_recovery(cx);
+        // If we are in recovery, retransmit as many unacked packets as we are allowed by the recovery algorithm.
+        if let Recovery::Recovery(rec) = &mut self.recovery {
+            let high_rxt = rec.high_rxt;
+            let mut it = self
+                .user_tx_segments
+                .iter_mut()
+                .skip_while(|seg| seg.seq_nr() <= high_rxt)
+                .filter(|s| {
+                    !s.is_delivered() && s.segment().is_sent() && s.seq_nr() <= rec.recovery_point
+                });
+            while rec.retransmit_tokens > 0 {
+                if let Some(mut seg) = it.next() {
+                    if send_data!(self, cx, header, seg) {
+                        trace!(
+                            %header.seq_nr,
+                            %header.ack_nr,
+                            payload_size = seg.payload_size(),
+                            "RECOVERY: sent ST_DATA"
+                        );
+                        rec.high_rxt = seg.seq_nr();
+                        rec.retransmit_tokens -= 1;
+                    } else {
+                        return Ok(());
+                    }
+                }
+            }
         }
 
+        let mut recv_wnd = self
+            .recovery
+            .recovery_cwnd()
+            .unwrap_or(self.congestion_controller.window())
+            .min(self.last_remote_window as usize);
+
         let mut sent = false;
-        let mut recv_wnd = self.effective_remote_receive_window();
 
         // Send the stuff we haven't sent yet, up to sender's window.
         for mut item in self.user_tx_segments.iter_mut() {
+            if item.is_delivered() {
+                continue;
+            }
             let already_sent = item.seq_nr() <= self.last_sent_seq_nr;
             if already_sent {
                 recv_wnd = recv_wnd.saturating_sub(item.payload_size());
@@ -466,10 +408,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             // Selective ACK already marked this, ignore.
-            if item.is_delivered() {
-                continue;
-            }
-
             if recv_wnd < item.payload_size() {
                 METRICS.send_window_exhausted.increment(1);
                 debug_every_ms!(100, "remote recv window exhausted, not sending anything");
@@ -754,7 +692,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         if !was_in_recovery && self.recovery.is_recovery() {
             self.congestion_controller
-                .on_congestion_event(self.this_poll.now);
+                .on_enter_fast_retransmit(self.this_poll.now);
         }
 
         if result.on_ack_result.acked_segments_count > 0
@@ -1046,6 +984,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     &result.on_ack_result,
                     &mut self.user_tx_segments,
                     self.last_sent_seq_nr,
+                    &mut *self.congestion_controller,
+                    self.this_poll.now,
                 );
             }
             ST_RESET => bail!("ST_RESET received"),
