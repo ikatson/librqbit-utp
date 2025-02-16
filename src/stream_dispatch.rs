@@ -332,14 +332,26 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         // Retransmit timer expired, rewind state backwards.
         if self.timers.retransmit.expired(self.this_poll.now) {
-            if let Some(first_unacked) = self.user_tx_segments.first_seq_nr() {
+            debug!("retransmit timer expired");
+            if let Some(mut seg) = self.user_tx_segments.iter_mut().next() {
+                if send_data!(self, cx, header, seg) {
+                    debug!(
+                        %header.seq_nr,
+                        %header.ack_nr,
+                        payload_size = seg.payload_size(),
+                        "RTO expired: sent ST_DATA"
+                    );
+                    self.congestion_controller
+                        .on_rto_timeout(self.this_poll.now);
+                    self.rtte.on_rto_timeout();
+                    self.recovery.on_rto_timeout(self.last_sent_seq_nr);
+                    // Rewind back last sent seq_nr so that normal sending resumes.
+                    self.last_sent_seq_nr = seg.seq_nr();
+                } else {
+                    // This will retry on next poll.
+                    return Ok(());
+                }
                 debug!("retransmit timer expired, will resend");
-                self.congestion_controller
-                    .on_rto_timeout(self.this_poll.now);
-                self.rtte.on_rto_timeout();
-                self.recovery.on_rto_timeout(self.last_sent_seq_nr);
-                // Rewind back last sent seq_nr so that normal sending resumes.
-                self.last_sent_seq_nr = first_unacked - 1;
             } else {
                 // There's no data to send. Maybe we need to resend FIN? Check.
                 match self.state.our_fin_if_unacked() {
@@ -361,6 +373,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         // If we are in recovery, retransmit as many unacked packets as we are allowed by the recovery algorithm.
         if let Recovery::Recovery(rec) = &mut self.recovery {
+            debug!("in recovery");
             let high_rxt = rec.high_rxt;
             let mut it = self
                 .user_tx_segments
@@ -372,7 +385,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             while rec.retransmit_tokens > 0 {
                 if let Some(mut seg) = it.next() {
                     if send_data!(self, cx, header, seg) {
-                        trace!(
+                        debug!(
                             %header.seq_nr,
                             %header.ack_nr,
                             payload_size = seg.payload_size(),
@@ -383,6 +396,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     } else {
                         return Ok(());
                     }
+                } else {
+                    break;
                 }
             }
         }
