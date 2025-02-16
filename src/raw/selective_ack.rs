@@ -10,13 +10,13 @@ pub struct SelectiveAck {
 }
 
 impl SelectiveAck {
-    pub fn new(unacked: impl Iterator<Item = usize>) -> Option<Self> {
+    pub fn new(unacked: impl Iterator<Item = usize>) -> Self {
         let mut data = SelectiveAckData::default();
 
         for idx in unacked.take_while(|i| *i < SACK_DEPTH) {
             data.set(idx, true);
         }
-        Some(Self { data })
+        Self { data }
     }
 
     #[cfg(test)]

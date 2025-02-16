@@ -915,7 +915,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         "dropping message, we already ACKed it"
                     );
                     METRICS.incoming_already_acked_data_packets.increment(1);
-                    self.force_immediate_ack();
+                    // self.force_immediate_ack();
                     return Ok(result);
                 }
 
@@ -955,6 +955,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     AssemblerAddRemoveResult::Unavailable(_) => {
                         debug_every_ms!(500, header=%hdr.short_repr(), offset,
                             ?self.last_consumed_remote_seq_nr, "cannot reassemble message, ignoring it");
+                    }
+                    AssemblerAddRemoveResult::AlreadyPresent => {
+                        debug_every_ms!(500, header=%hdr.short_repr(), offset,
+                            ?self.last_consumed_remote_seq_nr, "already present in assembler");
                     }
                 }
 

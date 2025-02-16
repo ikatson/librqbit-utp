@@ -127,11 +127,11 @@ impl Recovery {
             }
             Recovery::Recovery(rec) => {
                 // Heuristic. If there's still selective ACK data, DO NOT exit recovery.
-                if header.ack_nr >= rec.recovery_point && header.extensions.selective_ack.is_some()
-                {
-                    debug!("moving recovery point further, still not fully recovered");
-                    rec.recovery_point = last_sent_seq_nr;
-                }
+                // if header.ack_nr >= rec.recovery_point && header.extensions.selective_ack.is_some()
+                // {
+                //     debug!("moving recovery point further, still not fully recovered");
+                //     rec.recovery_point = last_sent_seq_nr;
+                // }
 
                 if header.ack_nr >= rec.recovery_point {
                     if rec.total_retransmitted_segments > 0 {

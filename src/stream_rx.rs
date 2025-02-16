@@ -435,6 +435,7 @@ pub enum AssemblerAddRemoveResult {
         sequence_numbers: usize,
         bytes: usize,
     },
+    AlreadyPresent,
     Unavailable(UtpMessage),
 }
 
@@ -553,7 +554,7 @@ impl OutOfOrderQueue {
                 }
             });
 
-        SelectiveAck::new(unacked)
+        Some(SelectiveAck::new(unacked))
     }
 
     pub fn add_remove(
@@ -589,7 +590,7 @@ impl OutOfOrderQueue {
             .get_mut(effective_offset)
             .context("bug: slot should be there")?;
         if !slot.payload().is_empty() {
-            bail!("bug: slot had payload")
+            return Ok(AssemblerAddRemoveResult::AlreadyPresent);
         }
 
         self.len += 1;
@@ -852,5 +853,26 @@ mod tests {
         );
         trace!(asm=%asm.debug_string(true));
         assert_eq!(asm.stored_packets(), 1);
+    }
+
+    #[test]
+    fn test_asm_duplicate_msg_ignored() {
+        setup_test_logging();
+
+        let mut asm = OutOfOrderQueue::new(NonZeroUsize::new(10).unwrap());
+        let msg_2 = msg(2, b"test");
+        assert_eq!(
+            asm.add_remove(msg_2, 2).unwrap(),
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 0,
+                bytes: 0
+            }
+        );
+
+        let msg_2 = msg(2, b"test");
+        assert_eq!(
+            asm.add_remove(msg_2, 2).unwrap(),
+            AssemblerAddRemoveResult::AlreadyPresent
+        );
     }
 }
