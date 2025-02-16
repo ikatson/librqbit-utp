@@ -342,7 +342,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         // Retransmit timer expired, rewind state backwards.
         if self.timers.retransmit.expired(self.this_poll.now) {
             debug!("retransmit timer expired");
-            if let Some(mut seg) = self.user_tx_segments.iter_mut().next() {
+            if let Some(mut seg) = self.user_tx_segments.iter_mut_for_sending(None).next() {
                 if send_data!(self, cx, header, seg) {
                     debug!(
                         %header.seq_nr,
@@ -388,7 +388,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             let recovery_point = rec.recovery_point();
             let mut it = self
                 .user_tx_segments
-                .iter_mut()
+                .iter_mut_for_sending(None)
                 .take(SACK_DEPTH + 1)
                 .skip_while(|seg| seg.seq_nr() <= high_rxt)
                 .take_while(|seg| seg.seq_nr() <= recovery_point)
@@ -464,7 +464,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let mut sent_count = 0;
 
         // Send the stuff we haven't sent yet, up to sender's window.
-        for mut item in self.user_tx_segments.iter_mut() {
+        for mut item in self
+            .user_tx_segments
+            .iter_mut_for_sending(Some(self.last_sent_seq_nr + 1))
+        {
             if item.is_delivered() {
                 continue;
             }

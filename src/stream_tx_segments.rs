@@ -23,6 +23,7 @@ enum SentStatus {
 
 pub struct Segment {
     payload_size: usize,
+    payload_offset_absolute: u64,
     is_delivered: bool,
     sent: SentStatus,
 }
@@ -64,6 +65,12 @@ pub struct Segments {
     // This is including unsent. So it's not FlightSize
     len_bytes: usize,
     capacity: usize,
+
+    // absolute offset in bytes since creation.
+    offset: u64,
+
+    // how many bytes were consumed since creation.
+    removed_offset: u64,
 
     // SND.UNA - the sequence number of first unacknowledged segment.
     // If all acknowledged, this is the same as SND.NEXT.
@@ -203,6 +210,8 @@ impl Segments {
             segments: VecDeque::new(),
             // TODO: store total sacked (marked delivered through sack)
             len_bytes: 0,
+            offset: 0,
+            removed_offset: 0,
             capacity: tx_bytes / smss,
             snd_una,
         }
@@ -253,9 +262,11 @@ impl Segments {
         }
         self.segments.push_back(Segment {
             payload_size: payload_len,
+            payload_offset_absolute: self.offset,
             is_delivered: false,
             sent: SentStatus::NotSent,
         });
+        self.offset += payload_len as u64;
         self.len_bytes += payload_len;
         true
     }
@@ -336,6 +347,8 @@ impl Segments {
             self.segments.pop_front().unwrap();
         }
 
+        self.removed_offset += payload_size as u64;
+
         OnAckResult {
             acked_segments_count: removed,
             acked_bytes: payload_size,
@@ -366,7 +379,7 @@ impl Segments {
         let mut recalc_timer = None;
 
         let take = high_data - self.snd_una;
-        debug_assert!(take > 0);
+        debug_assert!(take >= 0);
         let take = take as usize;
 
         for (offset, seq_nr, segment, last_sent) in self
@@ -416,25 +429,32 @@ impl Segments {
     }
 
     // Iterate stored data - headers and their payload offsets (as a function to copy payload to some other buffer).
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = SegmentIterItem<&mut Segment>> {
-        self.segments.iter_mut().scan(
-            SegmentIterState {
-                seq_nr: self.snd_una,
-                payload_offset: 0,
-            },
-            SegmentIterState::on_scan,
-        )
-    }
-
-    #[allow(unused)]
-    pub fn iter(&self) -> impl Iterator<Item = SegmentIterItem<&Segment>> {
-        self.segments.iter().scan(
-            SegmentIterState {
-                seq_nr: self.snd_una,
-                payload_offset: 0,
-            },
-            SegmentIterState::on_scan,
-        )
+    pub fn iter_mut_for_sending(
+        &mut self,
+        start: Option<SeqNr>,
+    ) -> impl Iterator<Item = SegmentIterItem<&mut Segment>> {
+        let offset = match start {
+            Some(start) => (start - self.snd_una).max(0) as usize,
+            None => 0,
+        };
+        let removed_abs = self.removed_offset;
+        let snd_una = self.snd_una;
+        let range = if offset >= self.segments.len() {
+            self.segments.len()..
+        } else {
+            offset..
+        };
+        self.segments
+            .range_mut(range)
+            .enumerate()
+            .map(move |(idx, seg)| SegmentIterItem {
+                seq_nr: snd_una + (offset + idx) as u16,
+                payload_offset: seg
+                    .payload_offset_absolute
+                    .checked_sub(removed_abs)
+                    .unwrap() as usize,
+                segment: seg,
+            })
     }
 }
 
@@ -575,7 +595,7 @@ mod tests {
         // Test Case 1: Basic setup with 4 packets starting from sequence number 3
         let mut now = Instant::now();
         let mut ftx = make_segmented_tx(3, 5);
-        for mut item in ftx.iter_mut() {
+        for mut item in ftx.iter_mut_for_sending(None) {
             item.on_sent(now);
         }
         now += Duration::from_secs(1);
@@ -590,7 +610,7 @@ mod tests {
         assert_eq!(ftx.first_seq_nr(), Some(6.into()));
 
         // We retransmit the rest
-        for mut item in ftx.iter_mut() {
+        for mut item in ftx.iter_mut_for_sending(None) {
             item.on_sent(now);
         }
 
@@ -601,5 +621,94 @@ mod tests {
         assert_eq!(res.acked_segments_count, 2);
         // This inflates rtt
         assert_eq!(res.new_rtt, None);
+    }
+
+    #[test]
+    fn test_iter_mut_offsets() {
+        let mut segs = Segments::new(0.into(), 1000, 10);
+        assert!(segs.enqueue(1));
+        assert!(segs.enqueue(2));
+        assert!(segs.enqueue(3));
+
+        assert_eq!(
+            segs.iter_mut_for_sending(None)
+                .map(|s| (s.seq_nr().0, s.payload_offset(), s.payload_size()))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 1), (1, 1, 2), (2, 3, 3)]
+        );
+
+        assert_eq!(
+            segs.remove_up_to_ack(
+                Instant::now(),
+                &UtpHeader {
+                    ack_nr: 0.into(),
+                    ..Default::default()
+                },
+            )
+            .acked_bytes,
+            1
+        );
+
+        assert_eq!(
+            segs.iter_mut_for_sending(None)
+                .map(|s| (s.seq_nr().0, s.payload_offset(), s.payload_size()))
+                .collect::<Vec<_>>(),
+            vec![(1, 0, 2), (2, 2, 3)]
+        );
+
+        assert!(segs.enqueue(4));
+        assert_eq!(
+            segs.iter_mut_for_sending(None)
+                .map(|s| (s.seq_nr().0, s.payload_offset(), s.payload_size()))
+                .collect::<Vec<_>>(),
+            vec![(1, 0, 2), (2, 2, 3), (3, 5, 4)]
+        );
+        assert_eq!(
+            segs.remove_up_to_ack(
+                Instant::now(),
+                &UtpHeader {
+                    ack_nr: 2.into(),
+                    ..Default::default()
+                },
+            )
+            .acked_bytes,
+            5
+        );
+
+        assert_eq!(
+            segs.iter_mut_for_sending(None)
+                .map(|s| (s.seq_nr().0, s.payload_offset(), s.payload_size()))
+                .collect::<Vec<_>>(),
+            vec![(3, 0, 4)]
+        );
+
+        assert_eq!(
+            segs.iter_mut_for_sending(Some(3.into()))
+                .map(|s| (s.seq_nr().0, s.payload_offset(), s.payload_size()))
+                .collect::<Vec<_>>(),
+            vec![(3, 0, 4)]
+        );
+
+        assert_eq!(
+            segs.iter_mut_for_sending(Some(4.into()))
+                .map(|s| (s.seq_nr().0, s.payload_offset(), s.payload_size()))
+                .collect::<Vec<_>>(),
+            vec![]
+        );
+
+        // From the past
+        assert_eq!(
+            segs.iter_mut_for_sending(Some(0.into()))
+                .map(|s| (s.seq_nr().0, s.payload_offset(), s.payload_size()))
+                .collect::<Vec<_>>(),
+            vec![(3, 0, 4)]
+        );
+
+        assert_eq!(
+            segs.iter_mut_for_sending(Some(1000.into()))
+                .map(|s| (s.seq_nr().0, s.payload_offset(), s.payload_size()))
+                .collect::<Vec<_>>(),
+            vec![]
+        );
     }
 }
