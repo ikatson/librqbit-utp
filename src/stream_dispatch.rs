@@ -395,6 +395,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     return Ok(());
                 }
             }
+
+            if let Some(our_fin) = self.state.our_fin_if_unacked() {
+                if rec.high_rxt == our_fin - 1 {
+                    // Rewind last_sent_seq_nr to re-send FIN
+                    self.last_sent_seq_nr = our_fin - 1;
+                    rec.high_rxt = our_fin;
+                    // No reason to do anything further.
+                    return Ok(());
+                }
+            }
         }
 
         let mut recv_wnd = self
