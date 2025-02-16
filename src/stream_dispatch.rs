@@ -18,7 +18,8 @@ use tracing::{debug, error_span, trace, trace_span, Level};
 use crate::{
     congestion::CongestionController,
     constants::{
-        ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RTTE_TRACING_LOG_LEVEL, SYNACK_RESEND_INTERNAL,
+        ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RTTE_TRACING_LOG_LEVEL, SACK_DEPTH,
+        SYNACK_RESEND_INTERNAL,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -370,22 +371,25 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(());
         }
 
+        let mut in_recovery = false;
+
         // If we are in recovery, retransmit as many unacked packets as we are allowed by the recovery algorithm.
         if let Some(rec) = self.recovery.recovering_mut() {
+            in_recovery = true;
             let high_rxt = rec.high_rxt;
             let recovery_point = rec.recovery_point();
             let mut it = self
                 .user_tx_segments
                 .iter_mut()
+                .take(SACK_DEPTH + 1)
                 .skip_while(|seg| seg.seq_nr() <= high_rxt)
                 .take_while(|seg| seg.seq_nr() <= recovery_point)
                 .filter(|s| !s.is_delivered());
 
             let mut cwnd = rec.cwnd();
             let mut sent = 0;
-            while rec.total_retransmitted_segments == 0
-                || cwnd > self.socket_opts.max_outgoing_payload_size.get()
-            {
+            let mss = self.socket_opts.max_outgoing_payload_size.get();
+            while rec.total_retransmitted_segments == 0 || cwnd > mss {
                 let mut seg = match it.next() {
                     Some(seg) => seg,
                     None => break,
@@ -417,14 +421,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 );
             }
 
-            match rec.pipe_estimate.recalc_timer {
-                Some(t) => {
-                    self.timers.recovery_pipe_expiry = Some(t);
+            if cwnd < mss {
+                match rec.pipe_estimate.recalc_timer {
+                    Some(t) => {
+                        self.timers.recovery_pipe_expiry = Some(t);
+                    }
+                    None if sent > 0 => {
+                        self.timers.recovery_pipe_expiry = Some(self.rtte.roundtrip_time() / 2);
+                    }
+                    _ => {}
                 }
-                None if sent > 0 => {
-                    self.timers.recovery_pipe_expiry = Some(self.rtte.roundtrip_time());
-                }
-                _ => {}
             }
 
             // Retransmit FIN if needed.
@@ -446,7 +452,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .unwrap_or(self.congestion_controller.window())
             .min(self.last_remote_window as usize);
 
-        let mut sent = false;
+        let mut sent_count = 0;
 
         // Send the stuff we haven't sent yet, up to sender's window.
         for mut item in self.user_tx_segments.iter_mut() {
@@ -455,7 +461,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
             let already_sent = item.seq_nr() <= self.last_sent_seq_nr;
             if already_sent {
-                recv_wnd = recv_wnd.saturating_sub(item.payload_size());
+                // Recovery already accounted for the sent segments in the pipe calculation.
+                if !in_recovery {
+                    recv_wnd = recv_wnd.saturating_sub(item.payload_size());
+                }
                 continue;
             }
 
@@ -475,7 +484,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     "sent ST_DATA"
                 );
                 recv_wnd = recv_wnd.saturating_sub(item.payload_size());
-                sent = true;
+                sent_count += 1;
             } else {
                 break;
             }
@@ -485,9 +494,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         }
 
-        if !sent {
+        if sent_count == 0 {
             trace!(recv_wnd, "did not send anything");
         } else {
+            if in_recovery {
+                debug!(sent_count, remaining_cwnd = recv_wnd, "sent in recovery");
+            }
             trace!(recv_wnd, "remaining recv_wnd after sending");
         }
 

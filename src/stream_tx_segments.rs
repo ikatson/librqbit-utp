@@ -357,6 +357,8 @@ impl Segments {
         let mut delivered_segs = 0;
         let mut recalc_timer = None;
 
+        let halfrtt = rtt / 2;
+
         for (offset, seq_nr, segment, last_sent) in self
             .segments
             .iter()
@@ -378,9 +380,9 @@ impl Segments {
 
             if offset > SACK_DEPTH + 1 {
                 // If a segment is past sack depth limit, we don't know anything about it.
-                // So assume like this: if it was last sent before RTT, it's in the pipe.
-                if now - last_sent < rtt {
-                    let expires_in = last_sent + rtt - now;
+                // So assume like this: it's in the pipe if we last sent it in half RTT.
+                if now - last_sent < halfrtt {
+                    let expires_in = last_sent + halfrtt - now;
                     pipe += segment.payload_size;
                     recalc_timer = match recalc_timer {
                         Some(d) if d < expires_in => Some(d),
@@ -398,10 +400,7 @@ impl Segments {
             }
         }
 
-        Pipe {
-            pipe,
-            recalc_timer: recalc_timer,
-        }
+        Pipe { pipe, recalc_timer }
     }
 
     // Iterate stored data - headers and their payload offsets (as a function to copy payload to some other buffer).
