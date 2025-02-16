@@ -258,6 +258,11 @@ macro_rules! send_data {
 
         $header.set_type(Type::ST_DATA);
         $header.seq_nr = $segment_iter_item.seq_nr();
+        $header.timestamp_microseconds =
+            ($self.env.now() - $self.socket_created).as_micros() as u32;
+        $header.timestamp_difference_microseconds = $header
+            .timestamp_microseconds
+            .wrapping_sub($self.last_remote_timestamp);
 
         let len = $header
             .serialize_with_payload(&mut $self.this_poll.tmp_buf, |b| {
@@ -275,7 +280,10 @@ macro_rules! send_data {
                 .socket
                 .try_poll_send_to($cx, &$self.this_poll.tmp_buf[..len], $self.remote)?;
         if !$self.this_poll.transport_pending {
-            $segment_iter_item.on_sent($self.this_poll.now);
+            // This time better be as precise as possible as we are using it to
+            // calculate recovery pipe (estimate of how many packets are in transit).
+            // see rfc6675.
+            $segment_iter_item.on_sent($self.env.now());
             on_packet_sent!($self, $header);
 
             if $segment_iter_item.seq_nr() > $self.last_sent_seq_nr {
