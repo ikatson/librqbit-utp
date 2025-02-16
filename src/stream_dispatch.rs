@@ -351,7 +351,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     // This will retry on next poll.
                     return Ok(());
                 }
-                debug!("retransmit timer expired, will resend");
             } else {
                 // There's no data to send. Maybe we need to resend FIN? Check.
                 match self.state.our_fin_if_unacked() {
@@ -373,31 +372,27 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         // If we are in recovery, retransmit as many unacked packets as we are allowed by the recovery algorithm.
         if let Recovery::Recovery(rec) = &mut self.recovery {
-            debug!("in recovery");
             let high_rxt = rec.high_rxt;
-            let mut it = self
+            let it = self
                 .user_tx_segments
                 .iter_mut()
                 .skip_while(|seg| seg.seq_nr() <= high_rxt)
-                .filter(|s| {
-                    !s.is_delivered() && s.segment().is_sent() && s.seq_nr() <= rec.recovery_point
-                });
-            while rec.retransmit_tokens > 0 {
-                if let Some(mut seg) = it.next() {
-                    if send_data!(self, cx, header, seg) {
-                        debug!(
-                            %header.seq_nr,
-                            %header.ack_nr,
-                            payload_size = seg.payload_size(),
-                            "RECOVERY: sent ST_DATA"
-                        );
-                        rec.high_rxt = seg.seq_nr();
-                        rec.retransmit_tokens -= 1;
-                    } else {
-                        return Ok(());
-                    }
+                .take_while(|seg| seg.seq_nr() <= rec.recovery_point)
+                .filter(|s| !s.is_delivered())
+                .take(rec.retransmit_tokens);
+            for mut seg in it {
+                if send_data!(self, cx, header, seg) {
+                    trace!(
+                        %header.seq_nr,
+                        %header.ack_nr,
+                        payload_size = seg.payload_size(),
+                        "RECOVERY: sent ST_DATA"
+                    );
+                    rec.high_rxt = seg.seq_nr();
+                    rec.retransmit_tokens -= 1;
+                    rec.total_retransmitted_segments += 1;
                 } else {
-                    break;
+                    return Ok(());
                 }
             }
         }

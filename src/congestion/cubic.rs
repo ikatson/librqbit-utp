@@ -97,9 +97,10 @@ impl CongestionController for Cubic {
         self.k = calc_k(self.w_max);
     }
 
-    fn on_recovered(&mut self, recovery_cwnd_bytes: usize) {
-        let rec_cwnd = recovery_cwnd_bytes as f64 / self.mss as f64;
+    fn on_recovered(&mut self, new_cwnd_bytes: usize, new_sshthresh: usize) {
+        let rec_cwnd = new_cwnd_bytes as f64 / self.mss as f64;
         self.cwnd = rec_cwnd.min(self.rwnd).max(2.);
+        self.ssthresh = new_sshthresh as f64 / self.mss as f64;
     }
 
     fn on_ack(&mut self, now: Instant, len: usize, rtte: &RttEstimator) {

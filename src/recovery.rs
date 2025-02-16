@@ -18,8 +18,13 @@ pub struct RecoveryPhase {
     pub high_rxt: SeqNr,
     pub retransmit_tokens: usize,
 
+    pub total_retransmitted_segments: usize,
+
     // During recovery we manage cwnd, not congestion controller.
     pub cwnd: usize,
+
+    restore_cwnd: usize,
+    restore_sshthresh: usize,
 }
 
 impl RecoveryPhase {}
@@ -55,6 +60,7 @@ impl Recovery {
         match self {
             Recovery::IgnoringUntilRecoveryPoint { recovery_point } => {
                 if header.ack_nr >= *recovery_point {
+                    debug!(?recovery_point, ?header.ack_nr, "exiting IgnoringUntilRecoveryPoint");
                     *self = Recovery::CountingDuplicates { dup_acks: 0 }
                 }
             }
@@ -82,6 +88,7 @@ impl Recovery {
                     dup_acks,
                     ?high_ack,
                     high_data = ?last_sent_seq_nr,
+                    ?congestion_controller,
                     "counting duplicate acks"
                 );
 
@@ -89,52 +96,65 @@ impl Recovery {
                     return;
                 }
 
+                let restore_cwnd = congestion_controller.window();
+                let restore_sshthresh = congestion_controller.sshthresh();
+
                 congestion_controller.on_enter_fast_retransmit(now);
+
+                let retransmit_tokens = header
+                    .extensions
+                    .selective_ack
+                    .as_ref()
+                    .map(|sack| sack.as_bitslice().count_ones())
+                    .unwrap_or(0)
+                    .max(1);
 
                 let rec = RecoveryPhase {
                     recovery_point: last_sent_seq_nr,
 
-                    // These 2 will allow us to fast retransmit the first missing packet right away
                     high_rxt: high_ack,
-                    retransmit_tokens: 1,
+                    retransmit_tokens,
+
+                    total_retransmitted_segments: 0,
 
                     cwnd: congestion_controller.sshthresh(),
+                    restore_cwnd,
+                    restore_sshthresh,
                 };
 
-                // TODO: we need to inform congestion controller
-                // decrease sshthresh, maybe cwnd too?
-
-                debug!(?rec.recovery_point, "entered recovery");
+                debug!(?rec.recovery_point, ?retransmit_tokens, ?congestion_controller, "entered recovery");
                 *self = Recovery::Recovery(rec);
             }
             Recovery::Recovery(rec) => {
+                // Heuristic. If there's still selective ACK data, DO NOT exit recovery.
+                if header.ack_nr >= rec.recovery_point && header.extensions.selective_ack.is_some()
+                {
+                    debug!("moving recovery point further, still not fully recovered");
+                    rec.recovery_point = last_sent_seq_nr;
+                }
+
                 if header.ack_nr >= rec.recovery_point {
-                    // TODO: we need to inform congestion controller
-                    // Set cwnd to either (1) to min (ssthresh, max(FlightSize, SMSS) + SMSS)
-                    debug!(?rec.recovery_point, ?header.ack_nr, "exited recovery");
-                    congestion_controller.on_recovered(rec.cwnd);
+                    if rec.total_retransmitted_segments > 0 {
+                        // Recovery actually did something
+                        // let mss = congestion_controller.smss();
+                        // let cwnd = congestion_controller
+                        //     .sshthresh()
+                        //     .min(tx_segs.calc_flight_size().max(mss) + mss);
+                        let sshthresh = rec.cwnd;
+                        // congestion_controller.on_recovered(cwnd, sshthresh);
+                        congestion_controller.on_recovered(sshthresh, sshthresh);
+                    } else {
+                        debug!("recovery was not necessary, restoring previous values");
+                        // The ACKs repaired themselves without us doing anything. Restore previous values.
+                        congestion_controller.on_recovered(rec.restore_cwnd, rec.restore_sshthresh);
+                    }
+
+                    debug!(?rec.recovery_point, ?header.ack_nr, prev_cwnd=rec.cwnd, ?congestion_controller, "exited recovery");
                     *self = Recovery::CountingDuplicates { dup_acks: 0 };
                     return;
                 }
 
-                // partial ACK
-                // In this case,
-                //        retransmit the first unacknowledged segment.  Deflate the
-                //        congestion window by the amount of new data acknowledged by the
-                //        Cumulative Acknowledgment field.
-
-                let total_acked_bytes = on_ack_result.total_acked_bytes();
-
-                if total_acked_bytes > 0 {
-                    // rec.cwnd = rec.cwnd.saturating_sub(total_acked_bytes);
-                    if total_acked_bytes >= congestion_controller.smss() {
-                        // This will let us send new data.
-                        // rec.cwnd += congestion_controller.smss();
-
-                        // This will let us retransmit one more unacked segment.
-                        rec.retransmit_tokens += 1;
-                    }
-                }
+                rec.retransmit_tokens += on_ack_result.total_acked_segments();
             }
         }
     }

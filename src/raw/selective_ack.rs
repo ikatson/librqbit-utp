@@ -1,4 +1,4 @@
-use bitvec::{order::Lsb0, BitArr};
+use bitvec::{order::Lsb0, slice::BitSlice, BitArr};
 
 use crate::constants::SACK_DEPTH;
 
@@ -49,6 +49,10 @@ impl SelectiveAck {
         let mut data = SelectiveAckData::default();
         data.as_raw_mut_slice()[..len].copy_from_slice(&bytes[..len]);
         Self { data }
+    }
+
+    pub fn as_bitslice(&self) -> &BitSlice<u8> {
+        self.data.as_bitslice()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = bool> + '_ {

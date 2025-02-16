@@ -4,9 +4,14 @@ use crate::{constants::CONGESTION_TRACING_LOG_LEVEL, rtte::RttEstimator};
 
 use super::CongestionController;
 
-#[derive(Debug)]
 pub struct TracingController<I> {
     inner: I,
+}
+
+impl<I: std::fmt::Debug> std::fmt::Debug for TracingController<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.inner)
+    }
 }
 
 impl<I> TracingController<I> {
@@ -62,13 +67,13 @@ where
         self.inner.sshthresh()
     }
 
-    fn on_recovered(&mut self, recovery_cwnd_bytes: usize) {
+    fn on_recovered(&mut self, new_cwnd_bytes: usize, new_sshthresh: usize) {
         log_if_changed!(
             CONGESTION_TRACING_LOG_LEVEL,
             "on_recovered",
             self,
             |s| s.inner,
-            |s| s.inner.on_recovered(recovery_cwnd_bytes)
+            |s| s.inner.on_recovered(new_cwnd_bytes, new_sshthresh)
         );
     }
 

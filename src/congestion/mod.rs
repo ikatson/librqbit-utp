@@ -14,7 +14,7 @@ pub trait CongestionController: Send + Sync + core::fmt::Debug {
 
     fn smss(&self) -> usize;
 
-    fn on_recovered(&mut self, recovery_cwnd_bytes: usize);
+    fn on_recovered(&mut self, new_cwnd_bytes: usize, new_sshthresh: usize);
 
     /// Increase the window on ACK
     fn on_ack(&mut self, now: Instant, len: usize, rtt: &RttEstimator);
