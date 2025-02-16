@@ -19,7 +19,7 @@ pub struct Recovering {
 
     // The packet sender may modify these so they are pub.
     pub high_rxt: SeqNr,
-    pub total_retransmitted_segments: usize,
+    total_retransmitted_segments: usize,
 
     // rfc6675: conservative estimate of how many bytes are in transit
     pub pipe_estimate: Pipe,
@@ -34,11 +34,18 @@ impl Recovering {
     pub fn recovery_point(&self) -> SeqNr {
         self.recovery_point
     }
-}
 
-impl Recovering {
     pub fn cwnd(&self) -> usize {
         self.cwnd.saturating_sub(self.pipe_estimate.pipe)
+    }
+
+    pub fn total_retransmitted_segments(&self) -> usize {
+        self.total_retransmitted_segments
+    }
+
+    pub fn increment_total_transmitted_segments(&mut self) {
+        self.total_retransmitted_segments += 1;
+        METRICS.recovery_retransmitted_segments_count.increment(1);
     }
 }
 
@@ -159,6 +166,7 @@ impl Recovery {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn on_ack(
         &mut self,
         header: &UtpHeader,
@@ -220,6 +228,8 @@ impl Recovery {
                     pipe_estimate,
                     cwnd,
                 };
+
+                METRICS.recovery_enter_count.increment(1);
 
                 debug!(?rec.recovery_point, ?high_ack, high_data=?last_sent_seq_nr, ack_nr=?header.ack_nr, ?pipe_estimate, ?cwnd, "entered recovery");
                 self.phase = RecoveryPhase::Recovering(rec);

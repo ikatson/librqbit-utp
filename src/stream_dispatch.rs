@@ -342,6 +342,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         // Retransmit timer expired, rewind state backwards.
         if self.timers.retransmit.expired(self.this_poll.now) {
             debug!("retransmit timer expired");
+            METRICS.rto_timeouts_count.increment(1);
+
             if let Some(mut seg) = self.user_tx_segments.iter_mut_for_sending(None).next() {
                 if send_data!(self, cx, header, seg) {
                     debug!(
@@ -397,7 +399,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             let mut cwnd = rec.cwnd();
             let mut sent = 0;
             let mss = self.socket_opts.max_outgoing_payload_size.get();
-            while rec.total_retransmitted_segments == 0 || cwnd > mss {
+            while rec.total_retransmitted_segments() == 0 || cwnd > mss {
                 let mut seg = match it.next() {
                     Some(seg) => seg,
                     None => break,
@@ -413,7 +415,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         "RECOVERY: sent ST_DATA"
                     );
                     rec.high_rxt = seg.seq_nr();
-                    rec.total_retransmitted_segments += 1;
+                    rec.increment_total_transmitted_segments();
                     rec.pipe_estimate.pipe += seg.payload_size();
                     cwnd = cwnd.saturating_sub(seg.payload_size());
                     sent += 1;
@@ -448,7 +450,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     // Rewind last_sent_seq_nr to re-send FIN
                     self.last_sent_seq_nr = our_fin - 1;
                     rec.high_rxt = our_fin;
-                    rec.total_retransmitted_segments += 1;
+                    rec.increment_total_transmitted_segments();
                     // No reason to do anything further.
                     return Ok(());
                 }
@@ -496,6 +498,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if sent_count == 0 {
             trace!(remaining_cwnd, "did not send anything");
         } else if in_recovery {
+            METRICS
+                .recovery_transmitted_new_segments_count
+                .increment(sent_count);
             debug!(
                 sent_count,
                 remaining_cwnd = remaining_cwnd,

@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::{constants::SACK_DEPTH, metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
 
@@ -78,13 +78,13 @@ pub struct Segments {
     snd_una: SeqNr,
 }
 
-pub struct SegmentIterItem<T> {
+pub struct SegmentForSending<T> {
     segment: T,
     seq_nr: SeqNr,
     payload_offset: usize,
 }
 
-impl<T: Borrow<Segment>> SegmentIterItem<T> {
+impl<T: Borrow<Segment>> SegmentForSending<T> {
     pub fn seq_nr(&self) -> SeqNr {
         self.seq_nr
     }
@@ -107,7 +107,7 @@ impl<T: Borrow<Segment>> SegmentIterItem<T> {
     }
 }
 
-impl<T: BorrowMut<Segment>> SegmentIterItem<T> {
+impl<T: BorrowMut<Segment>> SegmentForSending<T> {
     pub fn on_sent(&mut self, now: Instant) {
         let seg = self.segment.borrow_mut();
         seg.sent = match seg.sent {
@@ -140,25 +140,6 @@ impl<T: BorrowMut<Segment>> SegmentIterItem<T> {
     }
 }
 
-struct SegmentIterState {
-    seq_nr: SeqNr,
-    payload_offset: usize,
-}
-
-impl SegmentIterState {
-    fn on_scan<T: Borrow<Segment>>(&mut self, segment: T) -> Option<SegmentIterItem<T>> {
-        let ps = segment.borrow().payload_size;
-        let item = SegmentIterItem {
-            segment,
-            payload_offset: self.payload_offset,
-            seq_nr: self.seq_nr,
-        };
-        self.payload_offset += ps;
-        self.seq_nr += 1;
-        Some(item)
-    }
-}
-
 #[derive(Default)]
 pub struct OnAckResult {
     // How many segments we can remove from the beginning of TX queue.
@@ -181,10 +162,6 @@ impl OnAckResult {
         self.new_rtt = rtt_min(self.new_rtt, other.new_rtt);
         self.newly_sacked_segment_count += other.newly_sacked_segment_count;
         self.newly_sacked_byte_count += other.newly_sacked_byte_count;
-    }
-
-    pub fn total_acked_segments(&self) -> usize {
-        self.acked_segments_count + self.newly_sacked_segment_count
     }
 }
 
@@ -433,7 +410,7 @@ impl Segments {
     pub fn iter_mut_for_sending(
         &mut self,
         start: Option<SeqNr>,
-    ) -> impl Iterator<Item = SegmentIterItem<&mut Segment>> {
+    ) -> impl Iterator<Item = SegmentForSending<&mut Segment>> {
         let offset = match start {
             Some(start) => (start - self.snd_una).max(0) as usize,
             None => 0,
@@ -448,7 +425,7 @@ impl Segments {
         self.segments
             .range_mut(range)
             .enumerate()
-            .map(move |(idx, seg)| SegmentIterItem {
+            .map(move |(idx, seg)| SegmentForSending {
                 seq_nr: snd_una + (offset + idx) as u16,
                 payload_offset: seg
                     .payload_offset_absolute

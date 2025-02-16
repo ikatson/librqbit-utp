@@ -29,6 +29,10 @@ pub struct Metrics {
     pub sent_control_packets: Counter,
     pub unsent_control_packets: Counter,
     pub incoming_already_acked_data_packets: Counter,
+    pub recovery_retransmitted_segments_count: Counter,
+    pub recovery_enter_count: Counter,
+    pub rto_timeouts_count: Counter,
+    pub recovery_transmitted_new_segments_count: Counter,
 }
 
 impl Metrics {
@@ -63,6 +67,16 @@ impl Metrics {
             inactivity_timeouts: counter!("utp_inactivity_timeouts"),
             synack_retransmissions: counter!("utp_synack_retransmissions"),
             max_retransmissions_reached: counter!("utp_max_retransmissions_reached"),
+
+            rto_timeouts_count: counter!("utp_rto_timeouts_count"),
+
+            recovery_enter_count: counter!("utp_recovery_enter_count"),
+            recovery_retransmitted_segments_count: counter!(
+                "utp_recovery_retransmitted_segments_count"
+            ),
+            recovery_transmitted_new_segments_count: counter!(
+                "utp_recovery_transmitted_new_segments_count"
+            ),
         }
     }
 }
