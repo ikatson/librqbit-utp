@@ -2,7 +2,7 @@
 /// Uses elements of RFC 6675 "SACK Loss Recovery Algorithm for TCP" for duplicate counting.
 use std::time::Instant;
 
-use tracing::debug;
+use tracing::{debug, trace};
 
 use crate::{
     congestion::CongestionController,
@@ -86,9 +86,18 @@ impl Recovery {
             Some(sack) => {
                 // Per rfc6675, if we received at least 3 segments above high_ack, we need to enter recovery
                 // right away.
-                if sack.as_bitslice().count_ones() >= SACK_DUP_THRESH as usize {
+                let segments_past_first = sack.as_bitslice().count_ones();
+                if segments_past_first >= SACK_DUP_THRESH as usize {
+                    debug!(
+                        prev_dup_acks,
+                        segments_past_first,
+                        ?header.ack_nr,
+                        "too many segments past first ACKed"
+                    );
+                    METRICS.duplicate_acks_received.increment(1);
                     return SACK_DUP_THRESH;
                 }
+
                 // Per rfc6675, ONLY if the SACK carries new data we +1 the counter. I.e.
                 // "a segment that arrives carrying a SACK block that
                 // identifies previously unacknowledged and un-SACKed octets between
@@ -97,6 +106,7 @@ impl Recovery {
                 // However, uTP cannot convey any information past the SACK size limit
                 // (usually 64 segments). So we assume it is trying to do that here, and
                 // ignore actually looking at how many segments were ACKed.
+                METRICS.duplicate_acks_received.increment(1);
                 prev_dup_acks + 1
             }
             None => {
@@ -143,19 +153,21 @@ impl Recovery {
                     if header.htype != Type::ST_STATE {
                         return;
                     }
-                    let is_window_update = self.last_window == Some(header.wnd_size);
+                    let is_window_update = self.last_window != Some(header.wnd_size);
                     self.last_window = Some(header.wnd_size);
-
-                    if header.ack_nr != high_ack {
-                        return;
-                    }
 
                     if is_window_update {
                         return;
                     }
 
+                    if header.ack_nr != high_ack {
+                        return;
+                    }
+
                     METRICS.duplicate_acks_received.increment(1);
                     *dup_acks += 1;
+
+                    trace!(?header.ack_nr, ?high_ack, dup_acks, "counted duplicate ACK in non-sack mode");
                 }
 
                 let should_enter_recovery = *dup_acks >= SACK_DUP_THRESH;
