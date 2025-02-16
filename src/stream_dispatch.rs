@@ -371,13 +371,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         // If we are in recovery, retransmit as many unacked packets as we are allowed by the recovery algorithm.
-        if let Recovery::Recovering(rec) = &mut self.recovery {
+        if let Some(rec) = self.recovery.recovering_mut() {
             let high_rxt = rec.high_rxt;
+            let recovery_point = rec.recovery_point();
             let it = self
                 .user_tx_segments
                 .iter_mut()
                 .skip_while(|seg| seg.seq_nr() <= high_rxt)
-                .take_while(|seg| seg.seq_nr() <= rec.recovery_point)
+                .take_while(|seg| seg.seq_nr() <= recovery_point)
                 .filter(|s| !s.is_delivered())
                 .take(rec.retransmit_tokens);
             for mut seg in it {
@@ -390,7 +391,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     );
                     rec.high_rxt = seg.seq_nr();
                     rec.retransmit_tokens -= 1;
-                    rec.total_retransmitted_segments += 1;
                 } else {
                     return Ok(());
                 }
@@ -1432,7 +1432,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             },
 
             socket: socket.clone(),
-            recovery: Recovery::CountingDuplicates { dup_acks: 0 },
+            recovery: Recovery::default(),
         };
 
         METRICS.live_virtual_sockets.increment(1);

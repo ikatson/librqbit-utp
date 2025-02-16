@@ -8,39 +8,102 @@ use crate::{
     congestion::CongestionController,
     constants::SACK_DUP_THRESH,
     metrics::METRICS,
-    raw::UtpHeader,
+    raw::{Type, UtpHeader},
     seq_nr::SeqNr,
     stream_tx_segments::{OnAckResult, Segments},
 };
 
 #[derive(Debug, Clone, Copy)]
-pub struct RecoveryPhase {
-    pub recovery_point: SeqNr,
+pub struct Recovering {
+    recovery_point: SeqNr,
+
+    // The packet sender may modify these so they are pub.
     pub high_rxt: SeqNr,
     pub retransmit_tokens: usize,
-
-    pub total_retransmitted_segments: usize,
 
     // During recovery we manage cwnd, not congestion controller.
     // After recovery is done, this will be used to configure
     // congestion controller.
-    pub cwnd: usize,
+    cwnd: usize,
 }
 
-impl RecoveryPhase {}
+impl Recovering {
+    pub fn recovery_point(&self) -> SeqNr {
+        self.recovery_point
+    }
+}
+
+impl Recovering {}
 
 #[derive(Debug, Clone, Copy)]
-pub enum Recovery {
+enum RecoveryPhase {
     IgnoringUntilRecoveryPoint { recovery_point: SeqNr },
     CountingDuplicates { dup_acks: u8 },
-    Recovering(RecoveryPhase),
+    Recovering(Recovering),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Recovery {
+    receiver_supports_sack: bool,
+
+    // Tracks if an ACK is a window update before it switches to SACK mode.
+    last_window: Option<u32>,
+
+    phase: RecoveryPhase,
+}
+
+impl Default for Recovery {
+    fn default() -> Self {
+        Self {
+            receiver_supports_sack: false,
+            last_window: None,
+            phase: RecoveryPhase::CountingDuplicates { dup_acks: 0 },
+        }
+    }
 }
 
 impl Recovery {
     pub fn recovery_cwnd(&self) -> Option<usize> {
-        match self {
-            Recovery::Recovering(rec) => Some(rec.cwnd),
+        match &self.phase {
+            RecoveryPhase::Recovering(rec) => Some(rec.cwnd),
             _ => None,
+        }
+    }
+
+    pub fn recovering_mut(&mut self) -> Option<&mut Recovering> {
+        match &mut self.phase {
+            RecoveryPhase::Recovering(rec) => Some(rec),
+            _ => None,
+        }
+    }
+
+    fn count_sack_duplicates(
+        header: &UtpHeader,
+        _on_ack_result: &OnAckResult,
+        prev_dup_acks: u8,
+    ) -> u8 {
+        match &header.extensions.selective_ack {
+            Some(sack) => {
+                // Per rfc6675, if we received at least 3 segments above high_ack, we need to enter recovery
+                // right away.
+                if sack.as_bitslice().count_ones() >= SACK_DUP_THRESH as usize {
+                    return SACK_DUP_THRESH;
+                }
+                // Per rfc6675, ONLY if the SACK carries new data we +1 the counter. I.e.
+                // "a segment that arrives carrying a SACK block that
+                // identifies previously unacknowledged and un-SACKed octets between
+                // HighACK and HighData".
+                //
+                // However, uTP cannot convey any information past the SACK size limit
+                // (usually 64 segments). So we assume it is trying to do that here, and
+                // ignore actually looking at how many segments were ACKed.
+                prev_dup_acks + 1
+            }
+            None => {
+                // If the incoming ACK is a cumulative acknowledgment, the TCP MUST
+                // reset DupAcks to zero.
+                0
+            }
         }
     }
 
@@ -53,14 +116,16 @@ impl Recovery {
         congestion_controller: &mut dyn CongestionController,
         now: Instant,
     ) {
-        match self {
-            Recovery::IgnoringUntilRecoveryPoint { recovery_point } => {
+        self.receiver_supports_sack |= header.extensions.selective_ack.is_some();
+
+        match &mut self.phase {
+            RecoveryPhase::IgnoringUntilRecoveryPoint { recovery_point } => {
                 if header.ack_nr >= *recovery_point {
                     debug!(?recovery_point, ?header.ack_nr, "exiting IgnoringUntilRecoveryPoint");
-                    *self = Recovery::CountingDuplicates { dup_acks: 0 }
+                    self.phase = RecoveryPhase::CountingDuplicates { dup_acks: 0 }
                 }
             }
-            Recovery::CountingDuplicates { dup_acks } => {
+            RecoveryPhase::CountingDuplicates { dup_acks } => {
                 // HighAck is the last sequence number fully consumed by receiver.
                 let high_ack = match tx_segs.first_seq_nr() {
                     Some(s) => s - 1,
@@ -70,33 +135,30 @@ impl Recovery {
                         return;
                     }
                 };
-                if header.ack_nr <= high_ack {
-                    // Ignore the useless ACK.
-                    return;
+
+                if self.receiver_supports_sack {
+                    *dup_acks = Self::count_sack_duplicates(header, on_ack_result, *dup_acks);
+                } else {
+                    // Resort to simple duplicate ACK counting per rfc5681.
+                    if header.htype != Type::ST_STATE {
+                        return;
+                    }
+                    let is_window_update = self.last_window == Some(header.wnd_size);
+                    self.last_window = Some(header.wnd_size);
+
+                    if header.ack_nr != high_ack {
+                        return;
+                    }
+
+                    if is_window_update {
+                        return;
+                    }
+
+                    METRICS.duplicate_acks_received.increment(1);
+                    *dup_acks += 1;
                 }
 
-                // This is pretty strong, for this heuristic to work the receiver MUST support SACK.
-                // We can probably just assume that. If it doesn't work, we'll need to track if we have
-                // ever seen a SACK before at least once.
-                if !on_ack_result.is_duplicate() || header.extensions.selective_ack.is_none() {
-                    *dup_acks = 0;
-                    return;
-                }
-
-                METRICS.duplicate_acks_received.increment(1);
-                *dup_acks += 1;
-
-                let should_enter_recovery = *dup_acks as usize >= SACK_DUP_THRESH;
-
-                debug!(
-                    should_enter_recovery,
-                    dup_acks,
-                    ?high_ack,
-                    high_data = ?last_sent_seq_nr,
-                    ?congestion_controller,
-                    "counting duplicate acks"
-                );
-
+                let should_enter_recovery = *dup_acks >= SACK_DUP_THRESH;
                 if !should_enter_recovery {
                     return;
                 }
@@ -113,22 +175,20 @@ impl Recovery {
                     .unwrap_or(0)
                     .max(1);
 
-                let rec = RecoveryPhase {
+                let rec = Recovering {
                     recovery_point: last_sent_seq_nr,
 
                     high_rxt: high_ack,
                     retransmit_tokens,
 
-                    total_retransmitted_segments: 0,
-
                     // This is already reduced sshthresh.
                     cwnd: congestion_controller.sshthresh(),
                 };
 
-                debug!(?rec.recovery_point, ?retransmit_tokens, ?congestion_controller, "entered recovery");
-                *self = Recovery::Recovering(rec);
+                debug!(?rec.recovery_point, ?retransmit_tokens, ?high_ack, ack_nr=?header.ack_nr, ?congestion_controller, "entered recovery");
+                self.phase = RecoveryPhase::Recovering(rec);
             }
-            Recovery::Recovering(rec) => {
+            RecoveryPhase::Recovering(rec) => {
                 if header.ack_nr >= rec.recovery_point {
                     // From rfc6582 NewReno "Full Acknowledgements" section.
                     // On recover we set cwnd very conservatively not to cause a sudden burst of traffic.
@@ -141,7 +201,7 @@ impl Recovery {
                     congestion_controller.on_recovered(cwnd, sshthresh);
 
                     debug!(?rec.recovery_point, ?header.ack_nr, prev_cwnd=rec.cwnd, ?congestion_controller, "exited recovery");
-                    *self = Recovery::CountingDuplicates { dup_acks: 0 };
+                    self.phase = RecoveryPhase::CountingDuplicates { dup_acks: 0 };
                     return;
                 }
 
@@ -155,7 +215,7 @@ impl Recovery {
             recovery_point = ?last_sent_seq_nr,
             "on_rto_timeout: ignoring duplicate acks until"
         );
-        *self = Recovery::IgnoringUntilRecoveryPoint {
+        self.phase = RecoveryPhase::IgnoringUntilRecoveryPoint {
             recovery_point: last_sent_seq_nr,
         }
     }

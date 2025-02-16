@@ -163,14 +163,6 @@ impl OnAckResult {
     pub fn total_acked_segments(&self) -> usize {
         self.acked_segments_count + self.newly_sacked_segment_count
     }
-
-    // Check if it's a duplicate ACK per rfc6298
-    pub fn is_duplicate(&self) -> bool {
-        if self.newly_sacked_segment_count > 0 {
-            return true; // Any new SACK data means a duplicate ACK
-        }
-        self.acked_segments_count == 0
-    }
 }
 
 impl core::fmt::Debug for OnAckResult {
