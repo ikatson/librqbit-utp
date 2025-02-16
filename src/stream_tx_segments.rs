@@ -10,12 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{
-    constants::{SACK_DEPTH, SACK_DUP_THRESH},
-    metrics::METRICS,
-    raw::UtpHeader,
-    seq_nr::SeqNr,
-};
+use crate::{metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
 
 #[derive(Clone, Copy)]
 enum SentStatus {
@@ -28,10 +23,6 @@ pub struct Segment {
     payload_size: usize,
     is_delivered: bool,
     sent: SentStatus,
-
-    // For SACK recovery purposes
-    pub is_lost: bool,
-    pub has_sacks_after_it: bool,
 }
 
 pub fn rtt_min(rtt1: Option<Duration>, rtt2: Option<Duration>) -> Option<Duration> {
@@ -68,7 +59,6 @@ pub struct Segments {
     // If all acknowledged, this is the same as SND.NEXT.
     // Name is the same as in https://datatracker.ietf.org/doc/html/rfc9293#section-3.3.1
     snd_una: SeqNr,
-    smss: usize,
 }
 
 pub struct SegmentIterItem<T> {
@@ -78,10 +68,6 @@ pub struct SegmentIterItem<T> {
 }
 
 impl<T: Borrow<Segment>> SegmentIterItem<T> {
-    pub fn segment(&self) -> &Segment {
-        self.segment.borrow()
-    }
-
     pub fn seq_nr(&self) -> SeqNr {
         self.seq_nr
     }
@@ -174,10 +160,6 @@ impl OnAckResult {
         self.newly_sacked_byte_count += other.newly_sacked_byte_count;
     }
 
-    pub fn total_acked_bytes(&self) -> usize {
-        self.newly_sacked_byte_count + self.acked_bytes
-    }
-
     pub fn total_acked_segments(&self) -> usize {
         self.acked_segments_count + self.newly_sacked_segment_count
     }
@@ -208,7 +190,6 @@ impl Segments {
             // TODO: store total sacked (marked delivered through sack)
             len_bytes: 0,
             capacity: tx_bytes / smss,
-            smss,
             snd_una,
         }
     }
@@ -260,8 +241,6 @@ impl Segments {
             payload_size: payload_len,
             is_delivered: false,
             sent: SentStatus::NotSent,
-            is_lost: false,
-            has_sacks_after_it: false,
         });
         self.len_bytes += payload_len;
         true
@@ -352,22 +331,12 @@ impl Segments {
         }
     }
 
-    fn smss(&self) -> usize {
-        self.smss
-    }
-
     pub fn calc_flight_size(&self) -> usize {
         self.segments
             .iter()
             .take_while(|s| !s.is_sent())
             .map(|s| if s.is_delivered { 0 } else { s.payload_size })
             .sum()
-    }
-
-    // rfc6675 IsLost
-    // TODO: use pre-calculated values from set_pipe
-    pub fn first_is_lost(&self) -> bool {
-        self.segments.iter().next().is_some_and(|seg| seg.is_lost)
     }
 
     // Iterate stored data - headers and their payload offsets (as a function to copy payload to some other buffer).
@@ -381,6 +350,7 @@ impl Segments {
         )
     }
 
+    #[allow(unused)]
     pub fn iter(&self) -> impl Iterator<Item = SegmentIterItem<&Segment>> {
         self.segments.iter().scan(
             SegmentIterState {

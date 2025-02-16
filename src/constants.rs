@@ -19,8 +19,6 @@ pub const DEFAULT_INCOMING_MTU: usize = 1520;
 pub const DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK: usize = 1024 * 1024;
 // By default, this is how many unACKed bytes the socket can store without blocking writer.
 pub const DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK: usize = 1024 * 1024;
-// How many out-of-order packets to track.
-pub const DEFAULT_MAX_OUT_OF_ORDER_PACKETS: usize = 64;
 // Outgoing MTU is autodetected using this IP. It's used to calculate the maximum uTP
 // segment size we can send.
 pub const DEFAULT_MTU_AUTODETECT_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));

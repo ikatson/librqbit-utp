@@ -371,7 +371,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         // If we are in recovery, retransmit as many unacked packets as we are allowed by the recovery algorithm.
-        if let Recovery::Recovery(rec) = &mut self.recovery {
+        if let Recovery::Recovering(rec) = &mut self.recovery {
             let high_rxt = rec.high_rxt;
             let it = self
                 .user_tx_segments
@@ -1212,11 +1212,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             // If there's a timer-based next poll to run, arm the timer.
             match self.next_poll_send_to_at() {
-                PollAt::Now => {
-                    return Poll::Ready(Err(anyhow::anyhow!(
-                        "bug: encountered PollAt::now after running poll()",
-                    )));
-                }
                 PollAt::Time(instant) => {
                     let duration = instant - self.this_poll.now;
                     trace!(sleep = ?duration, "arming timer");
@@ -1363,7 +1358,6 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
 
         let (user_rx, read_half) = UserRx::build(
             socket.opts().max_user_rx_buffered_bytes,
-            socket.opts().max_rx_out_of_order_packets,
             socket.opts().max_incoming_payload_size,
         );
 
@@ -1558,8 +1552,6 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
 /// Gives an indication on the next time the socket should be polled.
 #[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum PollAt {
-    /// The socket needs to be polled immediately.
-    Now,
     /// The socket needs to be polled at given [Instant][struct.Instant].
     Time(Instant),
     /// The socket does not need to be polled unless there are external changes.

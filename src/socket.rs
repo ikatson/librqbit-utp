@@ -18,10 +18,9 @@ use crate::{
     congestion::CongestionController,
     constants::{
         DEFAULT_CONSERVATIVE_OUTGOING_MTU, DEFAULT_INCOMING_MTU,
-        DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET, DEFAULT_MAX_OUT_OF_ORDER_PACKETS,
-        DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK, DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK,
-        DEFAULT_MTU_AUTODETECT_IP, DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IPV4_HEADER, MIN_UDP_HEADER,
-        UTP_HEADER_SIZE,
+        DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET, DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK,
+        DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK, DEFAULT_MTU_AUTODETECT_IP,
+        DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IPV4_HEADER, MIN_UDP_HEADER, UTP_HEADER_SIZE,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -183,12 +182,6 @@ impl SocketOpts {
         )
         .context("max_user_rx_buffered_bytes = 0. Increase rx_bufsize")?;
 
-        let max_rx_out_of_order_packets = NonZeroUsize::new(
-            self.max_rx_out_of_order_packets
-                .unwrap_or(DEFAULT_MAX_OUT_OF_ORDER_PACKETS),
-        )
-        .context("invalid configuration: virtual_socket_tx_packets = 0")?;
-
         let virtual_socket_tx_bytes = NonZeroUsize::new(
             self.vsock_tx_bufsize_bytes
                 .unwrap_or(DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK),
@@ -200,7 +193,6 @@ impl SocketOpts {
             max_incoming_payload_size: incoming.max_payload_size,
             max_outgoing_payload_size: outgoing.max_payload_size,
             max_user_rx_buffered_bytes,
-            max_rx_out_of_order_packets,
             virtual_socket_tx_bytes,
             nagle: !self.disable_nagle,
             congestion: self.congestion,
@@ -225,7 +217,6 @@ pub(crate) struct ValidatedSocketOpts {
     pub max_outgoing_payload_size: NonZeroUsize,
     pub max_user_rx_buffered_bytes: NonZeroUsize,
 
-    pub max_rx_out_of_order_packets: NonZeroUsize,
     pub virtual_socket_tx_bytes: NonZeroUsize,
     pub nagle: bool,
     pub congestion: CongestionConfig,

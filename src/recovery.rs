@@ -1,15 +1,16 @@
-/// Implements RFC 6675 "SACK Loss Recovery Algorithm for TCP"
-/// Some other parts are in user_tx_segments and stream_dispatch
+/// Implements RFC 6582 "The NewReno Modification to TCP's Fast Recovery Algorithm"
+/// Uses elements of RFC 6675 "SACK Loss Recovery Algorithm for TCP" for duplicate counting.
 use std::time::Instant;
 
-use tracing::{debug, trace, warn};
+use tracing::debug;
 
 use crate::{
     congestion::CongestionController,
-    constants::{SACK_DEPTH, SACK_DUP_THRESH},
+    constants::SACK_DUP_THRESH,
+    metrics::METRICS,
     raw::UtpHeader,
     seq_nr::SeqNr,
-    stream_tx_segments::{OnAckResult, Segment, SegmentIterItem, Segments},
+    stream_tx_segments::{OnAckResult, Segments},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -21,10 +22,9 @@ pub struct RecoveryPhase {
     pub total_retransmitted_segments: usize,
 
     // During recovery we manage cwnd, not congestion controller.
+    // After recovery is done, this will be used to configure
+    // congestion controller.
     pub cwnd: usize,
-
-    restore_cwnd: usize,
-    restore_sshthresh: usize,
 }
 
 impl RecoveryPhase {}
@@ -33,17 +33,13 @@ impl RecoveryPhase {}
 pub enum Recovery {
     IgnoringUntilRecoveryPoint { recovery_point: SeqNr },
     CountingDuplicates { dup_acks: u8 },
-    Recovery(RecoveryPhase),
+    Recovering(RecoveryPhase),
 }
 
 impl Recovery {
-    pub fn is_recovery(&self) -> bool {
-        matches!(self, Recovery::Recovery { .. })
-    }
-
     pub fn recovery_cwnd(&self) -> Option<usize> {
         match self {
-            Recovery::Recovery(rec) => Some(rec.cwnd),
+            Recovery::Recovering(rec) => Some(rec.cwnd),
             _ => None,
         }
     }
@@ -65,6 +61,20 @@ impl Recovery {
                 }
             }
             Recovery::CountingDuplicates { dup_acks } => {
+                // HighAck is the last sequence number fully consumed by receiver.
+                let high_ack = match tx_segs.first_seq_nr() {
+                    Some(s) => s - 1,
+                    None => {
+                        // The queue is empty, don't count ACKs.
+                        *dup_acks = 0;
+                        return;
+                    }
+                };
+                if header.ack_nr <= high_ack {
+                    // Ignore the useless ACK.
+                    return;
+                }
+
                 // This is pretty strong, for this heuristic to work the receiver MUST support SACK.
                 // We can probably just assume that. If it doesn't work, we'll need to track if we have
                 // ever seen a SACK before at least once.
@@ -73,16 +83,8 @@ impl Recovery {
                     return;
                 }
 
+                METRICS.duplicate_acks_received.increment(1);
                 *dup_acks += 1;
-
-                let high_ack = match tx_segs.first_seq_nr() {
-                    Some(s) => s - 1,
-                    None => {
-                        // Everything got ACKed.
-                        *dup_acks = 0;
-                        return;
-                    }
-                };
 
                 let should_enter_recovery = *dup_acks as usize >= SACK_DUP_THRESH;
 
@@ -99,11 +101,10 @@ impl Recovery {
                     return;
                 }
 
-                let restore_cwnd = congestion_controller.window();
-                let restore_sshthresh = congestion_controller.sshthresh();
-
                 congestion_controller.on_enter_fast_retransmit(now);
 
+                // This is a simplified version of rfc6675. How many burst packets we are allowed to retransmit.
+                // It must be at least 1 for fast retransmit (as per rfc5681) to trigger.
                 let retransmit_tokens = header
                     .extensions
                     .selective_ack
@@ -120,37 +121,24 @@ impl Recovery {
 
                     total_retransmitted_segments: 0,
 
+                    // This is already reduced sshthresh.
                     cwnd: congestion_controller.sshthresh(),
-                    restore_cwnd,
-                    restore_sshthresh,
                 };
 
                 debug!(?rec.recovery_point, ?retransmit_tokens, ?congestion_controller, "entered recovery");
-                *self = Recovery::Recovery(rec);
+                *self = Recovery::Recovering(rec);
             }
-            Recovery::Recovery(rec) => {
-                // Heuristic. If there's still selective ACK data, DO NOT exit recovery.
-                // if header.ack_nr >= rec.recovery_point && header.extensions.selective_ack.is_some()
-                // {
-                //     debug!("moving recovery point further, still not fully recovered");
-                //     rec.recovery_point = last_sent_seq_nr;
-                // }
-
+            Recovery::Recovering(rec) => {
                 if header.ack_nr >= rec.recovery_point {
-                    if rec.total_retransmitted_segments > 0 {
-                        // Recovery actually did something
-                        // let mss = congestion_controller.smss();
-                        // let cwnd = congestion_controller
-                        //     .sshthresh()
-                        //     .min(tx_segs.calc_flight_size().max(mss) + mss);
-                        let sshthresh = rec.cwnd;
-                        // congestion_controller.on_recovered(cwnd, sshthresh);
-                        congestion_controller.on_recovered(sshthresh, sshthresh);
-                    } else {
-                        debug!("recovery was not necessary, restoring previous values");
-                        // The ACKs repaired themselves without us doing anything. Restore previous values.
-                        congestion_controller.on_recovered(rec.restore_cwnd, rec.restore_sshthresh);
-                    }
+                    // From rfc6582 NewReno "Full Acknowledgements" section.
+                    // On recover we set cwnd very conservatively not to cause a sudden burst of traffic.
+                    // It will very quickly reach sshthresh.
+                    let mss = congestion_controller.smss();
+                    let cwnd = congestion_controller
+                        .sshthresh()
+                        .min(tx_segs.calc_flight_size().max(mss) + mss);
+                    let sshthresh = rec.cwnd;
+                    congestion_controller.on_recovered(cwnd, sshthresh);
 
                     debug!(?rec.recovery_point, ?header.ack_nr, prev_cwnd=rec.cwnd, ?congestion_controller, "exited recovery");
                     *self = Recovery::CountingDuplicates { dup_acks: 0 };

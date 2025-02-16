@@ -6,7 +6,7 @@ use std::{
     task::{Poll, Waker},
 };
 
-use anyhow::{bail, Context};
+use anyhow::Context;
 use msgq::MsgQueue;
 use parking_lot::Mutex;
 use tokio::io::AsyncRead;
@@ -236,7 +236,6 @@ pub struct UserRx {
 impl UserRx {
     pub fn build(
         max_rx_bytes: NonZeroUsize,
-        out_of_order_max_packets: NonZeroUsize,
         max_incoming_payload: NonZeroUsize,
     ) -> (UserRx, UtpStreamReadHalf) {
         let shared = Arc::new(UserRxShared {
@@ -643,14 +642,9 @@ mod tests {
         )
     }
 
-    fn user_rx(
-        capacity_bytes: usize,
-        out_of_order_max_packets: usize,
-    ) -> (UserRx, UtpStreamReadHalf) {
+    fn user_rx(capacity_bytes: usize) -> (UserRx, UtpStreamReadHalf) {
         UserRx::build(
             NonZeroUsize::new(capacity_bytes).unwrap(),
-            NonZeroUsize::new(out_of_order_max_packets).unwrap(),
-            // TODO
             NonZeroUsize::new(1500).unwrap(),
         )
     }
@@ -688,7 +682,7 @@ mod tests {
     #[tokio::test]
     async fn test_asm_channel_full_asm_empty() {
         setup_test_logging();
-        let (mut user_rx, _read) = user_rx(1, 2);
+        let (mut user_rx, _read) = user_rx(1);
         let msg = msg(0, b"a");
 
         // fill RX
@@ -710,7 +704,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_asm_channel_full_asm_not_empty() {
-        let (mut user_rx, _read) = user_rx(1, 2);
+        let (mut user_rx, _read) = user_rx(1);
         let msg = msg(0, b"a");
 
         // fill RX
@@ -744,7 +738,7 @@ mod tests {
     async fn test_asm_out_of_order() {
         setup_test_logging();
 
-        let (mut user_rx, mut read) = user_rx(100, 3);
+        let (mut user_rx, mut read) = user_rx(100);
 
         let msg_0 = msg(0, b"hello");
         let msg_1 = msg(1, b"world");
@@ -787,7 +781,7 @@ mod tests {
     #[tokio::test]
     async fn test_asm_inorder() {
         setup_test_logging();
-        let (mut user_rx, mut read) = user_rx(100, 3);
+        let (mut user_rx, mut read) = user_rx(100);
 
         let msg_0 = msg(0, b"hello");
         let msg_1 = msg(1, b"world");
