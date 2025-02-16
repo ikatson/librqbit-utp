@@ -358,10 +358,11 @@ impl Segments {
         }
     }
 
+    // TODO: store this instead of iterating.
     pub fn calc_flight_size(&self) -> usize {
         self.segments
             .iter()
-            .take_while(|s| !s.is_sent())
+            .take_while(|s| s.is_sent())
             .map(|s| if s.is_delivered { 0 } else { s.payload_size })
             .sum()
     }

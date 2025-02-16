@@ -455,11 +455,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         }
 
-        let mut recv_wnd = self
-            .recovery
-            .recovery_cwnd()
-            .unwrap_or(self.congestion_controller.window())
-            .min(self.last_remote_window as usize);
+        let mut remaining_cwnd = self.recovery.recovery_cwnd().unwrap_or_else(|| {
+            self.congestion_controller
+                .window()
+                .saturating_sub(self.user_tx_segments.calc_flight_size())
+        });
 
         let mut sent_count = 0;
 
@@ -468,20 +468,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .user_tx_segments
             .iter_mut_for_sending(Some(self.last_sent_seq_nr + 1))
         {
-            if item.is_delivered() {
-                continue;
-            }
-            let already_sent = item.seq_nr() <= self.last_sent_seq_nr;
-            if already_sent {
-                // Recovery already accounted for the sent segments in the pipe calculation.
-                if !in_recovery {
-                    recv_wnd = recv_wnd.saturating_sub(item.payload_size());
-                }
-                continue;
-            }
-
-            // Selective ACK already marked this, ignore.
-            if recv_wnd < item.payload_size() {
+            if remaining_cwnd < item.payload_size() {
                 METRICS.send_window_exhausted.increment(1);
                 trace_every_ms!(100, "remote recv window exhausted");
                 break;
@@ -492,10 +479,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     %header.seq_nr,
                     %header.ack_nr,
                     payload_size = item.payload_size(),
-                    recv_wnd,
+                    remaining_cwnd,
                     "sent ST_DATA"
                 );
-                recv_wnd = recv_wnd.saturating_sub(item.payload_size());
+                remaining_cwnd -= item.payload_size();
                 sent_count += 1;
             } else {
                 break;
@@ -507,12 +494,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         if sent_count == 0 {
-            trace!(recv_wnd, "did not send anything");
+            trace!(remaining_cwnd, "did not send anything");
+        } else if in_recovery {
+            debug!(
+                sent_count,
+                remaining_cwnd = remaining_cwnd,
+                "sent in recovery"
+            );
         } else {
-            if in_recovery {
-                debug!(sent_count, remaining_cwnd = recv_wnd, "sent in recovery");
-            }
-            trace!(recv_wnd, "remaining recv_wnd after sending");
+            trace!(remaining_cwnd, "remaining recv_wnd after sending");
         }
 
         Ok(())
