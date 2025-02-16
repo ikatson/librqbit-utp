@@ -65,7 +65,10 @@ impl Recovery {
                 }
             }
             Recovery::CountingDuplicates { dup_acks } => {
-                if !on_ack_result.is_duplicate() {
+                // This is pretty strong, for this heuristic to work the receiver MUST support SACK.
+                // We can probably just assume that. If it doesn't work, we'll need to track if we have
+                // ever seen a SACK before at least once.
+                if !on_ack_result.is_duplicate() || header.extensions.selective_ack.is_none() {
                     *dup_acks = 0;
                     return;
                 }

@@ -915,7 +915,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         "dropping message, we already ACKed it"
                     );
                     METRICS.incoming_already_acked_data_packets.increment(1);
-                    // self.force_immediate_ack();
                     return Ok(result);
                 }
 
