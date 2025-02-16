@@ -471,7 +471,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // Selective ACK already marked this, ignore.
             if recv_wnd < item.payload_size() {
                 METRICS.send_window_exhausted.increment(1);
-                debug_every_ms!(100, "remote recv window exhausted, not sending anything");
+                trace_every_ms!(100, "remote recv window exhausted");
                 break;
             }
 
@@ -597,10 +597,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(())
     }
 
-    fn effective_remote_receive_window(&self) -> usize {
-        (self.last_remote_window as usize).min(self.congestion_controller.window())
-    }
-
     fn split_tx_queue_into_segments(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -617,27 +613,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(());
         }
 
-        let tx_offset = self
-            .user_tx_segments
-            .iter_mut()
-            .last()
-            .map(|item| item.payload_offset() + item.payload_size())
-            .unwrap_or(0);
+        let segmented_len = self.user_tx_segments.total_len_bytes();
 
-        if g.len() < tx_offset {
+        if g.len() < self.user_tx_segments.total_len_bytes() {
             bail!(
-                "bug in buffer computations: user_tx_buflen={} tx_offset={}",
+                "bug in buffer computations: user_tx_buflen={} segmented_len={}",
                 g.len(),
-                tx_offset
+                segmented_len
             );
         }
 
-        let mut remaining = g.len() - tx_offset;
+        let mut remaining = g.len() - segmented_len;
 
         // TODO: need to refactor this to play nicely with recovery etc
-        let mut remote_window_remaining = self
-            .effective_remote_receive_window()
-            .saturating_sub(self.user_tx_segments.total_len_bytes());
+        let mut remote_window_remaining = self.last_remote_window as usize;
 
         trace!(
             remote_window_remaining,

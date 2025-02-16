@@ -208,7 +208,7 @@ impl Recovery {
                 congestion_controller.on_enter_fast_retransmit(now);
 
                 let high_rxt = high_ack;
-                let pipe_estimate = tx_segs.calc_pipe(high_rxt, rtt, now);
+                let pipe_estimate = tx_segs.calc_pipe(high_rxt, last_sent_seq_nr, rtt, now);
                 let cwnd = congestion_controller.sshthresh();
 
                 let rec = Recovering {
@@ -243,7 +243,7 @@ impl Recovery {
                 }
 
                 // TODO: we can do this once per whole batch to optimize
-                rec.pipe_estimate = tx_segs.calc_pipe(rec.high_rxt, rtt, now);
+                rec.pipe_estimate = tx_segs.calc_pipe(rec.high_rxt, last_sent_seq_nr, rtt, now);
             }
         }
     }

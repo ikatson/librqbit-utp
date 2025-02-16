@@ -351,7 +351,13 @@ impl Segments {
             .sum()
     }
 
-    pub fn calc_pipe(&self, high_rxt: SeqNr, rtt: Duration, now: Instant) -> Pipe {
+    pub fn calc_pipe(
+        &self,
+        high_rxt: SeqNr,
+        high_data: SeqNr,
+        rtt: Duration,
+        now: Instant,
+    ) -> Pipe {
         let mut pipe = 0;
         let mut unknown_segs = 0;
         let mut delivered_segs = 0;
@@ -359,9 +365,11 @@ impl Segments {
 
         let halfrtt = rtt / 2;
 
+        let take = (high_data - self.snd_una) as usize;
+
         for (offset, seq_nr, segment, last_sent) in self
             .segments
-            .iter()
+            .range(..take)
             .enumerate()
             .rev()
             .filter_map(|(offset, seg)| {
