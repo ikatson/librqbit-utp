@@ -27,6 +27,10 @@ fn make_msg(header: UtpHeader, payload: &str) -> UtpMessage {
     UtpMessage::new_test(header, payload.as_bytes())
 }
 
+const fn calc_mtu_for_mss(mss: usize) -> usize {
+    mss + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER
+}
+
 struct TestVsock {
     transport: RememberingTransport,
     env: MockUtpEnvironment,
@@ -1424,7 +1428,7 @@ async fn test_flow_control() {
 
     // Configure socket with small buffers to test flow control
     let opts = SocketOpts {
-        mtu: Some(5 + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
+        mtu: Some(calc_mtu_for_mss(5)),
         vsock_rx_bufsize_bytes: Some(25), // Small receive buffer (~5 packets of size 5)
         max_rx_out_of_order_packets: Some(5), // Small assembly queue
         ..Default::default()
@@ -1648,7 +1652,13 @@ async fn test_retransmission_behavior() {
 #[tokio::test]
 async fn test_selective_ack_retransmission() {
     setup_test_logging();
-    let mut t = make_test_vsock(Default::default(), false);
+    let mut t = make_test_vsock(
+        SocketOpts {
+            mtu: Some(calc_mtu_for_mss(5)),
+            ..Default::default()
+        },
+        false,
+    );
     t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(5).unwrap();
 
     const FORCED_RETRANSMISSION_TIME: Duration = Duration::from_secs(1);
@@ -1878,7 +1888,7 @@ async fn test_window_update_sent_when_window_less_than_mss() {
     let mss = 5;
     let opts = SocketOpts {
         vsock_rx_bufsize_bytes: Some(mss * 2),
-        mtu: Some(mss + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
+        mtu: Some(calc_mtu_for_mss(mss)),
         ..Default::default()
     };
 
@@ -1939,7 +1949,7 @@ async fn test_window_update_ack_after_read_with_waking() {
     let mss = 5;
     let opts = SocketOpts {
         vsock_rx_bufsize_bytes: Some(mss * 2),
-        mtu: Some(mss + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
+        mtu: Some(calc_mtu_for_mss(5)),
         ..Default::default()
     };
 
@@ -2788,7 +2798,7 @@ async fn test_rto_not_stuck_in_congestion_control() {
     const MSS: usize = 5;
     let mut t = make_test_vsock(
         SocketOpts {
-            mtu: Some(MSS + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
+            mtu: Some(calc_mtu_for_mss(MSS)),
             congestion: crate::CongestionConfig {
                 tracing: true,
                 ..Default::default()

@@ -411,21 +411,24 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     None => break,
                 };
 
-                if !seg.is_lost() {
-                    event!(
-                        RECOVERY_TRACING_LOG_LEVEL,
-                        "skipping segment that is not lost"
-                    );
-                    continue;
-                }
+                // we MUST transmit the first segment no matter what.
+                if rec.total_retransmitted_segments() > 0 {
+                    if !seg.is_lost() {
+                        event!(
+                            RECOVERY_TRACING_LOG_LEVEL,
+                            "skipping segment that is not lost"
+                        );
+                        continue;
+                    }
 
-                if !seg.has_sacks_after_it() {
-                    event!(
-                        RECOVERY_TRACING_LOG_LEVEL,
-                        seq_nr = ?seg.seq_nr(),
-                        "stopping iteration. has no sacks after it"
-                    );
-                    break;
+                    if !seg.has_sacks_after_it() {
+                        event!(
+                            RECOVERY_TRACING_LOG_LEVEL,
+                            seq_nr = ?seg.seq_nr(),
+                            "stopping iteration. has no sacks after it"
+                        );
+                        break;
+                    }
                 }
 
                 if send_data!(self, cx, header, seg) {
