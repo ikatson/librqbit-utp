@@ -2,11 +2,11 @@
 /// Uses elements of RFC 6675 "SACK Loss Recovery Algorithm for TCP" for duplicate counting.
 use std::time::{Duration, Instant};
 
-use tracing::debug;
+use tracing::event;
 
 use crate::{
     congestion::CongestionController,
-    constants::SACK_DUP_THRESH,
+    constants::{RECOVERY_TRACING_LOG_LEVEL, SACK_DUP_THRESH},
     metrics::METRICS,
     raw::{Type, UtpHeader},
     seq_nr::SeqNr,
@@ -77,7 +77,8 @@ fn count_sack_duplicates(
             // right away.
             let segments_past_first = sack.as_bitslice().count_ones();
             if segments_past_first >= SACK_DUP_THRESH as usize {
-                debug!(
+                event!(
+                    RECOVERY_TRACING_LOG_LEVEL,
                     prev_dup_acks,
                     segments_past_first,
                     ?header.ack_nr,
@@ -123,7 +124,7 @@ fn count_non_sack_duplicates(
         {
             METRICS.duplicate_acks_received.increment(1);
             let dup_acks = prev_dup_acks.saturating_add(1);
-            debug!(?header.ack_nr, high_ack=?*last.ack_nr, ?dup_acks, "counted duplicate ACK in non-sack mode");
+            event!(RECOVERY_TRACING_LOG_LEVEL, ?header.ack_nr, high_ack=?*last.ack_nr, ?dup_acks, "counted duplicate ACK in non-sack mode");
             dup_acks
         }
         _ => {
@@ -159,6 +160,10 @@ impl Recovery {
         }
     }
 
+    pub fn is_recovering(&self) -> bool {
+        matches!(self.phase, RecoveryPhase::Recovering { .. })
+    }
+
     pub fn recovering_mut(&mut self) -> Option<&mut Recovering> {
         match &mut self.phase {
             RecoveryPhase::Recovering(rec) => Some(rec),
@@ -182,7 +187,7 @@ impl Recovery {
         match &mut self.phase {
             RecoveryPhase::IgnoringUntilRecoveryPoint { recovery_point } => {
                 if header.ack_nr >= *recovery_point {
-                    debug!(?recovery_point, ?header.ack_nr, "exiting IgnoringUntilRecoveryPoint");
+                    event!(RECOVERY_TRACING_LOG_LEVEL, ?recovery_point, ?header.ack_nr, "exiting IgnoringUntilRecoveryPoint");
                     self.phase = RecoveryPhase::CountingDuplicates { dup_acks: 0 }
                 }
             }
@@ -231,7 +236,7 @@ impl Recovery {
 
                 METRICS.recovery_enter_count.increment(1);
 
-                debug!(?rec.recovery_point, ?high_ack, high_data=?last_sent_seq_nr, ack_nr=?header.ack_nr, ?pipe_estimate, ?cwnd, ?rtt, "entered recovery");
+                event!(RECOVERY_TRACING_LOG_LEVEL, ?rec.recovery_point, ?high_ack, high_data=?last_sent_seq_nr, ack_nr=?header.ack_nr, ?pipe_estimate, ?cwnd, ?rtt, "entered recovery");
                 self.phase = RecoveryPhase::Recovering(rec);
             }
             RecoveryPhase::Recovering(rec) => {
@@ -246,7 +251,7 @@ impl Recovery {
                     let sshthresh = rec.cwnd;
                     congestion_controller.on_recovered(cwnd, sshthresh);
 
-                    debug!(?rec.recovery_point, ?header.ack_nr, prev_cwnd=rec.cwnd,
+                    event!(RECOVERY_TRACING_LOG_LEVEL, ?rec.recovery_point, ?header.ack_nr, prev_cwnd=rec.cwnd,
                         ?congestion_controller, ?rec.total_retransmitted_segments, ?rtt, "exited recovery");
                     self.phase = RecoveryPhase::CountingDuplicates { dup_acks: 0 };
                 }
@@ -256,7 +261,8 @@ impl Recovery {
 
     pub(crate) fn on_rto_timeout(&mut self, last_sent_seq_nr: SeqNr) {
         if let RecoveryPhase::Recovering(rec) = &self.phase {
-            debug!(
+            event!(
+                RECOVERY_TRACING_LOG_LEVEL,
                 recovery_point = ?last_sent_seq_nr,
                 recovery_state=?rec,
                 "on_rto_timeout: RTO during recovery. Ignoring duplicate acks until new recovery point."

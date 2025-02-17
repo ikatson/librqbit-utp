@@ -13,12 +13,13 @@ use std::{
 use anyhow::{bail, Context};
 use tokio::{sync::mpsc::UnboundedReceiver, time::Sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error_span, trace, trace_span, Level};
+use tracing::{debug, error_span, event, trace, trace_span, Level};
 
 use crate::{
     congestion::CongestionController,
     constants::{
-        ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RTTE_TRACING_LOG_LEVEL, SYNACK_RESEND_INTERNAL,
+        calc_pipe_expiry, ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL,
+        RTTE_TRACING_LOG_LEVEL, SYNACK_RESEND_INTERNAL,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -335,7 +336,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.user_rx.remaining_rx_window() as u32
     }
 
-    // Returns true if UDP socket is full
     fn send_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
         // No reason to send anything, we'll get polled next time.
         if self.this_poll.transport_pending {
@@ -412,17 +412,32 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 };
 
                 if !seg.is_lost() {
-                    debug!("skipping segment that is not lost");
+                    event!(
+                        RECOVERY_TRACING_LOG_LEVEL,
+                        "skipping segment that is not lost"
+                    );
                     continue;
                 }
 
+                if !seg.has_sacks_after_it() {
+                    event!(
+                        RECOVERY_TRACING_LOG_LEVEL,
+                        seq_nr = ?seg.seq_nr(),
+                        "stopping iteration. has no sacks after it"
+                    );
+                    break;
+                }
+
                 if send_data!(self, cx, header, seg) {
-                    debug!(
+                    event!(
+                        RECOVERY_TRACING_LOG_LEVEL,
                         %header.seq_nr,
                         %header.ack_nr,
                         payload_size = seg.payload_size(),
                         pipe = rec.pipe_estimate.pipe,
                         cwnd,
+                        is_lost = seg.is_lost(),
+                        is_expired = seg.is_expired(),
                         "RECOVERY: sent ST_DATA"
                     );
                     rec.high_rxt = seg.seq_nr();
@@ -435,7 +450,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
-            debug!(
+            event!(
+                RECOVERY_TRACING_LOG_LEVEL,
                 ?sent,
                 pipe = rec.pipe_estimate.pipe,
                 remaining_cwnd = cwnd,
@@ -448,7 +464,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         self.timers.recovery_pipe_expiry = Some(t);
                     }
                     None if sent > 0 => {
-                        self.timers.recovery_pipe_expiry = Some(self.rtte.roundtrip_time());
+                        self.timers.recovery_pipe_expiry =
+                            Some(self.this_poll.now + calc_pipe_expiry(self.rtte.roundtrip_time()));
                     }
                     _ => {}
                 }
@@ -512,7 +529,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             METRICS
                 .recovery_transmitted_new_segments_count
                 .increment(sent_count);
-            debug!(
+            event!(
+                RECOVERY_TRACING_LOG_LEVEL,
                 sent_count,
                 remaining_cwnd = remaining_cwnd,
                 "sent in recovery"
@@ -770,8 +788,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // TODO: figure out why did I put this here?
             self.timers.remote_inactivity_timer = None;
 
-            // Update RTO
-            if let Some(rtt) = result.on_ack_result.new_rtt {
+            // Update RTT and RTO if not in recovery. In recovery we get very delayed info
+            // for packets beyond sack depth.
+            if let (false, Some(rtt)) =
+                (self.recovery.is_recovering(), result.on_ack_result.new_rtt)
+            {
                 METRICS.rtt.record(rtt.as_secs_f64());
                 log_every_ms_if_changed!(
                     500,
@@ -1175,7 +1196,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .timers
             .recovery_pipe_expiry
             .take()
-            .map_or(PollAt::Ingress, |p| PollAt::Time(self.this_poll.now + p));
+            .map_or(PollAt::Ingress, PollAt::Time);
 
         // We wait for the earliest of our timers to fire.
         self.timers
@@ -1568,7 +1589,7 @@ enum RetransmitTimer {
 struct Timers {
     sleep: Pin<Box<Sleep>>,
     remote_inactivity_timer: Option<Instant>,
-    recovery_pipe_expiry: Option<Duration>,
+    recovery_pipe_expiry: Option<Instant>,
     retransmit: RetransmitTimer,
     ack_delay_timer: AckDelayTimer,
 }

@@ -37,6 +37,7 @@ pub const WRAP_TOLERANCE: u16 = 1024;
 
 pub const CONGESTION_TRACING_LOG_LEVEL: Level = Level::DEBUG;
 pub const RTTE_TRACING_LOG_LEVEL: Level = Level::TRACE;
+pub const RECOVERY_TRACING_LOG_LEVEL: Level = Level::DEBUG;
 
 // How long to wait to kill the connection if the remote is non-responsive.
 pub const DEFAULT_REMOTE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -45,3 +46,8 @@ pub const DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET: usize = 512;
 
 pub const SACK_DUP_THRESH: u8 = 3;
 pub const SACK_DEPTH: usize = 64;
+
+pub fn calc_pipe_expiry(rtt: Duration) -> Duration {
+    // rtt/2 might be too aggressive
+    rtt * 3 / 4
+}

@@ -7,16 +7,19 @@ type SelectiveAckData = BitArr!(for SACK_DEPTH, in u8, Lsb0);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectiveAck {
     data: SelectiveAckData,
+    len: usize,
 }
 
 impl SelectiveAck {
     pub fn new(unacked: impl Iterator<Item = usize>) -> Self {
         let mut data = SelectiveAckData::default();
-
         for idx in unacked.take_while(|i| *i < SACK_DEPTH) {
             data.set(idx, true);
         }
-        Self { data }
+        Self {
+            data,
+            len: SACK_DEPTH,
+        }
     }
 
     #[cfg(test)]
@@ -28,10 +31,18 @@ impl SelectiveAck {
             count += 1;
         }
         if count > 0 {
-            Some(Self { data })
+            Some(Self {
+                data,
+                len: SACK_DEPTH,
+            })
         } else {
             None
         }
+    }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.len
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -48,7 +59,10 @@ impl SelectiveAck {
         let len = bytes.len().min(std::mem::size_of::<SelectiveAckData>());
         let mut data = SelectiveAckData::default();
         data.as_raw_mut_slice()[..len].copy_from_slice(&bytes[..len]);
-        Self { data }
+        Self {
+            data,
+            len: bytes.len() * 8,
+        }
     }
 
     pub fn as_bitslice(&self) -> &BitSlice<u8> {

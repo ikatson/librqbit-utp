@@ -11,7 +11,7 @@ use std::{
 
 use tracing::trace;
 
-use crate::{metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
+use crate::{constants::calc_pipe_expiry, metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
 
 #[derive(Clone, Copy)]
 enum SentStatus {
@@ -28,6 +28,8 @@ pub struct Segment {
 
     // IsLost() from rfc6675
     is_lost: bool,
+    is_expired: bool,
+    has_sacks_after_it: bool,
 }
 
 pub fn rtt_min(rtt1: Option<Duration>, rtt2: Option<Duration>) -> Option<Duration> {
@@ -72,6 +74,7 @@ pub struct Segments {
 
     // If a SACK seen, this will set how many sgements did it cover.
     sack_depth: usize,
+    last_sack_empty: bool,
 
     // SND.UNA - the sequence number of first unacknowledged segment.
     // If all acknowledged, this is the same as SND.NEXT.
@@ -88,6 +91,14 @@ pub struct SegmentForSending<'a> {
 impl SegmentForSending<'_> {
     pub fn is_lost(&self) -> bool {
         self.segment.is_lost
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.segment.is_expired
+    }
+
+    pub fn has_sacks_after_it(&self) -> bool {
+        self.segment.has_sacks_after_it
     }
 
     pub fn seq_nr(&self) -> SeqNr {
@@ -174,10 +185,21 @@ impl core::fmt::Debug for OnAckResult {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Pipe {
     pub pipe: usize,
-    pub recalc_timer: Option<Duration>,
+    pub recalc_timer: Option<Instant>,
+}
+
+impl std::fmt::Debug for Pipe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pipe={},recalc_timer={:?}",
+            self.pipe,
+            self.recalc_timer.map(|t| Instant::now() - t)
+        )
+    }
 }
 
 impl Segments {
@@ -190,6 +212,7 @@ impl Segments {
             removed_offset: 0,
             sack_depth: 0,
             capacity: tx_bytes / smss,
+            last_sack_empty: false,
             snd_una,
         }
     }
@@ -247,6 +270,8 @@ impl Segments {
             is_delivered: false,
             sent: SentStatus::NotSent,
             is_lost: false,
+            is_expired: false,
+            has_sacks_after_it: false,
         });
         self.offset += payload_len as u64;
         self.len_bytes += payload_len;
@@ -283,7 +308,8 @@ impl Segments {
         // If TX start matches with header ACK and it's a selective ACK, mark all segments delivered.
         match (self.first_seq_nr(), ack_header.extensions.selective_ack) {
             (Some(first_seq_nr), Some(sack)) if first_seq_nr > ack_header.ack_nr => {
-                self.sack_depth = sack.as_bitslice().len();
+                self.sack_depth = sack.len();
+                self.last_sack_empty = sack.as_bitslice().not_any();
 
                 let sack_start = ack_header.ack_nr + 2;
                 let sack_start_offset = sack_start - first_seq_nr;
@@ -356,7 +382,7 @@ impl Segments {
     }
 
     // rfc6675: pipe is the estimate of how much outstanding data is in the network.
-    // used during SACK-based recovery not to overwhelm the receiver.
+    // used during SACK-based recovery not to overwhelm the network.
     pub fn calc_pipe(
         &mut self,
         high_rxt: SeqNr,
@@ -369,6 +395,10 @@ impl Segments {
         let mut recalc_timer = None;
 
         let take = (high_data - self.snd_una).max(0) as usize;
+
+        // After this we don't consider the packet being in the network.
+        // rtt/2 might be a bit too aggressive.
+        let expiry_threshold = calc_pipe_expiry(rtt);
 
         for (offset, seq_nr, segment, last_sent) in self
             .segments
@@ -385,29 +415,32 @@ impl Segments {
                 continue;
             }
 
+            segment.has_sacks_after_it = delivered_segs > 0 || self.last_sack_empty;
+
             if seq_nr <= high_rxt {
                 pipe += segment.payload_size;
             }
 
-            let expired = now - last_sent >= rtt;
+            segment.is_expired = now - last_sent >= expiry_threshold;
 
             // If a segment is past sack depth limit, we don't know anything about it.
             segment.is_lost = if offset > self.sack_depth + 1 {
-                expired
+                segment.is_expired
             } else {
-                // Because of the segments we don't know about, we can't fully use rfc6675
-                delivered_segs >= 3 || expired
+                // Because of the segments we don't know about, we can't fully use rfc6675, so
+                // be conservative here.
+                delivered_segs >= 3 || segment.is_expired
             };
 
             if !segment.is_lost {
                 pipe += segment.payload_size;
             }
 
-            if !expired && !segment.is_lost {
-                let expires_in = last_sent + rtt - now;
+            if !segment.is_expired && !segment.is_lost {
+                let expires = last_sent + expiry_threshold;
                 recalc_timer = match recalc_timer {
-                    Some(d) if d < expires_in => Some(d),
-                    _ => Some(expires_in),
+                    Some(ts) if expires < ts => Some(expires),
+                    _ => Some(expires),
                 }
             }
         }
