@@ -36,10 +36,6 @@ pub fn rtt_min(rtt1: Option<Duration>, rtt2: Option<Duration>) -> Option<Duratio
 }
 
 impl Segment {
-    pub fn is_sent(&self) -> bool {
-        !matches!(self.sent, SentStatus::NotSent)
-    }
-
     fn update_rtt(&self, now: Instant, rtt: &mut Option<Duration>) {
         match self.sent {
             // This should not happen.

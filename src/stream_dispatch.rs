@@ -831,7 +831,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .user_tx_segments
                 .calc_flight_size(self.last_sent_seq_nr);
             self.metrics.cwnd.set(cwnd as f64);
-            self.metrics.sshthresh.set(sshthresh as f64);
+            if sshthresh < usize::MAX {
+                self.metrics.sshthresh.set(sshthresh as f64);
+            }
             self.metrics.flight_size.set(flight_size as f64);
         }
 
