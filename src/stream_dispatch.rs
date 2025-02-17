@@ -205,6 +205,9 @@ struct VirtualSocket<T, Env> {
 
     drop_guard: DropGuardSendBeforeDeath<ControlRequest>,
     parent_span: Option<tracing::Span>,
+
+    #[cfg(feature = "per-connection-metrics")]
+    metrics: crate::metrics::PerConnectionMetrics,
 }
 
 // Updated on every poll
@@ -285,6 +288,9 @@ macro_rules! send_data {
             // see rfc6675.
             $segment_iter_item.on_sent($self.env.now());
             on_packet_sent!($self, $header);
+
+            #[cfg(feature = "per-connection-metrics")]
+            $self.metrics.sent_bytes.increment(len as u64);
 
             if $segment_iter_item.seq_nr() > $self.last_sent_seq_nr {
                 $self.last_sent_seq_nr = $segment_iter_item.seq_nr();
@@ -561,6 +567,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         if sent {
             METRICS.sent_control_packets.increment(1);
+            #[cfg(feature = "per-connection-metrics")]
+            {
+                self.metrics.sent_bytes.increment(len as u64);
+            }
             self.on_packet_sent(&header);
         } else {
             METRICS.unsent_control_packets.increment(1);
@@ -808,6 +818,18 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.rtte.roundtrip_time(),
                 self.this_poll.now,
             );
+        }
+
+        if cfg!(feature = "per-connection-metrics") {
+            let cwnd = self
+                .recovery
+                .recovery_cwnd()
+                .unwrap_or_else(|| self.congestion_controller.window());
+            let sshthresh = self.congestion_controller.sshthresh();
+            let flight_size = self.user_tx_segments.calc_flight_size();
+            self.metrics.cwnd.set(cwnd as f64);
+            self.metrics.sshthresh.set(sshthresh as f64);
+            self.metrics.flight_size.set(flight_size as f64);
         }
 
         Ok(())
@@ -1502,6 +1524,8 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
 
             socket: socket.clone(),
             recovery: Recovery::default(),
+            #[cfg(feature = "per-connection-metrics")]
+            metrics: crate::metrics::PerConnectionMetrics::new(remote),
         };
 
         METRICS.live_virtual_sockets.increment(1);

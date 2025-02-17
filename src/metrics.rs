@@ -1,5 +1,11 @@
+use std::net::SocketAddr;
+
 use lazy_static::lazy_static;
 use metrics::{counter, gauge, histogram, Counter, Gauge, Histogram};
+
+lazy_static! {
+    pub static ref METRICS: Metrics = Metrics::new();
+}
 
 pub struct Metrics {
     pub accepting: Gauge,
@@ -83,6 +89,21 @@ impl Metrics {
     }
 }
 
-lazy_static! {
-    pub static ref METRICS: Metrics = Metrics::new();
+pub struct PerConnectionMetrics {
+    pub cwnd: Gauge,
+    pub sshthresh: Gauge,
+    pub flight_size: Gauge,
+    pub sent_bytes: Counter,
+}
+
+impl PerConnectionMetrics {
+    pub fn new(remote: SocketAddr) -> Self {
+        let labels = [("remote_addr", format!("{}", remote))];
+        Self {
+            cwnd: gauge!("utp_conn_cwnd", &labels),
+            sshthresh: gauge!("utp_conn_sshthresh", &labels),
+            flight_size: gauge!("utp_conn_flightsize", &labels),
+            sent_bytes: counter!("utp_conn_sent_bytes", &labels),
+        }
+    }
 }

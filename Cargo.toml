@@ -8,6 +8,10 @@ documentation = "https://docs.rs/librqbit-utp"
 repository = "https://github.com/ikatson/librqbit-utp"
 readme = "README.md"
 
+[features]
+default = ["per-connection-metrics"]
+per-connection-metrics = []
+
 [dependencies]
 tokio = { version = "1", features = [
     "net",
