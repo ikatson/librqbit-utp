@@ -231,7 +231,7 @@ impl Recovery {
 
                 METRICS.recovery_enter_count.increment(1);
 
-                debug!(?rec.recovery_point, ?high_ack, high_data=?last_sent_seq_nr, ack_nr=?header.ack_nr, ?pipe_estimate, ?cwnd, "entered recovery");
+                debug!(?rec.recovery_point, ?high_ack, high_data=?last_sent_seq_nr, ack_nr=?header.ack_nr, ?pipe_estimate, ?cwnd, ?rtt, "entered recovery");
                 self.phase = RecoveryPhase::Recovering(rec);
             }
             RecoveryPhase::Recovering(rec) => {
@@ -247,7 +247,7 @@ impl Recovery {
                     congestion_controller.on_recovered(cwnd, sshthresh);
 
                     debug!(?rec.recovery_point, ?header.ack_nr, prev_cwnd=rec.cwnd,
-                        ?congestion_controller, ?rec.total_retransmitted_segments, "exited recovery");
+                        ?congestion_controller, ?rec.total_retransmitted_segments, ?rtt, "exited recovery");
                     self.phase = RecoveryPhase::CountingDuplicates { dup_acks: 0 };
                 }
             }

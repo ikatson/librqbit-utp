@@ -25,6 +25,9 @@ pub struct Segment {
     payload_offset_absolute: u64,
     is_delivered: bool,
     sent: SentStatus,
+
+    // IsLost() from rfc6675
+    is_lost: bool,
 }
 
 pub fn rtt_min(rtt1: Option<Duration>, rtt2: Option<Duration>) -> Option<Duration> {
@@ -83,6 +86,10 @@ pub struct SegmentForSending<'a> {
 }
 
 impl SegmentForSending<'_> {
+    pub fn is_lost(&self) -> bool {
+        self.segment.is_lost
+    }
+
     pub fn seq_nr(&self) -> SeqNr {
         self.seq_nr
     }
@@ -239,6 +246,7 @@ impl Segments {
             payload_offset_absolute: self.offset,
             is_delivered: false,
             sent: SentStatus::NotSent,
+            is_lost: false,
         });
         self.offset += payload_len as u64;
         self.len_bytes += payload_len;
@@ -350,14 +358,13 @@ impl Segments {
     // rfc6675: pipe is the estimate of how much outstanding data is in the network.
     // used during SACK-based recovery not to overwhelm the receiver.
     pub fn calc_pipe(
-        &self,
+        &mut self,
         high_rxt: SeqNr,
         high_data: SeqNr,
         rtt: Duration,
         now: Instant,
     ) -> Pipe {
         let mut pipe = 0;
-        let mut unknown_segs = 0;
         let mut delivered_segs = 0;
         let mut recalc_timer = None;
 
@@ -365,7 +372,7 @@ impl Segments {
 
         for (offset, seq_nr, segment, last_sent) in self
             .segments
-            .range(..take)
+            .range_mut(..take)
             .enumerate()
             .rev()
             .filter_map(|(offset, seg)| {
@@ -382,25 +389,25 @@ impl Segments {
                 pipe += segment.payload_size;
             }
 
-            if offset > self.sack_depth + 1 {
-                // If a segment is past sack depth limit, we don't know anything about it.
-                // So assume like this: it's in the pipe if we last sent it within RTT.
-                // NOTE: I tried half rtt and it seemed less stable.
-                if now - last_sent < rtt {
-                    let expires_in = last_sent + rtt - now;
-                    pipe += segment.payload_size;
-                    recalc_timer = match recalc_timer {
-                        Some(d) if d < expires_in => Some(d),
-                        _ => Some(expires_in),
-                    }
-                }
-                unknown_segs += 1;
+            let expired = now - last_sent >= rtt;
+
+            // If a segment is past sack depth limit, we don't know anything about it.
+            segment.is_lost = if offset > self.sack_depth + 1 {
+                expired
             } else {
-                let is_lost = delivered_segs >= 3 || unknown_segs >= 3;
-                // If 3 or more past it are delivered, we consider it lost, it's not in the pipe.
-                // If 3 or more unknown segments past it, we consider it lost, it's not in the pipe.
-                if !is_lost {
-                    pipe += segment.payload_size;
+                // Because of the segments we don't know about, we can't fully use rfc6675
+                delivered_segs >= 3 || expired
+            };
+
+            if !segment.is_lost {
+                pipe += segment.payload_size;
+            }
+
+            if !expired && !segment.is_lost {
+                let expires_in = last_sent + rtt - now;
+                recalc_timer = match recalc_timer {
+                    Some(d) if d < expires_in => Some(d),
+                    _ => Some(expires_in),
                 }
             }
         }

@@ -411,6 +411,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     None => break,
                 };
 
+                if !seg.is_lost() {
+                    debug!("skipping segment that is not lost");
+                    continue;
+                }
+
                 if send_data!(self, cx, header, seg) {
                     debug!(
                         %header.seq_nr,
