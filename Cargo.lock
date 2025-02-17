@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "librqbit-utp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "approx",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "libutp-rs2-sys"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bindgen 0.71.1",
  "cc",
