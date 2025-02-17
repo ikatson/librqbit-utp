@@ -18,8 +18,7 @@ use tracing::{debug, error_span, trace, trace_span, Level};
 use crate::{
     congestion::CongestionController,
     constants::{
-        ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RTTE_TRACING_LOG_LEVEL, SACK_DEPTH,
-        SYNACK_RESEND_INTERNAL,
+        ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RTTE_TRACING_LOG_LEVEL, SYNACK_RESEND_INTERNAL,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -394,10 +393,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             in_recovery = true;
             let high_rxt = rec.high_rxt;
             let recovery_point = rec.recovery_point();
+            let sack_depth = self.user_tx_segments.sack_depth();
             let mut it = self
                 .user_tx_segments
                 .iter_mut_for_sending(None)
-                .take(SACK_DEPTH + 1)
+                .take(sack_depth + 1)
                 .skip_while(|seg| seg.seq_nr() <= high_rxt)
                 .take_while(|seg| seg.seq_nr() <= recovery_point)
                 .filter(|s| !s.is_delivered());
@@ -430,13 +430,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
-            if sent == 0 {
-                debug!(
-                    pipe = rec.pipe_estimate.pipe,
-                    remaining_cwnd = cwnd,
-                    "recovery couldn't send anything"
-                );
-            }
+            debug!(
+                ?sent,
+                pipe = rec.pipe_estimate.pipe,
+                remaining_cwnd = cwnd,
+                "recovery sending"
+            );
 
             if cwnd < mss {
                 match rec.pipe_estimate.recalc_timer {

@@ -11,7 +11,7 @@ use std::{
 
 use tracing::trace;
 
-use crate::{constants::SACK_DEPTH, metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
+use crate::{metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
 
 #[derive(Clone, Copy)]
 enum SentStatus {
@@ -66,6 +66,9 @@ pub struct Segments {
 
     // how many bytes were consumed since creation.
     removed_offset: u64,
+
+    // If a SACK seen, this will set how many sgements did it cover.
+    sack_depth: usize,
 
     // SND.UNA - the sequence number of first unacknowledged segment.
     // If all acknowledged, this is the same as SND.NEXT.
@@ -178,6 +181,7 @@ impl Segments {
             len_bytes: 0,
             offset: 0,
             removed_offset: 0,
+            sack_depth: 0,
             capacity: tx_bytes / smss,
             snd_una,
         }
@@ -210,6 +214,10 @@ impl Segments {
 
     pub fn total_len_bytes(&self) -> usize {
         self.len_bytes
+    }
+
+    pub fn sack_depth(&self) -> usize {
+        self.sack_depth
     }
 
     pub fn is_empty(&self) -> bool {
@@ -267,6 +275,8 @@ impl Segments {
         // If TX start matches with header ACK and it's a selective ACK, mark all segments delivered.
         match (self.first_seq_nr(), ack_header.extensions.selective_ack) {
             (Some(first_seq_nr), Some(sack)) if first_seq_nr > ack_header.ack_nr => {
+                self.sack_depth = sack.as_bitslice().len();
+
                 let sack_start = ack_header.ack_nr + 2;
                 let sack_start_offset = sack_start - first_seq_nr;
 
@@ -372,7 +382,7 @@ impl Segments {
                 pipe += segment.payload_size;
             }
 
-            if offset > SACK_DEPTH + 1 {
+            if offset > self.sack_depth + 1 {
                 // If a segment is past sack depth limit, we don't know anything about it.
                 // So assume like this: it's in the pipe if we last sent it within RTT.
                 // NOTE: I tried half rtt and it seemed less stable.
