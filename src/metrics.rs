@@ -1,12 +1,4 @@
-use lazy_static::lazy_static;
-use metrics::{
-    counter, gauge, histogram, Counter as counter, Gauge as gauge, Histogram as histogram,
-};
-
-lazy_static! {
-    pub static ref METRICS: Metrics = Metrics::new();
-}
-
+#[cfg(feature = "export-metrics")]
 macro_rules! create_metrics {
     (
         $(
@@ -14,6 +6,15 @@ macro_rules! create_metrics {
         ),*
         $(,)?
     ) => {
+        use lazy_static::lazy_static;
+        use metrics::{
+            counter, gauge, histogram, Counter as counter, Gauge as gauge, Histogram as histogram,
+        };
+
+        lazy_static! {
+            pub static ref METRICS: Metrics = Metrics::new();
+        }
+
         pub struct Metrics {
             $(
                 pub $name: $type,
@@ -27,6 +28,39 @@ macro_rules! create_metrics {
                         $name: $type!(
                             concat!("utp_", stringify!($name))
                         ),
+                    )*
+                }
+            }
+        }
+    };
+}
+
+#[cfg(not(feature = "export-metrics"))]
+macro_rules! create_metrics {
+    (
+        $(
+            $type:ident $name:ident
+        ),*
+        $(,)?
+    ) => {
+        pub static METRICS: Metrics = Metrics::new();
+        pub struct Dummy;
+        impl Dummy {
+            pub fn increment<T>(&self, _: T) {}
+            pub fn decrement<T>(&self, _: T) {}
+            pub fn record<T>(&self, _: T) {}
+        }
+        pub struct Metrics {
+            $(
+                pub $name: Dummy,
+            )*
+        }
+
+        impl Metrics {
+            pub const fn new() -> Self {
+                Self {
+                    $(
+                        $name: Dummy,
                     )*
                 }
             }
@@ -71,10 +105,10 @@ create_metrics!(
 
 #[cfg(feature = "per-connection-metrics")]
 pub struct PerConnectionMetrics {
-    pub cwnd: Gauge,
-    pub sshthresh: Gauge,
-    pub flight_size: Gauge,
-    pub sent_bytes: Counter,
+    pub cwnd: ::metrics::Gauge,
+    pub sshthresh: ::metrics::Gauge,
+    pub flight_size: ::metrics::Gauge,
+    pub sent_bytes: ::metrics::Counter,
 }
 
 #[cfg(feature = "per-connection-metrics")]
@@ -82,10 +116,10 @@ impl PerConnectionMetrics {
     pub fn new(remote: std::net::SocketAddr) -> Self {
         let labels = [("remote_addr", format!("{}", remote))];
         Self {
-            cwnd: gauge!("utp_conn_cwnd", &labels),
-            sshthresh: gauge!("utp_conn_sshthresh", &labels),
-            flight_size: gauge!("utp_conn_flightsize", &labels),
-            sent_bytes: counter!("utp_conn_sent_bytes", &labels),
+            cwnd: ::metrics::gauge!("utp_conn_cwnd", &labels),
+            sshthresh: ::metrics::gauge!("utp_conn_sshthresh", &labels),
+            flight_size: ::metrics::gauge!("utp_conn_flightsize", &labels),
+            sent_bytes: ::metrics::counter!("utp_conn_sent_bytes", &labels),
         }
     }
 }

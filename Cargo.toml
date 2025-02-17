@@ -10,7 +10,8 @@ readme = "README.md"
 
 [features]
 default = []
-per-connection-metrics = []
+export-metrics = ["metrics"]
+per-connection-metrics = ["metrics"]
 
 [dependencies]
 tokio = { version = "1", features = [
@@ -30,7 +31,7 @@ bitvec = "1.0.1"
 rustc-hash = "2.1.0"
 tokio-util = "0.7.13"
 ringbuf = "0.4.7"
-metrics = "0.24.1"
+metrics = { version = "0.24.1", optional = true }
 lazy_static = "1.5.0"
 socket2 = "0.5.8"
 
