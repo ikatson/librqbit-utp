@@ -855,7 +855,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             );
         }
 
-        if cfg!(feature = "per-connection-metrics") {
+        #[cfg(feature = "per-connection-metrics")]
+        {
             let cwnd = self
                 .recovery
                 .cwnd()

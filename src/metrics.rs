@@ -1,5 +1,3 @@
-use std::net::SocketAddr;
-
 use lazy_static::lazy_static;
 use metrics::{counter, gauge, histogram, Counter, Gauge, Histogram};
 
@@ -89,6 +87,7 @@ impl Metrics {
     }
 }
 
+#[cfg(feature = "per-connection-metrics")]
 pub struct PerConnectionMetrics {
     pub cwnd: Gauge,
     pub sshthresh: Gauge,
@@ -96,8 +95,9 @@ pub struct PerConnectionMetrics {
     pub sent_bytes: Counter,
 }
 
+#[cfg(feature = "per-connection-metrics")]
 impl PerConnectionMetrics {
-    pub fn new(remote: SocketAddr) -> Self {
+    pub fn new(remote: std::net::SocketAddr) -> Self {
         let labels = [("remote_addr", format!("{}", remote))];
         Self {
             cwnd: gauge!("utp_conn_cwnd", &labels),

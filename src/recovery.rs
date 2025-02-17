@@ -153,6 +153,7 @@ impl Recovery {
         }
     }
 
+    #[allow(unused)]
     pub fn cwnd(&self) -> Option<usize> {
         match &self.phase {
             RecoveryPhase::Recovering(rec) => Some(rec.cwnd),
