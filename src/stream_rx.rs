@@ -384,8 +384,7 @@ impl UserRx {
         match self.ooq.add_remove(msg, offset)? {
             res @ AssemblerAddRemoveResult::Consumed {
                 sequence_numbers, ..
-            } if sequence_numbers > 0 => {
-                // TODO: we shouldn't flush on every single message, but rather should do it after a certain threshold.
+            } if sequence_numbers > 0 && self.ooq.is_full() => {
                 self.flush(cx)?;
                 Ok(res)
             }
