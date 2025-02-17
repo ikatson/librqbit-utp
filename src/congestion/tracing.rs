@@ -39,23 +39,23 @@ where
         );
     }
 
-    fn on_rto_timeout(&mut self, now: Instant) {
+    fn on_retransmission_timeout(&mut self, now: Instant) {
         log_if_changed!(
             CONGESTION_TRACING_LOG_LEVEL,
-            "on_rto_timeout",
+            "on_rto",
             self,
             |s| s.inner,
-            |s| s.inner.on_rto_timeout(now)
+            |s| s.inner.on_retransmission_timeout(now)
         );
     }
 
-    fn on_enter_fast_retransmit(&mut self, now: Instant) {
+    fn on_enter_recovery(&mut self, now: Instant) {
         log_if_changed!(
             CONGESTION_TRACING_LOG_LEVEL,
-            "on_enter_fast_retransmit",
+            "on_enter_recovery",
             self,
             |s| s.inner,
-            |s| s.inner.on_enter_fast_retransmit(now)
+            |s| s.inner.on_enter_recovery(now)
         );
     }
 

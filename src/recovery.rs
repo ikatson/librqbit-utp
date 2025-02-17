@@ -213,7 +213,7 @@ impl Recovery {
                     return;
                 }
 
-                congestion_controller.on_enter_fast_retransmit(now);
+                congestion_controller.on_enter_recovery(now);
 
                 let high_rxt = high_ack;
                 let pipe_estimate = tx_segs.calc_pipe(high_rxt, last_sent_seq_nr, rtt, now);

@@ -21,9 +21,9 @@ pub trait CongestionController: Send + Sync + core::fmt::Debug {
 
     // NOT fast retransmit
     // flight_size per rfc5681
-    fn on_rto_timeout(&mut self, now: Instant);
+    fn on_retransmission_timeout(&mut self, now: Instant);
 
-    fn on_enter_fast_retransmit(&mut self, now: Instant);
+    fn on_enter_recovery(&mut self, now: Instant);
 
     fn set_remote_window(&mut self, win: usize);
 }

@@ -33,7 +33,7 @@ impl core::fmt::Debug for Cubic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "window={},cwnd={:.2},sshthresh:{:.2}",
+            "cwnd={},cwnd_mss={:.2},sshthresh_mss:{:.2}",
             self.window(),
             self.cwnd,
             self.ssthresh
@@ -73,13 +73,13 @@ impl CongestionController for Cubic {
         (self.ssthresh * self.mss as f64) as usize
     }
 
-    fn on_rto_timeout(&mut self, _now: Instant) {
+    fn on_retransmission_timeout(&mut self, _now: Instant) {
         // CUBIC https://datatracker.ietf.org/doc/html/rfc8312#section-4.7
         self.ssthresh = (self.cwnd * BETA_CUBIC).max(2.);
         self.cwnd = 1.
     }
 
-    fn on_enter_fast_retransmit(&mut self, now: Instant) {
+    fn on_enter_recovery(&mut self, now: Instant) {
         self.w_max = self.cwnd;
         self.cwnd *= BETA_CUBIC;
         self.ssthresh = self.cwnd.max(2.);
@@ -207,7 +207,7 @@ mod tests {
         trace!(?cubic, "cubic after 50 MSS packets");
 
         now += rtt * 3;
-        cubic.on_enter_fast_retransmit(now);
+        cubic.on_enter_recovery(now);
         trace!(?cubic, "cubic after triple duplicate acks");
         // Pretend there was a fast retransmit here.
 
@@ -219,7 +219,7 @@ mod tests {
         trace!(?cubic, "cubic after 250 acked packets");
 
         now += Duration::from_secs(1);
-        cubic.on_rto_timeout(now);
+        cubic.on_retransmission_timeout(now);
 
         trace!(?cubic, "cubic after RTO");
 

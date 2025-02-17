@@ -353,7 +353,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         "RTO expired: sent ST_DATA"
                     );
                     self.congestion_controller
-                        .on_rto_timeout(self.this_poll.now);
+                        .on_retransmission_timeout(self.this_poll.now);
                     self.rtte.on_rto_timeout();
                     self.recovery.on_rto_timeout(self.last_sent_seq_nr);
                     // Rewind back last sent seq_nr so that normal sending resumes.
