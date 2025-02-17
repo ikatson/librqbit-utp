@@ -464,9 +464,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         let mut remaining_cwnd = self.recovery.recovery_cwnd().unwrap_or_else(|| {
-            self.congestion_controller
-                .window()
-                .saturating_sub(self.user_tx_segments.calc_flight_size())
+            self.congestion_controller.window().saturating_sub(
+                self.user_tx_segments
+                    .calc_flight_size(self.last_sent_seq_nr),
+            )
         });
 
         let mut sent_count = 0;
@@ -826,7 +827,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .recovery_cwnd()
                 .unwrap_or_else(|| self.congestion_controller.window());
             let sshthresh = self.congestion_controller.sshthresh();
-            let flight_size = self.user_tx_segments.calc_flight_size();
+            let flight_size = self
+                .user_tx_segments
+                .calc_flight_size(self.last_sent_seq_nr);
             self.metrics.cwnd.set(cwnd as f64);
             self.metrics.sshthresh.set(sshthresh as f64);
             self.metrics.flight_size.set(flight_size as f64);

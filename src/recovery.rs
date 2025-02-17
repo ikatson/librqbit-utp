@@ -242,7 +242,7 @@ impl Recovery {
                     let mss = congestion_controller.smss();
                     let cwnd = congestion_controller
                         .sshthresh()
-                        .min(tx_segs.calc_flight_size().max(mss) + mss);
+                        .min(tx_segs.calc_flight_size(last_sent_seq_nr).max(mss) + mss);
                     let sshthresh = rec.cwnd;
                     congestion_controller.on_recovered(cwnd, sshthresh);
 

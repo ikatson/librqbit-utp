@@ -329,11 +329,14 @@ impl Segments {
     }
 
     // The total payload of sent and unacked segments.
-    // TODO: store this instead of iterating if it shows up in benchmarks.
-    pub fn calc_flight_size(&self) -> usize {
+    pub fn calc_flight_size(&self, last_sent_seq_nr: SeqNr) -> usize {
+        // On RTO, we rewind back last_sent_seq_nr, however we don't reset the "sent" status
+        // of packets. So instead of using "is_sent", just iterate up to last_sent_seq_nr, and pretend we
+        // never sent them.
+        let take = (last_sent_seq_nr - self.snd_una + 1).max(0) as usize;
         self.segments
             .iter()
-            .take_while(|s| s.is_sent())
+            .take(take)
             .map(|s| if s.is_delivered { 0 } else { s.payload_size })
             .sum()
     }

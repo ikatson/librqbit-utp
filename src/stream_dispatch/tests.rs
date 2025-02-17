@@ -2877,6 +2877,7 @@ async fn test_rto_not_stuck_in_congestion_control() {
     // Now don't ACK anything and trigger RTO.
     t.env.increment_now(rto);
     t.poll_once_assert_pending().await;
+    // RTO should retransmit 1 packet per rfc5681.
     assert_eq!(
         t.take_sent(),
         vec![cmphead!(ST_DATA, seq_nr = 107, payload = "hello")]
@@ -2898,7 +2899,28 @@ async fn test_rto_not_stuck_in_congestion_control() {
         t.take_sent(),
         vec![
             cmphead!(ST_DATA, seq_nr = 108, payload = "world"),
-            cmphead!(ST_DATA, seq_nr = 109, payload = "hello"),
+            cmphead!(ST_DATA, seq_nr = 109, payload = "hello")
+        ]
+    );
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            wnd_size: 1024 * 1024,
+            seq_nr: 0.into(),
+            ack_nr: 109.into(),
+            ..Default::default()
+        },
+        "",
+    );
+
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![
+            cmphead!(ST_DATA, seq_nr = 110, payload = "world"),
+            cmphead!(ST_DATA, seq_nr = 111, payload = "hello"),
+            cmphead!(ST_DATA, seq_nr = 112, payload = "world"),
+            cmphead!(ST_DATA, seq_nr = 113, payload = "hello"),
         ]
     );
 }
