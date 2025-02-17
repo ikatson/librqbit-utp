@@ -352,9 +352,7 @@ impl Segments {
         let mut delivered_segs = 0;
         let mut recalc_timer = None;
 
-        let take = high_data - self.snd_una;
-        debug_assert!(take >= 0);
-        let take = take as usize;
+        let take = (high_data - self.snd_una).max(0) as usize;
 
         for (offset, seq_nr, segment, last_sent) in self
             .segments
@@ -377,7 +375,8 @@ impl Segments {
 
             if offset > SACK_DEPTH + 1 {
                 // If a segment is past sack depth limit, we don't know anything about it.
-                // So assume like this: it's in the pipe if we last sent it in half RTT.
+                // So assume like this: it's in the pipe if we last sent it within RTT.
+                // NOTE: I tried half rtt and it seemed less stable.
                 if now - last_sent < rtt {
                     let expires_in = last_sent + rtt - now;
                     pipe += segment.payload_size;
@@ -439,7 +438,7 @@ mod tests {
 
     use super::Segments;
 
-    fn make_segmented_tx(start_seq_nr: u16, count: u16) -> Segments {
+    fn make_segments(start_seq_nr: u16, count: u16) -> Segments {
         let mut ftx = Segments::new(start_seq_nr.into(), 64, 1);
         for _ in 0..count {
             assert!(ftx.enqueue(1));
@@ -463,14 +462,14 @@ mod tests {
     fn test_remove_up_to_ack() {
         // Test Case 1: Basic setup with 4 packets starting from sequence number 3
         let now = Instant::now();
-        let ftx = make_segmented_tx(3, 4);
+        let ftx = make_segments(3, 4);
         assert_eq!(ftx.total_len_bytes(), 4);
         assert_eq!(ftx.total_len_packets(), 4);
         assert_eq!(ftx.first_seq_nr().unwrap(), 3.into());
         assert_eq!(ftx.count_delivered_test(), 0);
 
         // Test Case 1.1: ACK with sequence number 4, should remove first two packets
-        let mut ftx = make_segmented_tx(3, 4);
+        let mut ftx = make_segments(3, 4);
         ftx.remove_up_to_ack(now, &make_sack_header(4, []));
         assert_eq!(ftx.total_len_bytes(), 2);
         assert_eq!(ftx.total_len_packets(), 2);
@@ -478,7 +477,7 @@ mod tests {
         assert_eq!(ftx.count_delivered_test(), 0);
 
         // Test Case 1.2: ACK all packets, queue should be empty
-        let mut ftx = make_segmented_tx(3, 4);
+        let mut ftx = make_segments(3, 4);
         ftx.remove_up_to_ack(now, &make_sack_header(6, []));
         assert_eq!(ftx.total_len_bytes(), 0);
         assert_eq!(ftx.total_len_packets(), 0);
@@ -487,7 +486,7 @@ mod tests {
 
         // Test Case 2: ACK with sequence number 2 (below our start sequence)
         // Should not remove any packets or mark any as delivered
-        let mut ftx = make_segmented_tx(3, 4);
+        let mut ftx = make_segments(3, 4);
         ftx.remove_up_to_ack(now, &make_sack_header(2, []));
         assert_eq!(ftx.total_len_bytes(), 4);
         assert_eq!(ftx.total_len_packets(), 4);
@@ -496,7 +495,7 @@ mod tests {
 
         // Test Case 3: ACK with sequence number 3 (matches our start sequence)
         // Should remove the first packet, leaving 3 packets
-        let mut ftx = make_segmented_tx(3, 4);
+        let mut ftx = make_segments(3, 4);
         ftx.remove_up_to_ack(now, &make_sack_header(3, []));
         assert_eq!(ftx.total_len_bytes(), 3);
         assert_eq!(ftx.total_len_packets(), 3);
@@ -505,7 +504,7 @@ mod tests {
 
         // Test Case 4: ACK with sequence number 2 and selective ACK for next packet
         // Should mark the second packet as delivered but not remove any
-        let mut ftx = make_segmented_tx(3, 4);
+        let mut ftx = make_segments(3, 4);
         ftx.remove_up_to_ack(now, &make_sack_header(2, [0]));
         assert_eq!(ftx.total_len_bytes(), 4);
         assert_eq!(ftx.total_len_packets(), 4);
@@ -514,7 +513,7 @@ mod tests {
         assert!(ftx.segments.get(1).unwrap().is_delivered);
 
         // Test Case 4.1 (edge case): an older selective ACK should mark packets delivered.
-        let mut ftx = make_segmented_tx(3, 4);
+        let mut ftx = make_segments(3, 4);
         ftx.remove_up_to_ack(now, &make_sack_header(1, [1])); // means 2 and 3 are not delivered, but 4 is
         assert_eq!(ftx.total_len_bytes(), 4);
         assert_eq!(ftx.total_len_packets(), 4);
@@ -524,7 +523,7 @@ mod tests {
 
         // Test Case 5: ACK with sequence number 2 and selective ACK for second and fourth packets
         // Should mark both packets as delivered but not remove any
-        let mut ftx = make_segmented_tx(3, 4);
+        let mut ftx = make_segments(3, 4);
         ftx.remove_up_to_ack(now, &make_sack_header(2, [0, 2]));
         assert_eq!(ftx.total_len_bytes(), 4);
         assert_eq!(ftx.total_len_packets(), 4);
@@ -534,7 +533,7 @@ mod tests {
         assert!(ftx.segments.get(3).unwrap().is_delivered);
 
         // Test Case 6: Selective ACK with gaps
-        let mut ftx = make_segmented_tx(3, 6); // Create 6 packets
+        let mut ftx = make_segments(3, 6); // Create 6 packets
         ftx.remove_up_to_ack(now, &make_sack_header(2, [0, 2, 4])); // ACK 2nd, 4th, and 6th packets
         assert_eq!(ftx.total_len_bytes(), 6);
         assert_eq!(ftx.total_len_packets(), 6);
@@ -547,7 +546,7 @@ mod tests {
         assert!(!ftx.segments.get(4).unwrap().is_delivered);
 
         // Test Case 7: selective ACK should be able to clean up the queue
-        let mut ftx = make_segmented_tx(3, 4);
+        let mut ftx = make_segments(3, 4);
         ftx.remove_up_to_ack(now, &make_sack_header(1, [0, 1, 2])); // means 3,4,5 were received
         assert_eq!(ftx.total_len_bytes(), 1);
         assert_eq!(ftx.total_len_packets(), 1);
@@ -555,7 +554,7 @@ mod tests {
         assert_eq!(ftx.first_seq_nr().unwrap(), 6.into());
 
         // Test Case 7.1: selective ACK should be able to clean up the queue - even further away
-        let mut ftx = make_segmented_tx(3, 4);
+        let mut ftx = make_segments(3, 4);
         ftx.remove_up_to_ack(now, &make_sack_header(0, [0, 1, 2, 3])); // means 3,4,5 were received
         assert_eq!(ftx.total_len_bytes(), 1);
         assert_eq!(ftx.total_len_packets(), 1);
@@ -567,7 +566,7 @@ mod tests {
     fn test_rtt() {
         // Test Case 1: Basic setup with 4 packets starting from sequence number 3
         let mut now = Instant::now();
-        let mut ftx = make_segmented_tx(3, 5);
+        let mut ftx = make_segments(3, 5);
         for mut item in ftx.iter_mut_for_sending(None) {
             item.on_sent(now);
         }
