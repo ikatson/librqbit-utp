@@ -255,12 +255,16 @@ impl Recovery {
     }
 
     pub(crate) fn on_rto_timeout(&mut self, last_sent_seq_nr: SeqNr) {
-        debug!(
-            recovery_point = ?last_sent_seq_nr,
-            "on_rto_timeout: ignoring duplicate acks until"
-        );
-        self.phase = RecoveryPhase::IgnoringUntilRecoveryPoint {
-            recovery_point: last_sent_seq_nr,
+        if let RecoveryPhase::Recovering(rec) = &self.phase {
+            debug!(
+                recovery_point = ?last_sent_seq_nr,
+                recovery_state=?rec,
+                "on_rto_timeout: RTO during recovery. Ignoring duplicate acks until new recovery point."
+            );
+            METRICS.recovery_rto_during_recovery_count.increment(1);
+            self.phase = RecoveryPhase::IgnoringUntilRecoveryPoint {
+                recovery_point: last_sent_seq_nr,
+            }
         }
     }
 }

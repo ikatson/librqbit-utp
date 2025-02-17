@@ -33,6 +33,7 @@ pub struct Metrics {
     pub recovery_enter_count: Counter,
     pub rto_timeouts_count: Counter,
     pub recovery_transmitted_new_segments_count: Counter,
+    pub recovery_rto_during_recovery_count: Counter,
 }
 
 impl Metrics {
@@ -77,6 +78,7 @@ impl Metrics {
             recovery_transmitted_new_segments_count: counter!(
                 "utp_recovery_transmitted_new_segments_count"
             ),
+            recovery_rto_during_recovery_count: counter!("utp_rto_during_recovery_count"),
         }
     }
 }
