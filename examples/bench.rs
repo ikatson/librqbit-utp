@@ -55,6 +55,11 @@ struct BenchArgs {
     #[arg(long, default_value = "127.0.0.1:5001")]
     client_connect_addr: SocketAddr,
 
+    #[arg(long, default_value = "127.0.0.1:9001")]
+    client_prometheus_listen_addr: SocketAddr,
+    #[arg(long, default_value = "127.0.0.1:9002")]
+    server_prometheus_listen_addr: SocketAddr,
+
     #[arg(long, default_value = "127.0.0.1:5001")]
     server_listen_addr: SocketAddr,
 
@@ -96,6 +101,11 @@ fn boxrw(
 impl BenchArgs {
     #[tracing::instrument(name = "server", skip_all)]
     async fn server(&self) -> anyhow::Result<()> {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .with_http_listener(self.server_prometheus_listen_addr)
+            .install()
+            .context("error installing prometheus")?;
+
         let (r, w) = self.accept().await?;
         info!("accepted a connection");
         match self.program {
@@ -112,6 +122,11 @@ impl BenchArgs {
 
     #[tracing::instrument(name = "client", skip_all)]
     async fn client(&self) -> anyhow::Result<()> {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .with_http_listener(self.client_prometheus_listen_addr)
+            .install()
+            .context("error installing prometheus")?;
+
         let (r, w) = timeout(TIMEOUT, self.connect())
             .await
             .with_context(|| format!("timeout connecting to {}", self.client_connect_addr))?
