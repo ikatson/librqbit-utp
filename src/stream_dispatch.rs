@@ -487,12 +487,18 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         }
 
-        let mut remaining_cwnd = self.recovery.recovery_cwnd().unwrap_or_else(|| {
-            self.congestion_controller.window().saturating_sub(
-                self.user_tx_segments
-                    .calc_flight_size(self.last_sent_seq_nr),
-            )
-        });
+        let mut remaining_cwnd = self
+            .recovery
+            .remaining_cwnd(self.last_remote_window)
+            .unwrap_or_else(|| {
+                self.congestion_controller
+                    .window()
+                    .min(self.last_remote_window as usize)
+                    .saturating_sub(
+                        self.user_tx_segments
+                            .calc_flight_size(self.last_sent_seq_nr),
+                    )
+            });
 
         let mut sent_count = 0;
 
@@ -852,7 +858,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if cfg!(feature = "per-connection-metrics") {
             let cwnd = self
                 .recovery
-                .recovery_cwnd()
+                .cwnd()
                 .unwrap_or_else(|| self.congestion_controller.window());
             let sshthresh = self.congestion_controller.sshthresh();
             let flight_size = self

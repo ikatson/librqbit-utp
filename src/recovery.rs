@@ -153,9 +153,20 @@ impl Recovery {
         }
     }
 
-    pub fn recovery_cwnd(&self) -> Option<usize> {
+    pub fn cwnd(&self) -> Option<usize> {
         match &self.phase {
-            RecoveryPhase::Recovering(rec) => Some(rec.cwnd()),
+            RecoveryPhase::Recovering(rec) => Some(rec.cwnd),
+            _ => None,
+        }
+    }
+
+    pub fn remaining_cwnd(&self, last_remote_window: u32) -> Option<usize> {
+        match &self.phase {
+            RecoveryPhase::Recovering(rec) => Some(
+                rec.cwnd
+                    .min(last_remote_window as usize)
+                    .saturating_sub(rec.pipe_estimate.pipe),
+            ),
             _ => None,
         }
     }
