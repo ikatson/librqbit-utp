@@ -972,17 +972,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .remove_up_to_ack(self.this_poll.now, &msg.header),
         };
 
+        self.congestion_controller
+            .set_remote_window(msg.header.wnd_size as usize);
         self.congestion_controller.on_ack(
             self.this_poll.now,
             result.on_ack_result.acked_bytes,
             &self.rtte,
         );
-
         self.last_remote_timestamp = msg.header.timestamp_microseconds;
-
         self.last_remote_window = msg.header.wnd_size;
-        self.congestion_controller
-            .set_remote_window(msg.header.wnd_size as usize);
 
         self.recovery.on_ack(
             &msg.header,

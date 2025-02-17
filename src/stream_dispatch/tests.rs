@@ -2781,3 +2781,124 @@ async fn test_sequence_numbers_outgoing() {
         vec![cmphead!(ST_STATE, seq_nr = 15091, ack_nr = 31421)]
     )
 }
+
+#[tokio::test]
+async fn test_rto_not_stuck_in_congestion_control() {
+    setup_test_logging();
+    const MSS: usize = 5;
+    let mut t = make_test_vsock(
+        SocketOpts {
+            mtu: Some(MSS + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER),
+            congestion: crate::CongestionConfig {
+                tracing: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        false,
+    );
+    let (_r, mut w) = t.stream.take().unwrap().split();
+
+    let rto = Duration::from_millis(100);
+    t.vsock.rtte.force_timeout(rto);
+    for _ in 0..20 {
+        // This should write a bunch of MSS packets
+        w.write_all(b"helloworld").await.unwrap();
+    }
+
+    t.poll_once_assert_pending().await;
+
+    // 2 MSS
+    assert_eq!(t.vsock.congestion_controller.window(), 10);
+
+    // The first batch should be congestion controlled.
+    assert_eq!(
+        t.take_sent(),
+        vec![
+            cmphead!(ST_DATA, seq_nr = 101, payload = "hello"),
+            cmphead!(ST_DATA, seq_nr = 102, payload = "world"),
+        ]
+    );
+
+    // Ack both
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            wnd_size: 1024 * 1024,
+            seq_nr: 0.into(),
+            ack_nr: 102.into(),
+            ..Default::default()
+        },
+        "",
+    );
+
+    // The second batch should be congestion controlled but better.
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.vsock.congestion_controller.window(), 20);
+    assert_eq!(
+        t.take_sent(),
+        vec![
+            cmphead!(ST_DATA, seq_nr = 103, payload = "hello"),
+            cmphead!(ST_DATA, seq_nr = 104, payload = "world"),
+            cmphead!(ST_DATA, seq_nr = 105, payload = "hello"),
+            cmphead!(ST_DATA, seq_nr = 106, payload = "world"),
+        ]
+    );
+
+    // Ack all
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            wnd_size: 1024 * 1024,
+            seq_nr: 0.into(),
+            ack_nr: 106.into(),
+            ..Default::default()
+        },
+        "",
+    );
+
+    // Now let's pretend we send a bunch of data and then timeout.
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.vsock.congestion_controller.window(), 40);
+    assert_eq!(
+        t.take_sent(),
+        vec![
+            cmphead!(ST_DATA, seq_nr = 107, payload = "hello"),
+            cmphead!(ST_DATA, seq_nr = 108, payload = "world"),
+            cmphead!(ST_DATA, seq_nr = 109, payload = "hello"),
+            cmphead!(ST_DATA, seq_nr = 110, payload = "world"),
+            cmphead!(ST_DATA, seq_nr = 111, payload = "hello"),
+            cmphead!(ST_DATA, seq_nr = 112, payload = "world"),
+            cmphead!(ST_DATA, seq_nr = 113, payload = "hello"),
+            cmphead!(ST_DATA, seq_nr = 114, payload = "world"),
+        ]
+    );
+
+    // Now don't ACK anything and trigger RTO.
+    t.env.increment_now(rto);
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_DATA, seq_nr = 107, payload = "hello")]
+    );
+
+    // ACK the RTO packet. We then should resume normal sending from slow start.
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            wnd_size: 1024 * 1024,
+            seq_nr: 0.into(),
+            ack_nr: 107.into(),
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![
+            cmphead!(ST_DATA, seq_nr = 108, payload = "world"),
+            cmphead!(ST_DATA, seq_nr = 109, payload = "hello"),
+        ]
+    );
+}
