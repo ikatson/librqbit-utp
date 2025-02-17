@@ -5,12 +5,11 @@
 // remove from the actual TX (bytes) that are stored in struct UserTx.
 
 use std::{
-    borrow::{Borrow, BorrowMut},
     collections::VecDeque,
     time::{Duration, Instant},
 };
 
-use tracing::debug;
+use tracing::trace;
 
 use crate::{constants::SACK_DEPTH, metrics::METRICS, raw::UtpHeader, seq_nr::SeqNr};
 
@@ -78,49 +77,45 @@ pub struct Segments {
     snd_una: SeqNr,
 }
 
-pub struct SegmentForSending<T> {
-    segment: T,
+pub struct SegmentForSending<'a> {
+    segment: &'a mut Segment,
     seq_nr: SeqNr,
     payload_offset: usize,
 }
 
-impl<T: Borrow<Segment>> SegmentForSending<T> {
+impl SegmentForSending<'_> {
     pub fn seq_nr(&self) -> SeqNr {
         self.seq_nr
     }
     pub fn is_delivered(&self) -> bool {
-        self.segment.borrow().is_delivered
+        self.segment.is_delivered
     }
     pub fn payload_size(&self) -> usize {
-        self.segment.borrow().payload_size
+        self.segment.payload_size
     }
     pub fn payload_offset(&self) -> usize {
         self.payload_offset
     }
 
     pub fn retransmit_count(&self) -> usize {
-        match self.segment.borrow().sent {
+        match self.segment.sent {
             SentStatus::NotSent => 0,
             SentStatus::SentTime(..) => 0,
             SentStatus::Retransmitted { count, .. } => count,
         }
     }
-}
 
-impl<T: BorrowMut<Segment>> SegmentForSending<T> {
     pub fn on_sent(&mut self, now: Instant) {
-        let seg = self.segment.borrow_mut();
-        seg.sent = match seg.sent {
+        let ps = self.segment.payload_size as u64;
+        self.segment.sent = match self.segment.sent {
             SentStatus::NotSent => {
                 METRICS.send_count.increment(1);
-                METRICS.sent_bytes.increment(seg.payload_size as u64);
+                METRICS.sent_bytes.increment(ps);
                 SentStatus::SentTime(now)
             }
             SentStatus::SentTime(_) => {
                 METRICS.data_retransmissions.increment(1);
-                METRICS
-                    .retransmitted_bytes
-                    .increment(seg.payload_size as u64);
+                METRICS.retransmitted_bytes.increment(ps);
                 SentStatus::Retransmitted {
                     count: 1,
                     last_send_ts: now,
@@ -128,9 +123,7 @@ impl<T: BorrowMut<Segment>> SegmentForSending<T> {
             }
             SentStatus::Retransmitted { count, .. } => {
                 METRICS.data_retransmissions.increment(1);
-                METRICS
-                    .retransmitted_bytes
-                    .increment(seg.payload_size as u64);
+                METRICS.retransmitted_bytes.increment(ps);
                 SentStatus::Retransmitted {
                     count: count + 1,
                     last_send_ts: now,
@@ -335,7 +328,8 @@ impl Segments {
         }
     }
 
-    // TODO: store this instead of iterating.
+    // The total payload of sent and unacked segments.
+    // TODO: store this instead of iterating if it shows up in benchmarks.
     pub fn calc_flight_size(&self) -> usize {
         self.segments
             .iter()
@@ -344,6 +338,8 @@ impl Segments {
             .sum()
     }
 
+    // rfc6675: pipe is the estimate of how much outstanding data is in the network.
+    // used during SACK-based recovery not to overwhelm the receiver.
     pub fn calc_pipe(
         &self,
         high_rxt: SeqNr,
@@ -401,8 +397,7 @@ impl Segments {
             }
         }
 
-        debug!(?pipe, ?recalc_timer, ?high_rxt, high_ack=?self.snd_una, ?high_data, "calc_pipe");
-
+        trace!(?pipe, ?recalc_timer, ?high_rxt, high_ack=?self.snd_una, ?high_data, "calc_pipe");
         Pipe { pipe, recalc_timer }
     }
 
@@ -410,7 +405,7 @@ impl Segments {
     pub fn iter_mut_for_sending(
         &mut self,
         start: Option<SeqNr>,
-    ) -> impl Iterator<Item = SegmentForSending<&mut Segment>> {
+    ) -> impl Iterator<Item = SegmentForSending<'_>> {
         let offset = match start {
             Some(start) => (start - self.snd_una).max(0) as usize,
             None => 0,
