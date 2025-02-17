@@ -37,7 +37,7 @@ pub const WRAP_TOLERANCE: u16 = 1024;
 
 pub const CONGESTION_TRACING_LOG_LEVEL: Level = Level::DEBUG;
 pub const RTTE_TRACING_LOG_LEVEL: Level = Level::TRACE;
-pub const RECOVERY_TRACING_LOG_LEVEL: Level = Level::DEBUG;
+pub const RECOVERY_TRACING_LOG_LEVEL: Level = Level::TRACE;
 
 // How long to wait to kill the connection if the remote is non-responsive.
 pub const DEFAULT_REMOTE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
