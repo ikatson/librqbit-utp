@@ -1021,6 +1021,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         );
         self.last_remote_timestamp = msg.header.timestamp_microseconds;
         self.last_remote_window = msg.header.wnd_size;
+        #[cfg(feature = "per-connection-metrics")]
+        self.metrics.last_remote_window.set(self.last_remote_window);
 
         self.recovery.on_ack(
             &msg.header,

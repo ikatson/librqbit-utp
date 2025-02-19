@@ -109,6 +109,7 @@ pub struct PerConnectionMetrics {
     pub sshthresh: ::metrics::Gauge,
     pub flight_size: ::metrics::Gauge,
     pub sent_bytes: ::metrics::Counter,
+    pub last_remote_window: ::metrics::Gauge,
 }
 
 #[cfg(feature = "per-connection-metrics")]
@@ -120,6 +121,7 @@ impl PerConnectionMetrics {
             sshthresh: ::metrics::gauge!("utp_conn_sshthresh", &labels),
             flight_size: ::metrics::gauge!("utp_conn_flightsize", &labels),
             sent_bytes: ::metrics::counter!("utp_conn_sent_bytes", &labels),
+            last_remote_window: ::metrics::gauge!("utp_last_remote_window", &labels),
         }
     }
 }
