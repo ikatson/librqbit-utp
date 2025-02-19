@@ -333,7 +333,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     // TODO: implement this better
     // https://datatracker.ietf.org/doc/html/rfc9293#section-3.8.6.2.2
     fn rx_window(&self) -> u32 {
-        self.user_rx.remaining_rx_window() as u32
+        let wnd = self.user_rx.remaining_rx_window() as u32;
+        if (wnd as usize) < self.socket_opts.max_incoming_payload_size.get() {
+            return 0;
+        }
+        let rmss = self.socket_opts.max_incoming_payload_size.get() as u32;
+        wnd - (wnd % rmss)
     }
 
     fn send_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
