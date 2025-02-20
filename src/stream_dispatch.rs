@@ -772,6 +772,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     ) -> anyhow::Result<()> {
         let mut result = ProcessIncomingMessageResult::default();
 
+        let mut counter = 0u32;
         while let Poll::Ready(msg) = self.rx.poll_recv(cx) {
             let msg = match msg {
                 Some(msg) => msg,
@@ -791,10 +792,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             };
             result.update(&self.process_incoming_message(cx, msg)?);
+            counter += 1;
             if self.state_is_closed() {
                 break;
             }
         }
+
+        METRICS.recved_packets_in_batch.record(counter);
 
         if result.on_ack_result.acked_segments_count > 0
             || result.on_ack_result.newly_sacked_segment_count > 0

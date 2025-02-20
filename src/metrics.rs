@@ -100,7 +100,8 @@ create_metrics!(
     counter recovery_enter_count,
     counter rto_timeouts_count,
     counter recovery_transmitted_new_segments_count,
-    counter recovery_rto_during_recovery_count
+    counter recovery_rto_during_recovery_count,
+    histogram recved_packets_in_batch
 );
 
 #[cfg(feature = "per-connection-metrics")]
