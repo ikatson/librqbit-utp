@@ -28,7 +28,8 @@ pub const DEFAULT_CONSERVATIVE_OUTGOING_MTU: usize = 1280;
 // Delayed ACK timer. Linux has 40ms, so we set to it too.
 pub const ACK_DELAY: Duration = Duration::from_millis(40);
 
-pub const IMMEDIATE_ACK_EVERY_RMSS: usize = 2;
+pub const SOFT_IMMEDIATE_ACK_EVERY_RMSS: usize = 2;
+pub const HARD_IMMEDIATE_ACK_EVERY_RMSS: usize = 50;
 
 pub const SYNACK_RESEND_INTERNAL: Duration = Duration::from_millis(200);
 

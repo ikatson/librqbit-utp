@@ -18,8 +18,8 @@ use tracing::{debug, error_span, event, trace, trace_span, Level};
 use crate::{
     congestion::CongestionController,
     constants::{
-        calc_pipe_expiry, ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL,
-        RTTE_TRACING_LOG_LEVEL, SYNACK_RESEND_INTERNAL,
+        calc_pipe_expiry, ACK_DELAY, HARD_IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL,
+        RTTE_TRACING_LOG_LEVEL, SOFT_IMMEDIATE_ACK_EVERY_RMSS, SYNACK_RESEND_INTERNAL,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -561,11 +561,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             METRICS.immediate_acks.increment(1);
             return self.send_ack(cx);
         }
-        let expired = self.delayed_ack_expired();
-        if expired && self.ack_to_transmit() {
-            METRICS.delayed_acks.increment(1);
-            trace!("delayed ack expired, sending ACK");
-            self.send_ack(cx)
+        if self.delayed_ack_expired() {
+            if self.ack_to_transmit() {
+                METRICS.delayed_acks.increment(1);
+                trace!("delayed ack expired, sending ACK");
+                self.send_ack(cx)
+            } else {
+                self.timers.reset_delayed_ack_timer();
+                Ok(false)
+            }
         } else {
             Ok(false)
         }
@@ -1105,16 +1109,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     }
                 }
 
-                if self.ack_to_transmit() {
-                    self.timers.ack_delay_timer = match self.timers.ack_delay_timer {
-                        AckDelayTimer::Idle => {
-                            trace!("starting delayed ack timer");
-                            AckDelayTimer::Waiting(self.this_poll.now + ACK_DELAY)
-                        }
-                        timer @ AckDelayTimer::Waiting(_) => timer,
-                    };
-                }
-
                 // Per RFC 5681, we should send an immediate ACK when either:
                 //  1) an out-of-order segment is received, or
                 //  2) a segment arrives that fills in all or part of a gap in sequence space.
@@ -1126,6 +1120,18 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         "forcing immediate ACK"
                     );
                     self.force_immediate_ack();
+                }
+
+                if !self.immediate_ack_to_transmit() && self.consumed_but_unacked_bytes > 0 {
+                    let delay = if self.consumed_but_unacked_bytes
+                        >= SOFT_IMMEDIATE_ACK_EVERY_RMSS
+                            * self.socket_opts.max_incoming_payload_size.get()
+                    {
+                        Duration::from_millis(1)
+                    } else {
+                        ACK_DELAY
+                    };
+                    self.arm_ack_delay_timer(delay);
                 }
             }
             ST_STATE => {}
@@ -1178,12 +1184,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn immediate_ack_to_transmit(&self) -> bool {
         self.should_send_window_update()
             || self.consumed_but_unacked_bytes
-                >= IMMEDIATE_ACK_EVERY_RMSS * self.socket_opts.max_incoming_payload_size.get()
+                >= HARD_IMMEDIATE_ACK_EVERY_RMSS * self.socket_opts.max_incoming_payload_size.get()
     }
 
     fn force_immediate_ack(&mut self) {
         self.consumed_but_unacked_bytes =
-            IMMEDIATE_ACK_EVERY_RMSS * self.socket_opts.max_incoming_payload_size.get();
+            HARD_IMMEDIATE_ACK_EVERY_RMSS * self.socket_opts.max_incoming_payload_size.get();
     }
 
     fn ack_to_transmit(&self) -> bool {
@@ -1196,6 +1202,17 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             AckDelayTimer::Idle => true,
             AckDelayTimer::Waiting(t) => t <= self.this_poll.now,
         }
+    }
+
+    fn arm_ack_delay_timer(&mut self, delay: Duration) {
+        let new_expires = self.this_poll.now + delay;
+        self.timers.ack_delay_timer = match self.timers.ack_delay_timer {
+            AckDelayTimer::Idle => AckDelayTimer::Waiting(new_expires),
+            AckDelayTimer::Waiting(expires) if expires < new_expires => {
+                AckDelayTimer::Waiting(new_expires)
+            }
+            AckDelayTimer::Waiting(expires) => AckDelayTimer::Waiting(expires),
+        };
     }
 
     // When do we need to send smth timer-based next time.
