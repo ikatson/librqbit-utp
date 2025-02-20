@@ -69,6 +69,9 @@ struct BenchArgs {
     client_utp_kind: UtpKind,
 
     #[arg(long)]
+    udp_rcvbuf_kb: Option<usize>,
+
+    #[arg(long)]
     librqbit_utp_congestion_tracing: bool,
 
     #[arg(long, default_value = "none")]
@@ -150,6 +153,7 @@ impl BenchArgs {
                 tracing: self.librqbit_utp_congestion_tracing,
                 ..Default::default()
             },
+            udp_socket_rx_bufsize_bytes: self.udp_rcvbuf_kb.map(|v| v * 1024),
             ..Default::default()
         }
     }
@@ -162,6 +166,7 @@ impl BenchArgs {
                 LibUtpRs2LogLevel::Normal => libutp_rs2::UtpLogLevel::Normal,
                 LibUtpRs2LogLevel::Debug => libutp_rs2::UtpLogLevel::Debug,
             },
+            udp_rcvbuf: self.udp_rcvbuf_kb.map(|v| v * 1024),
             ..Default::default()
         }
     }

@@ -2,6 +2,7 @@ use std::{
     collections::{hash_map::Entry, VecDeque},
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
+    os::fd::{AsRawFd, FromRawFd},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -718,6 +719,28 @@ impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
 
 pub type UtpSocketUdp = UtpSocket<tokio::net::UdpSocket, DefaultUtpEnvironment>;
 
+fn set_udp_rcvbuf(
+    sock: tokio::net::UdpSocket,
+    bufsize: usize,
+) -> anyhow::Result<tokio::net::UdpSocket> {
+    let sock = sock.into_std()?;
+    let sock = socket2::Socket::from(sock);
+    let previous = sock.recv_buffer_size();
+    if let Err(e) = sock.set_recv_buffer_size(bufsize) {
+        tracing::warn!("error setting UDP socket rcv buf size: {e:#}");
+    } else {
+        let current = sock.recv_buffer_size();
+        tracing::info!(
+            expected = bufsize,
+            ?previous,
+            ?current,
+            "set UDP rcv buf size"
+        )
+    }
+    let sock: std::net::UdpSocket = sock.into();
+    Ok(tokio::net::UdpSocket::from_std(sock)?)
+}
+
 impl UtpSocketUdp {
     pub async fn new_udp(bind_addr: SocketAddr) -> anyhow::Result<Arc<Self>> {
         Self::new_udp_with_opts(bind_addr, Default::default()).await
@@ -727,9 +750,14 @@ impl UtpSocketUdp {
         bind_addr: SocketAddr,
         opts: SocketOpts,
     ) -> anyhow::Result<Arc<Self>> {
-        let sock = tokio::net::UdpSocket::bind(bind_addr)
+        let mut sock = tokio::net::UdpSocket::bind(bind_addr)
             .await
             .context("error binding")?;
+
+        if let Some(so_recvbuf) = opts.udp_socket_rx_bufsize_bytes {
+            sock = set_udp_rcvbuf(sock, so_recvbuf)?;
+        }
+
         Self::new_with_opts(sock, Default::default(), opts)
     }
 }
