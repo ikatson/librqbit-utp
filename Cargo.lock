@@ -132,7 +132,7 @@ version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54ac4f13dad353b209b34cbec082338202cbc01c8f00336b55c750c13ac91f8f"
 dependencies = [
- "bindgen 0.69.5",
+ "bindgen",
  "cc",
  "cmake",
  "dunce",
@@ -182,26 +182,6 @@ dependencies = [
  "shlex",
  "syn",
  "which",
-]
-
-[[package]]
-name = "bindgen"
-version = "0.71.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
-dependencies = [
- "bitflags",
- "cexpr",
- "clang-sys",
- "itertools",
- "log",
- "prettyplease",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash 2.1.0",
- "shlex",
- "syn",
 ]
 
 [[package]]
@@ -819,7 +799,6 @@ dependencies = [
 name = "libutp-rs2-sys"
 version = "0.1.1"
 dependencies = [
- "bindgen 0.71.1",
  "cc",
  "libc",
 ]
@@ -940,7 +919,7 @@ version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df6f72a335d87c273d0f1db95778aef6826175556538a72747e1213f9995c16a"
 dependencies = [
- "bindgen 0.69.5",
+ "bindgen",
  "cfg_aliases",
  "libc",
  "static_assertions",
