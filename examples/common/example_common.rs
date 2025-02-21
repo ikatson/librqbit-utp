@@ -15,7 +15,7 @@ use tokio::time::timeout;
 use tokio::try_join;
 use tracing::info;
 
-pub const TIMEOUT: Duration = Duration::from_secs(5);
+pub const TIMEOUT: Duration = Duration::from_secs(30);
 const PRINT_INTERVAL: Duration = Duration::from_secs(1);
 const BUFFER_SIZE: usize = 16384;
 

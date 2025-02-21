@@ -47,3 +47,9 @@ approx = "0.5.1"
 [profile.release]
 panic = "abort"
 debug = true
+
+[profile.release-small]
+inherits = "release"
+panic = "abort"
+debug = false
+strip = true

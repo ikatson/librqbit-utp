@@ -104,11 +104,7 @@ fn boxrw(
 impl BenchArgs {
     #[tracing::instrument(name = "server", skip_all)]
     async fn server(&self) -> anyhow::Result<()> {
-        metrics_exporter_prometheus::PrometheusBuilder::new()
-            .with_http_listener(self.server_prometheus_listen_addr)
-            .set_bucket_duration(Duration::from_secs(1))?
-            .install()
-            .context("error installing prometheus")?;
+        self.install_prometheus(self.server_prometheus_listen_addr)?;
 
         let (r, w) = self.accept().await?;
         info!("accepted a connection");
@@ -124,13 +120,18 @@ impl BenchArgs {
         }
     }
 
+    fn install_prometheus(&self, addr: SocketAddr) -> anyhow::Result<()> {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .with_http_listener(addr)
+            .set_bucket_duration(Duration::from_secs(1))?
+            .set_quantiles(&[0., 0.01, 0.1, 0.5, 0.9, 0.99, 1.])?
+            .install()
+            .context("error installing prometheus")
+    }
+
     #[tracing::instrument(name = "client", skip_all)]
     async fn client(&self) -> anyhow::Result<()> {
-        metrics_exporter_prometheus::PrometheusBuilder::new()
-            .with_http_listener(self.client_prometheus_listen_addr)
-            .set_bucket_duration(Duration::from_secs(1))?
-            .install()
-            .context("error installing prometheus")?;
+        self.install_prometheus(self.client_prometheus_listen_addr)?;
 
         let (r, w) = timeout(TIMEOUT, self.connect())
             .await
