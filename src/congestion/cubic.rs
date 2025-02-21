@@ -66,7 +66,7 @@ impl Cubic {
 
 impl CongestionController for Cubic {
     fn window(&self) -> usize {
-        (self.cwnd * self.mss as f64) as usize
+        (self.cwnd.min(self.rwnd) * self.mss as f64) as usize
     }
 
     fn sshthresh(&self) -> usize {
@@ -105,6 +105,10 @@ impl CongestionController for Cubic {
 
     fn on_ack(&mut self, now: Instant, len: usize, rtte: &RttEstimator) {
         if len == 0 {
+            return;
+        }
+
+        if self.cwnd >= self.rwnd {
             return;
         }
 
