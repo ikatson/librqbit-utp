@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::bail;
 use anyhow::Context;
+use metrics::histogram;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rand::Rng;
 use tokio::io::AsyncRead;
@@ -15,7 +16,7 @@ use tokio::time::timeout;
 use tokio::try_join;
 use tracing::info;
 
-pub const TIMEOUT: Duration = Duration::from_secs(30);
+pub const TIMEOUT: Duration = Duration::from_secs(5);
 const PRINT_INTERVAL: Duration = Duration::from_secs(1);
 const BUFFER_SIZE: usize = 16384;
 
@@ -25,10 +26,13 @@ pub async fn bench_receiver(mut stream: impl AsyncRead + Unpin) -> anyhow::Resul
     let start = Instant::now();
     let mut last_print = start;
 
+    let m_read_len = histogram!("utp_bench_read_len");
+
     loop {
-        match timeout(TIMEOUT, stream.read_exact(&mut buffer)).await {
-            Ok(Ok(_)) => {
-                total_bytes += BUFFER_SIZE as u64;
+        match timeout(TIMEOUT, stream.read(&mut buffer)).await {
+            Ok(Ok(len)) => {
+                m_read_len.record(len as f64);
+                total_bytes += len as u64;
                 let now = Instant::now();
                 if now.duration_since(last_print) >= PRINT_INTERVAL {
                     let elapsed = now.duration_since(start).as_secs_f64();
@@ -47,9 +51,13 @@ pub async fn bench_sender(mut stream: impl AsyncWrite + Unpin) -> anyhow::Result
     let mut buffer = vec![0u8; BUFFER_SIZE];
     rand::thread_rng().fill(buffer.as_mut_slice());
 
+    let m_send_len = histogram!("utp_bench_send_len");
+
     loop {
-        match timeout(TIMEOUT, stream.write_all(&buffer)).await {
-            Ok(Ok(())) => {}
+        match timeout(TIMEOUT, stream.write(&buffer)).await {
+            Ok(Ok(len)) => {
+                m_send_len.record(len as f64);
+            }
             Ok(Err(e)) => bail!("Error writing: {}", e),
             Err(_) => bail!("Timeout while writing"),
         }
