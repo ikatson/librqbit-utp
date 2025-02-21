@@ -874,15 +874,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .recovery
                 .cwnd()
                 .unwrap_or_else(|| self.congestion_controller.window());
+
             let sshthresh = self.congestion_controller.sshthresh();
             let flight_size = self
                 .user_tx_segments
                 .calc_flight_size(self.last_sent_seq_nr);
-            self.metrics.cwnd.set(cwnd as f64);
+            self.metrics.cwnd.record(cwnd as f64);
             if sshthresh < usize::MAX {
-                self.metrics.sshthresh.set(sshthresh as f64);
+                self.metrics.sshthresh.record(sshthresh as f64);
             }
-            self.metrics.flight_size.set(flight_size as f64);
+            self.metrics.flight_size.record(flight_size as f64);
         }
 
         Ok(())
@@ -1036,7 +1037,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.last_remote_window = msg.header.wnd_size;
         #[cfg(feature = "per-connection-metrics")]
         {
-            self.metrics.last_remote_window.set(self.last_remote_window);
+            self.metrics
+                .last_remote_window
+                .record(self.last_remote_window);
             self.metrics.received_packets.increment(1);
         }
 

@@ -106,6 +106,7 @@ impl BenchArgs {
     async fn server(&self) -> anyhow::Result<()> {
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .with_http_listener(self.server_prometheus_listen_addr)
+            .set_bucket_duration(Duration::from_secs(1))?
             .install()
             .context("error installing prometheus")?;
 
@@ -127,6 +128,7 @@ impl BenchArgs {
     async fn client(&self) -> anyhow::Result<()> {
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .with_http_listener(self.client_prometheus_listen_addr)
+            .set_bucket_duration(Duration::from_secs(1))?
             .install()
             .context("error installing prometheus")?;
 

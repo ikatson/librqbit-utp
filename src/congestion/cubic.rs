@@ -127,8 +127,7 @@ impl CongestionController for Cubic {
                 self.cwnd += (w_cubic(t + rtt, self.k, self.w_max) - self.cwnd) / self.cwnd;
             }
         }
-
-        self.cwnd = self.cwnd.min(self.rwnd).max(2.)
+        self.cwnd = self.cwnd.min(self.rwnd).max(2.);
     }
 
     fn set_remote_window(&mut self, win: usize) {

@@ -106,11 +106,11 @@ create_metrics!(
 
 #[cfg(feature = "per-connection-metrics")]
 pub struct PerConnectionMetrics {
-    pub cwnd: ::metrics::Gauge,
-    pub sshthresh: ::metrics::Gauge,
-    pub flight_size: ::metrics::Gauge,
+    pub cwnd: ::metrics::Histogram,
+    pub sshthresh: ::metrics::Histogram,
+    pub flight_size: ::metrics::Histogram,
     pub sent_bytes: ::metrics::Counter,
-    pub last_remote_window: ::metrics::Gauge,
+    pub last_remote_window: ::metrics::Histogram,
     pub received_packets: ::metrics::Counter,
 }
 
@@ -119,11 +119,11 @@ impl PerConnectionMetrics {
     pub fn new(remote: std::net::SocketAddr) -> Self {
         let labels = [("remote_addr", format!("{}", remote))];
         Self {
-            cwnd: ::metrics::gauge!("utp_conn_cwnd", &labels),
-            sshthresh: ::metrics::gauge!("utp_conn_sshthresh", &labels),
-            flight_size: ::metrics::gauge!("utp_conn_flightsize", &labels),
+            cwnd: ::metrics::histogram!("utp_conn_cwnd", &labels),
+            sshthresh: ::metrics::histogram!("utp_conn_sshthresh", &labels),
+            flight_size: ::metrics::histogram!("utp_conn_flightsize", &labels),
             sent_bytes: ::metrics::counter!("utp_conn_sent_bytes", &labels),
-            last_remote_window: ::metrics::gauge!("utp_conn_last_remote_window", &labels),
+            last_remote_window: ::metrics::histogram!("utp_conn_last_remote_window", &labels),
             received_packets: ::metrics::counter!("utp_conn_received_packets", &labels),
         }
     }

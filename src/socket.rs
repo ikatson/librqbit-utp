@@ -2,7 +2,6 @@ use std::{
     collections::{hash_map::Entry, VecDeque},
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
-    os::fd::{AsRawFd, FromRawFd},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
