@@ -52,10 +52,13 @@ pub async fn bench_sender(mut stream: impl AsyncWrite + Unpin) -> anyhow::Result
     rand::thread_rng().fill(buffer.as_mut_slice());
 
     let m_send_len = histogram!("utp_bench_send_len");
+    let m_send_time = histogram!("utp_bench_send_time_us");
 
     loop {
+        let start = Instant::now();
         match timeout(TIMEOUT, stream.write(&buffer)).await {
             Ok(Ok(len)) => {
+                m_send_time.record(start.elapsed().as_micros() as f64);
                 m_send_len.record(len as f64);
             }
             Ok(Err(e)) => bail!("Error writing: {}", e),
