@@ -1535,10 +1535,14 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             state,
             env,
             socket_opts: socket.opts().clone(),
-            congestion_controller: socket
-                .opts()
-                .congestion
-                .create(now, socket.opts().max_incoming_payload_size.get()),
+            congestion_controller: {
+                let mut ctrl = socket
+                    .opts()
+                    .congestion
+                    .create(now, socket.opts().max_incoming_payload_size.get());
+                ctrl.set_remote_window(remote_window as usize);
+                ctrl
+            },
 
             socket_created: socket.created,
             remote,
