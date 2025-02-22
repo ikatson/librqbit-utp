@@ -1,7 +1,9 @@
+use std::cell::OnceCell;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::bail;
 use anyhow::Context;
@@ -17,28 +19,37 @@ use tokio::try_join;
 use tracing::info;
 
 pub const TIMEOUT: Duration = Duration::from_secs(5);
-const PRINT_INTERVAL: Duration = Duration::from_secs(1);
 const BUFFER_SIZE: usize = 16384;
 
 pub async fn bench_receiver(mut stream: impl AsyncRead + Unpin) -> anyhow::Result<()> {
-    let mut buffer = vec![0u8; BUFFER_SIZE];
-    let mut total_bytes = 0u64;
-    let start = Instant::now();
-    let mut last_print = start;
+    // Create static/global counters for all connections
+    static LAST_PRINT: AtomicU64 = AtomicU64::new(0);
+    static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 
+    // Initialize start time only once
+    let mut buffer = vec![0u8; BUFFER_SIZE];
     let m_read_len = histogram!("utp_bench_read_len");
 
     loop {
         match timeout(TIMEOUT, stream.read(&mut buffer)).await {
             Ok(Ok(len)) => {
                 m_read_len.record(len as f64);
-                total_bytes += len as u64;
-                let now = Instant::now();
-                if now.duration_since(last_print) >= PRINT_INTERVAL {
-                    let elapsed = now.duration_since(start).as_secs_f64();
-                    let speed = (total_bytes as f64) / (1024.0 * 1024.0) / elapsed;
-                    info!("Receiving speed: {:.2} MB/s", speed);
-                    last_print = now;
+                TOTAL_BYTES.fetch_add(len as u64, Ordering::Relaxed);
+
+                let now = UNIX_EPOCH.elapsed().unwrap().as_millis() as u64;
+                let prev = LAST_PRINT.load(Ordering::Relaxed);
+                if now - prev > 1000
+                    && LAST_PRINT
+                        .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_ok()
+                    && prev != 0
+                {
+                    let total = TOTAL_BYTES
+                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |_| Some(0))
+                        .unwrap();
+                    let elapsed = (now - prev) as f64 / 1000.;
+                    let speed = (total as f64) / (1024.0 * 1024.0) / elapsed;
+                    info!("Total receiving speed: {:.2} MB/s", speed);
                 }
             }
             Ok(Err(e)) => bail!("Error reading: {}", e),

@@ -2,11 +2,13 @@
 #[path = "./common/example_common.rs"]
 mod example_common;
 
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use example_common::{bench_receiver, bench_sender, echo, TIMEOUT};
+use librqbit_utp::UtpSocketUdp;
+use libutp_rs2::UtpUdpContext;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
@@ -33,13 +35,13 @@ enum UtpKind {
     LibutpRs2,
 }
 
-#[derive(Clone, Debug, Subcommand)]
+#[derive(Clone, Copy, Debug, Subcommand)]
 enum Command {
     Server,
     Client,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum Program {
     Echo,
     Bench,
@@ -50,7 +52,7 @@ struct BenchArgs {
     #[arg(long, default_value = "utp")]
     mode: Mode,
 
-    #[arg(long, default_value = "127.0.0.1:5000")]
+    #[arg(long, default_value = "127.0.0.1:5002")]
     client_listen_addr: SocketAddr,
     #[arg(long, default_value = "127.0.0.1:5001")]
     client_connect_addr: SocketAddr,
@@ -83,43 +85,79 @@ struct BenchArgs {
     #[arg(long)]
     inprocess: bool,
 
+    #[arg(long, default_value = "1")]
+    connections: u16,
+
+    #[arg(long, default_value = "true")]
+    new_client_socket_per_connection: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
 
-type BoxRead = Box<dyn AsyncRead + Unpin + 'static>;
-type BoxWrite = Box<dyn AsyncWrite + Unpin + 'static>;
+type BoxRead = Box<dyn AsyncRead + Send + Unpin + 'static>;
+type BoxWrite = Box<dyn AsyncWrite + Send + Unpin + 'static>;
 type RW = (BoxRead, BoxWrite);
 
 fn boxrw(
     t: (
-        impl AsyncRead + Unpin + 'static,
-        impl AsyncWrite + Unpin + 'static,
+        impl AsyncRead + Send + Unpin + 'static,
+        impl AsyncWrite + Send + Unpin + 'static,
     ),
 ) -> RW {
     let (r, w) = t;
     (Box::new(r), Box::new(w))
 }
 
-impl BenchArgs {
-    #[tracing::instrument(name = "server", skip_all)]
-    async fn server(&self) -> anyhow::Result<()> {
-        self.install_prometheus(self.server_prometheus_listen_addr)?;
+enum Acceptor {
+    Tcp(TcpListener),
+    UtpRs2(Arc<UtpUdpContext>),
+    LibrqbitUtp(Arc<UtpSocketUdp>),
+}
 
-        let (r, w) = self.accept().await?;
-        info!("accepted a connection");
-        match self.program {
-            Program::Echo => {
-                info!("starting echo");
-                echo(r, w).await
+impl Acceptor {
+    async fn accept(&self) -> anyhow::Result<RW> {
+        Ok(match self {
+            Acceptor::Tcp(tcp_listener) => tcp_listener
+                .accept()
+                .await
+                .map(|(s, _)| boxrw(s.into_split()))?,
+            Acceptor::UtpRs2(utp_context) => utp_context
+                .accept()
+                .await
+                .map(|s| boxrw(tokio::io::split(s)))?,
+            Acceptor::LibrqbitUtp(utp_socket) => {
+                utp_socket.accept().await.map(|s| boxrw(s.split()))?
             }
-            Program::Bench => {
-                info!("starting receiver");
-                bench_receiver(r).await
-            }
-        }
+        })
     }
+}
 
+#[derive(Clone)]
+enum Connector {
+    Tcp,
+    UtpRs2(Arc<UtpUdpContext>),
+    LibrqbitUtp(Arc<UtpSocketUdp>),
+}
+
+impl Connector {
+    async fn connect(&self, addr: SocketAddr) -> anyhow::Result<RW> {
+        Ok(match self {
+            Connector::Tcp => TcpStream::connect(addr)
+                .await
+                .map(|s| boxrw(s.into_split()))?,
+            Connector::UtpRs2(utp_context) => utp_context
+                .connect(addr)
+                .await
+                .map(|s| boxrw(tokio::io::split(s)))?,
+            Connector::LibrqbitUtp(utp_socket) => {
+                utp_socket.connect(addr).await.map(|s| boxrw(s.split()))?
+            }
+        })
+    }
+}
+
+impl BenchArgs {
     fn install_prometheus(&self, addr: SocketAddr) -> anyhow::Result<()> {
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .with_http_listener(addr)
@@ -129,25 +167,99 @@ impl BenchArgs {
             .context("error installing prometheus")
     }
 
+    #[tracing::instrument(name = "server", skip_all)]
+    async fn server(&self) -> anyhow::Result<()> {
+        self.install_prometheus(self.server_prometheus_listen_addr)?;
+
+        let mut handles = Vec::new();
+
+        let acceptor = self.acceptor().await?;
+
+        for i in 0..self.connections {
+            let (r, w) = acceptor.accept().await?;
+            info!("accepted connection {}", i + 1);
+
+            let program = self.program;
+            let handle = tokio::spawn(async move {
+                match program {
+                    Program::Echo => {
+                        info!("starting echo for connection {}", i + 1);
+                        echo(r, w).await
+                    }
+                    Program::Bench => {
+                        info!("starting receiver for connection {}", i + 1);
+                        bench_receiver(r).await
+                    }
+                }
+            });
+            handles.push(handle);
+        }
+
+        // Wait for all connections to complete
+        for (i, handle) in handles.into_iter().enumerate() {
+            handle
+                .await
+                .context(format!("connection {} failed", i + 1))??;
+        }
+
+        Ok(())
+    }
+
     #[tracing::instrument(name = "client", skip_all)]
     async fn client(&self) -> anyhow::Result<()> {
         self.install_prometheus(self.client_prometheus_listen_addr)?;
 
-        let (r, w) = timeout(TIMEOUT, self.connect())
-            .await
-            .with_context(|| format!("timeout connecting to {}", self.client_connect_addr))?
-            .with_context(|| format!("error connecting to {}", self.client_connect_addr))?;
-        info!("connected");
-        match self.program {
-            Program::Echo => {
-                info!("starting echo");
-                echo(r, w).await
-            }
-            Program::Bench => {
-                info!("starting sender");
-                bench_sender(w).await
-            }
+        let mut handles = Vec::new();
+
+        let connector: Option<Connector> = if self.new_client_socket_per_connection {
+            None
+        } else {
+            Some(
+                timeout(TIMEOUT, self.connector(0))
+                    .await
+                    .context("timeout connecting")?
+                    .context("error connecting")?,
+            )
+        };
+
+        for i in 0..self.connections {
+            let program = self.program;
+            let connector = connector.clone();
+            let args = self.clone();
+
+            let handle = tokio::spawn(async move {
+                let connector = match connector {
+                    Some(c) => c,
+                    None => timeout(TIMEOUT, args.connector(i))
+                        .await
+                        .context("timeout connecting")?
+                        .context("error connecting")?,
+                };
+
+                let (r, w) = connector.connect(args.client_connect_addr).await?;
+
+                info!("connected client {}", i + 1);
+
+                match program {
+                    Program::Echo => {
+                        info!("starting echo for client {}", i + 1);
+                        echo(r, w).await
+                    }
+                    Program::Bench => {
+                        info!("starting sender for client {}", i + 1);
+                        bench_sender(w).await
+                    }
+                }
+            });
+            handles.push(handle);
         }
+
+        // Wait for all clients to complete
+        for (i, handle) in handles.into_iter().enumerate() {
+            handle.await.context(format!("client {} failed", i + 1))??;
+        }
+
+        Ok(())
     }
 
     fn librqbut_utp_socket_opts(&self) -> librqbit_utp::SocketOpts {
@@ -174,79 +286,66 @@ impl BenchArgs {
         }
     }
 
-    async fn accept(&self) -> anyhow::Result<RW> {
-        let listen = self.server_listen_addr;
+    async fn acceptor(&self) -> anyhow::Result<Acceptor> {
+        let addr = self.server_listen_addr;
         match &self.mode {
             Mode::Tcp => {
-                info!(addr=?listen, "starting TCP server");
-                let l = TcpListener::bind(listen)
+                info!(addr=?addr, "starting TCP server");
+                let l = TcpListener::bind(addr)
                     .await
-                    .with_context(|| format!("error binding to {listen}"))?;
-                let (stream, _) = l.accept().await.context("error accepting")?;
-                Ok(boxrw(stream.into_split()))
+                    .with_context(|| format!("error binding to {addr}"))?;
+                Ok(Acceptor::Tcp(l))
             }
             Mode::Utp => match &self.server_utp_kind {
                 UtpKind::LibrqbitUtp => {
-                    info!(addr=?listen, "starting librqbit-utp server");
-                    librqbit_utp::UtpSocketUdp::new_udp_with_opts(
-                        listen,
-                        self.librqbut_utp_socket_opts(),
-                    )
-                    .await
-                    .with_context(|| format!("error creating uTP socket at {listen}"))?
-                    .accept()
-                    .await
-                    .context("error accepting")
-                    .map(|s| boxrw(s.split()))
+                    info!(addr=?addr, "starting librqbit-utp server");
+                    Ok(Acceptor::LibrqbitUtp(
+                        librqbit_utp::UtpSocketUdp::new_udp_with_opts(
+                            addr,
+                            self.librqbut_utp_socket_opts(),
+                        )
+                        .await
+                        .with_context(|| format!("error creating uTP socket at {addr}"))?,
+                    ))
                 }
                 UtpKind::LibutpRs2 => {
-                    info!(addr=?listen, "starting libutp-rs-2 server");
-                    libutp_rs2::UtpContext::new_udp_with_opts(listen, self.libutp_rs2_opts())
-                        .await
-                        .with_context(|| format!("error creating uTP socket at {listen}"))?
-                        .accept()
-                        .await
-                        .context("error accepting")
-                        .map(|s| boxrw(tokio::io::split(s)))
+                    info!(addr=?addr, "starting libutp-rs-2 server");
+                    Ok(Acceptor::UtpRs2(
+                        libutp_rs2::UtpContext::new_udp_with_opts(addr, self.libutp_rs2_opts())
+                            .await
+                            .with_context(|| format!("error creating uTP socket at {addr}"))?,
+                    ))
                 }
             },
         }
     }
 
-    async fn connect(&self) -> anyhow::Result<RW> {
-        let listen = self.client_listen_addr;
-        let remote = self.client_connect_addr;
+    async fn connector(&self, port_offset: u16) -> anyhow::Result<Connector> {
+        let listen = SocketAddr::new(
+            self.client_listen_addr.ip(),
+            self.client_listen_addr.port() + port_offset,
+        );
         match &self.mode {
-            Mode::Tcp => {
-                info!(addr=?remote, "connecting over TCP");
-                TcpStream::connect(remote)
-                    .await
-                    .with_context(|| format!("TCP: error conecting to {remote}"))
-                    .map(|s| boxrw(s.into_split()))
-            }
+            Mode::Tcp => Ok(Connector::Tcp),
             Mode::Utp => match &self.client_utp_kind {
                 UtpKind::LibrqbitUtp => {
-                    info!(addr=?remote, "connecting over uTP with librqbit-utp");
-                    librqbit_utp::UtpSocketUdp::new_udp_with_opts(
-                        listen,
-                        self.librqbut_utp_socket_opts(),
-                    )
-                    .await
-                    .with_context(|| format!("error creating uTP socket at {listen}"))?
-                    .connect(remote)
-                    .await
-                    .with_context(|| format!("error connecting to {remote}"))
-                    .map(|s| boxrw(s.split()))
+                    info!(addr=?listen, "starting librqbit-utp server");
+                    Ok(Connector::LibrqbitUtp(
+                        librqbit_utp::UtpSocketUdp::new_udp_with_opts(
+                            listen,
+                            self.librqbut_utp_socket_opts(),
+                        )
+                        .await
+                        .with_context(|| format!("error creating uTP socket at {listen}"))?,
+                    ))
                 }
                 UtpKind::LibutpRs2 => {
-                    info!(addr=?remote, "connecting over uTP with libutp-rs-2");
-                    libutp_rs2::UtpContext::new_udp_with_opts(listen, self.libutp_rs2_opts())
-                        .await
-                        .with_context(|| format!("error creating uTP socket at {listen}"))?
-                        .connect(remote)
-                        .await
-                        .with_context(|| format!("error connecting to {remote}"))
-                        .map(|s| boxrw(tokio::io::split(s)))
+                    info!(addr=?listen, "starting libutp-rs-2 server");
+                    Ok(Connector::UtpRs2(
+                        libutp_rs2::UtpContext::new_udp_with_opts(listen, self.libutp_rs2_opts())
+                            .await
+                            .with_context(|| format!("error creating uTP socket at {listen}"))?,
+                    ))
                 }
             },
         }
