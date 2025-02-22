@@ -2630,6 +2630,8 @@ async fn test_write_fails_after_remote_fin_received() {
         "Error should indicate connection is closed: {err}"
     );
 
+    trace!("reading data");
+
     // Read should get the last data
     let mut buf = [0u8; 1024];
     let n = reader.read(&mut buf).await.unwrap();

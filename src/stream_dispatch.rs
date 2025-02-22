@@ -126,15 +126,14 @@ impl VirtualSocketState {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum UserRxMessage {
-    Payload(UtpMessage),
+    Msg(UtpMessage),
     Error(String),
-    Eof,
 }
 
 impl UserRxMessage {
     pub fn len_bytes(&self) -> usize {
         match &self {
-            UserRxMessage::Payload(buf) => buf.payload().len(),
+            UserRxMessage::Msg(buf) => buf.payload().len(),
             _ => 0,
         }
     }
@@ -743,11 +742,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             trace!("just_before_death: no error");
         }
 
-        self.user_rx.enqueue_last_message(
-            error
-                .map(|e| UserRxMessage::Error(format!("{e:#}")))
-                .unwrap_or(UserRxMessage::Eof),
-        );
+        if let Some(e) = error {
+            self.user_rx
+                .enqueue_last_message(UserRxMessage::Error(format!("{e:#}")));
+        }
 
         // This will close the reader.
         self.user_rx.mark_vsock_closed();
@@ -1053,21 +1051,21 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.rtte.roundtrip_time(),
         );
 
+        let offset = msg.header.seq_nr - (self.last_consumed_remote_seq_nr + 1);
+        if offset < 0 {
+            trace!(
+                %self.last_consumed_remote_seq_nr,
+                "dropping message, we already ACKed it"
+            );
+            METRICS.incoming_already_acked_data_packets.increment(1);
+            return Ok(result);
+        }
+
         match msg.header.get_type() {
             ST_DATA => {
                 trace!(payload_size = msg.payload().len(), "received ST_DATA");
 
                 let msg_seq_nr = msg.header.seq_nr;
-
-                let offset = msg_seq_nr - (self.last_consumed_remote_seq_nr + 1);
-                if offset < 0 {
-                    trace!(
-                        %self.last_consumed_remote_seq_nr,
-                        "dropping message, we already ACKed it"
-                    );
-                    METRICS.incoming_already_acked_data_packets.increment(1);
-                    return Ok(result);
-                }
 
                 trace!(
                     offset,
@@ -1148,8 +1146,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                 if !previously_seen_remote_fin {
                     self.last_consumed_remote_seq_nr = hdr.seq_nr;
-                    self.user_rx.enqueue_last_message(UserRxMessage::Eof);
-                    self.user_rx.mark_vsock_closed();
+                    self.user_rx.add_remove(cx, msg, offset as usize)?;
                     self.user_tx.mark_vsock_closed();
                 }
             }

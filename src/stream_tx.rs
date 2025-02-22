@@ -17,7 +17,7 @@ use crate::utils::{fill_buffer_from_slices, update_optional_waker};
 
 pub struct UserTxLocked {
     // Set when stream dies abruptly for writer to know about it.
-    pub vsock_closed: bool,
+    vsock_closed: bool,
     // When the writer drops this is set to true.
     writer_dropped: bool,
 

@@ -10,7 +10,7 @@ use anyhow::Context;
 use msgq::MsgQueue;
 use parking_lot::Mutex;
 use tokio::io::AsyncRead;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 mod msgq {
     use std::collections::VecDeque;
@@ -65,7 +65,9 @@ mod msgq {
 }
 
 use crate::{
-    message::UtpMessage, raw::selective_ack::SelectiveAck, stream_dispatch::UserRxMessage,
+    message::UtpMessage,
+    raw::{selective_ack::SelectiveAck, Type},
+    stream_dispatch::UserRxMessage,
     utils::update_optional_waker,
 };
 
@@ -83,13 +85,12 @@ impl UtpStreamReadHalf {
         let mut g = self.shared.locked.lock();
         while let Some(m) = g.queue.pop_front() {
             match m {
-                UserRxMessage::Payload(utp_message) => {
+                UserRxMessage::Msg(utp_message) => {
                     buf[offset..offset + utp_message.payload().len()]
                         .copy_from_slice(utp_message.payload());
                     offset += utp_message.payload().len();
                 }
                 UserRxMessage::Error(e) => return Err(std::io::Error::other(e)),
-                UserRxMessage::Eof => break,
             }
         }
         buf.truncate(offset);
@@ -139,17 +140,17 @@ impl AsyncRead for UtpStreamReadHalf {
             let mut g = self.shared.locked.lock();
             if let Some(msg) = g.queue.pop_front() {
                 match msg {
-                    UserRxMessage::Payload(msg) => {
+                    UserRxMessage::Msg(msg) if msg.header.htype == Type::ST_FIN => {
+                        drop(g);
+                        self.is_eof = true;
+                        break;
+                    }
+                    UserRxMessage::Msg(msg) => {
                         drop(g);
                         self.current = Some(BeingRead { msg, offset: 0 })
                     }
                     UserRxMessage::Error(msg) => {
                         return Poll::Ready(Err(std::io::Error::other(msg)))
-                    }
-                    UserRxMessage::Eof => {
-                        drop(g);
-                        self.is_eof = true;
-                        return Poll::Ready(Ok(()));
                     }
                 }
             } else {
@@ -313,7 +314,7 @@ impl UserRx {
                 debug_every_ms!(5000, "reader is dead, could not send UtpMesage to it");
                 return Err(msg);
             }
-            g.queue.try_push_back(UserRxMessage::Payload(msg)).unwrap();
+            g.queue.try_push_back(UserRxMessage::Msg(msg)).unwrap();
             Ok(())
         }) {
             flushed_bytes += len;
@@ -437,6 +438,10 @@ pub enum AssemblerAddRemoveResult {
     Unavailable(UtpMessage),
 }
 
+fn ooq_slot_is_default(slot: &UtpMessage) -> bool {
+    slot.header.get_type() == Type::ST_STATE && slot.payload().is_empty()
+}
+
 impl OutOfOrderQueue {
     pub fn new(capacity: NonZeroUsize) -> Self {
         Self {
@@ -545,7 +550,7 @@ impl OutOfOrderQueue {
             .range(start..)
             .enumerate()
             .filter_map(|(idx, data)| {
-                if data.payload().is_empty() {
+                if ooq_slot_is_default(data) {
                     None
                 } else {
                     Some(idx)
@@ -577,17 +582,11 @@ impl OutOfOrderQueue {
             return Ok(AssemblerAddRemoveResult::Unavailable(msg));
         }
 
-        if msg.payload().is_empty() {
-            // This shouldn't happen anyway, as we check for it way above, so warn is ok.
-            warn!("empty payload unsupported");
-            return Ok(AssemblerAddRemoveResult::Unavailable(msg));
-        }
-
         let slot = self
             .data
             .get_mut(effective_offset)
             .context("bug: slot should be there")?;
-        if !slot.payload().is_empty() {
+        if !ooq_slot_is_default(slot) {
             return Ok(AssemblerAddRemoveResult::AlreadyPresent);
         }
 
@@ -600,7 +599,7 @@ impl OutOfOrderQueue {
         let (consumed_segments, consumed_bytes) = self
             .data
             .range(range)
-            .take_while(|msg| !msg.payload().is_empty())
+            .take_while(|msg| !ooq_slot_is_default(msg))
             .fold((0, 0), |mut state, msg| {
                 state.0 += 1;
                 state.1 += msg.payload().len();
@@ -685,7 +684,7 @@ mod tests {
         let msg = msg(0, b"a");
 
         // fill RX
-        user_rx.enqueue_test(UserRxMessage::Payload(msg.clone()));
+        user_rx.enqueue_test(UserRxMessage::Msg(msg.clone()));
 
         assert!(user_rx.shared.is_full_test());
 
@@ -707,7 +706,7 @@ mod tests {
         let msg = msg(0, b"a");
 
         // fill RX
-        user_rx.enqueue_test(UserRxMessage::Payload(msg.clone()));
+        user_rx.enqueue_test(UserRxMessage::Msg(msg.clone()));
 
         assert_eq!(
             user_rx.add_remove_test(msg.clone(), 1).await.unwrap(),
