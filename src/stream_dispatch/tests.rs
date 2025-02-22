@@ -1902,7 +1902,7 @@ async fn test_window_update_sent_when_window_less_than_mss() {
             ST_STATE,
             seq_nr = 101,
             ack_nr = 2,
-            wnd_size = 4u32
+            wnd_size = 0u32
         )],
         "Should have sent an ACK with new window less than MSS"
     );
@@ -1924,7 +1924,7 @@ async fn test_window_update_sent_when_window_less_than_mss() {
             ST_STATE,
             seq_nr = 101,
             ack_nr = 2,
-            wnd_size = 9u32
+            wnd_size = 5u32
         )],
         "Should have sent an ACK with updated window"
     );

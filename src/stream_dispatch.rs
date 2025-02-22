@@ -1064,9 +1064,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         match msg.header.get_type() {
             ST_DATA => {
                 trace!(payload_size = msg.payload().len(), "received ST_DATA");
-
-                let msg_seq_nr = msg.header.seq_nr;
-
                 trace!(
                     offset,
                     %self.last_consumed_remote_seq_nr,
