@@ -616,7 +616,7 @@ impl OutOfOrderQueue {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
+    use std::{future::poll_fn, num::NonZeroUsize, task::Poll};
 
     use tokio::io::AsyncReadExt;
     use tracing::trace;
@@ -770,6 +770,12 @@ mod tests {
             }
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
+        assert_eq!(user_rx.ooq.stored_packets(), 3);
+        poll_fn(|cx| {
+            assert_eq!(user_rx.flush(cx).unwrap(), 14);
+            Poll::Ready(())
+        })
+        .await;
         assert_eq!(user_rx.ooq.stored_packets(), 0);
 
         let mut buf = [0u8; 1024];
@@ -794,7 +800,7 @@ mod tests {
             }
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
-        assert_eq!(user_rx.ooq.stored_packets(), 0);
+        assert_eq!(user_rx.ooq.stored_packets(), 1);
 
         assert_eq!(
             user_rx.add_remove_test(msg_1.clone(), 0).await.unwrap(),
@@ -813,7 +819,13 @@ mod tests {
             }
         );
         trace!(asm=%user_rx.ooq.debug_string(true));
-        assert_eq!(user_rx.ooq.stored_packets(), 0);
+        assert_eq!(user_rx.ooq.stored_packets(), 3);
+
+        poll_fn(|cx| {
+            assert_eq!(user_rx.flush(cx).unwrap(), 14);
+            Poll::Ready(())
+        })
+        .await;
 
         let mut buf = [0u8; 1024];
         let sz = read.read(&mut buf).await.unwrap();
