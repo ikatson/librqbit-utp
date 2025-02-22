@@ -116,8 +116,11 @@ pub struct PerConnectionMetrics {
 
 #[cfg(feature = "per-connection-metrics")]
 impl PerConnectionMetrics {
-    pub fn new(remote: std::net::SocketAddr) -> Self {
-        let labels = [("remote_addr", format!("{}", remote))];
+    pub fn new(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> Self {
+        let labels = [
+            ("local_addr", format!("{}", local)),
+            ("remote_addr", format!("{}", remote)),
+        ];
         Self {
             cwnd: ::metrics::histogram!("utp_conn_cwnd", &labels),
             sshthresh: ::metrics::histogram!("utp_conn_sshthresh", &labels),

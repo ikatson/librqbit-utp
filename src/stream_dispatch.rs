@@ -1595,7 +1595,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             socket: socket.clone(),
             recovery: Recovery::default(),
             #[cfg(feature = "per-connection-metrics")]
-            metrics: crate::metrics::PerConnectionMetrics::new(remote),
+            metrics: crate::metrics::PerConnectionMetrics::new(socket.bind_addr(), remote),
         };
 
         METRICS.live_virtual_sockets.increment(1);
