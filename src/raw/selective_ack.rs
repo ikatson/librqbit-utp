@@ -79,7 +79,9 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use crate::{
-        message::UtpMessage, raw::selective_ack::SelectiveAck, stream_rx::OutOfOrderQueue,
+        message::UtpMessage,
+        raw::{selective_ack::SelectiveAck, Type::ST_DATA},
+        stream_rx::OutOfOrderQueue,
     };
 
     fn asm() -> OutOfOrderQueue {
@@ -87,7 +89,13 @@ mod tests {
     }
 
     fn msg() -> UtpMessage {
-        UtpMessage::new_test(Default::default(), b"a")
+        UtpMessage::new_test(
+            crate::raw::UtpHeader {
+                htype: ST_DATA,
+                ..Default::default()
+            },
+            b"a",
+        )
     }
 
     #[test]

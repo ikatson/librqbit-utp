@@ -6,16 +6,53 @@ use std::{
     task::{Poll, Waker},
 };
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use msgq::MsgQueue;
 use parking_lot::Mutex;
 use tokio::io::AsyncRead;
 use tracing::{debug, trace};
 
+#[derive(Debug, PartialEq, Eq)]
+enum UserRxMessage {
+    Payload(Payload),
+    Eof,
+    Error(String),
+}
+
+impl UserRxMessage {
+    pub fn len_bytes(&self) -> usize {
+        match &self {
+            UserRxMessage::Payload(payload) => payload.len(),
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OoqMessage {
+    Payload(Payload),
+    Eof,
+}
+
+impl Default for OoqMessage {
+    fn default() -> Self {
+        OoqMessage::Payload(Vec::new())
+    }
+}
+
+impl OoqMessage {
+    pub fn len_bytes(&self) -> usize {
+        match &self {
+            OoqMessage::Payload(payload) => payload.len(),
+            _ => 0,
+        }
+    }
+}
+
 mod msgq {
     use std::collections::VecDeque;
 
-    use crate::stream_dispatch::UserRxMessage;
+    use super::{OoqMessage, UserRxMessage};
 
     pub struct MsgQueue {
         queue: VecDeque<UserRxMessage>,
@@ -38,12 +75,12 @@ mod msgq {
         }
 
         pub fn window(&self) -> usize {
-            self.capacity - self.len_bytes
+            self.capacity.saturating_sub(self.len_bytes)
         }
 
         #[cfg(test)]
         pub fn is_full(&self) -> bool {
-            self.len_bytes == self.capacity
+            self.len_bytes >= self.capacity
         }
 
         pub fn pop_front(&mut self) -> Option<UserRxMessage> {
@@ -52,14 +89,22 @@ mod msgq {
             Some(msg)
         }
 
-        pub fn try_push_back(&mut self, msg: UserRxMessage) -> Result<(), UserRxMessage> {
+        pub fn try_push_back(&mut self, msg: OoqMessage) -> Result<(), OoqMessage> {
             let len = msg.len_bytes();
             if self.capacity - self.len_bytes < len {
                 return Err(msg);
             }
-            self.queue.push_back(msg);
+            self.queue.push_back(match msg {
+                OoqMessage::Payload(payload) => UserRxMessage::Payload(payload),
+                OoqMessage::Eof => UserRxMessage::Eof,
+            });
             self.len_bytes += len;
             Ok(())
+        }
+
+        pub(crate) fn push_back(&mut self, msg: UserRxMessage) {
+            self.len_bytes += msg.len_bytes();
+            self.queue.push_back(msg);
         }
     }
 }
@@ -67,8 +112,8 @@ mod msgq {
 use crate::{
     message::UtpMessage,
     raw::{selective_ack::SelectiveAck, Type},
-    stream_dispatch::UserRxMessage,
     utils::update_optional_waker,
+    Payload,
 };
 
 pub struct UtpStreamReadHalf {
@@ -85,10 +130,12 @@ impl UtpStreamReadHalf {
         let mut g = self.shared.locked.lock();
         while let Some(m) = g.queue.pop_front() {
             match m {
-                UserRxMessage::Msg(utp_message) => {
-                    buf[offset..offset + utp_message.payload().len()]
-                        .copy_from_slice(utp_message.payload());
-                    offset += utp_message.payload().len();
+                UserRxMessage::Payload(payload) => {
+                    buf[offset..offset + payload.len()].copy_from_slice(&payload);
+                    offset += payload.len();
+                }
+                UserRxMessage::Eof => {
+                    break;
                 }
                 UserRxMessage::Error(e) => return Err(std::io::Error::other(e)),
             }
@@ -115,7 +162,7 @@ impl AsyncRead for UtpStreamReadHalf {
         while buf.remaining() > 0 {
             // If there was a previous message we haven't read till the end, do it.
             if let Some(current) = self.current.as_mut() {
-                let payload = &current.msg.payload()[current.offset..];
+                let payload = &current.payload[current.offset..];
                 if payload.is_empty() {
                     return Poll::Ready(Err(std::io::Error::other(
                         "bug in UtpStreamReadHalf: payload is empty",
@@ -127,7 +174,7 @@ impl AsyncRead for UtpStreamReadHalf {
                 buf.put_slice(&payload[..len]);
                 written += len;
                 current.offset += len;
-                if current.offset == current.msg.payload().len() {
+                if current.offset == current.payload.len() {
                     self.current = None;
                 }
                 continue;
@@ -140,14 +187,14 @@ impl AsyncRead for UtpStreamReadHalf {
             let mut g = self.shared.locked.lock();
             if let Some(msg) = g.queue.pop_front() {
                 match msg {
-                    UserRxMessage::Msg(msg) if msg.header.htype == Type::ST_FIN => {
+                    UserRxMessage::Eof => {
                         drop(g);
                         self.is_eof = true;
                         break;
                     }
-                    UserRxMessage::Msg(msg) => {
+                    UserRxMessage::Payload(payload) => {
                         drop(g);
-                        self.current = Some(BeingRead { msg, offset: 0 })
+                        self.current = Some(BeingRead { payload, offset: 0 })
                     }
                     UserRxMessage::Error(msg) => {
                         return Poll::Ready(Err(std::io::Error::other(msg)))
@@ -186,7 +233,7 @@ impl AsyncRead for UtpStreamReadHalf {
 }
 
 struct BeingRead {
-    msg: UtpMessage,
+    payload: Payload,
     offset: usize,
 }
 
@@ -314,7 +361,7 @@ impl UserRx {
                 debug_every_ms!(5000, "reader is dead, could not send UtpMesage to it");
                 return Err(msg);
             }
-            g.queue.try_push_back(UserRxMessage::Msg(msg)).unwrap();
+            g.queue.try_push_back(msg).unwrap();
             Ok(())
         }) {
             flushed_bytes += len;
@@ -348,9 +395,9 @@ impl UserRx {
         Ok(flushed_bytes)
     }
 
-    pub fn enqueue_last_message(&self, msg: UserRxMessage) {
+    pub fn enqueue_error(&self, msg: String) {
         let mut g = self.shared.locked.lock();
-        g.queue.try_push_back(msg).unwrap();
+        g.queue.push_back(UserRxMessage::Error(msg));
         let waker = g.reader_waker.take();
         if let Some(waker) = waker {
             drop(g);
@@ -416,12 +463,12 @@ impl UserRx {
     #[cfg(test)]
     fn enqueue_test(&self, msg: UserRxMessage) {
         let mut g = self.shared.locked.lock();
-        g.queue.try_push_back(msg).unwrap();
+        g.queue.push_back(msg);
     }
 }
 
 pub struct OutOfOrderQueue {
-    data: VecDeque<UtpMessage>,
+    data: VecDeque<OoqMessage>,
     filled_front: usize,
     len: usize,
     len_bytes: usize,
@@ -438,8 +485,11 @@ pub enum AssemblerAddRemoveResult {
     Unavailable(UtpMessage),
 }
 
-fn ooq_slot_is_default(slot: &UtpMessage) -> bool {
-    slot.header.get_type() == Type::ST_STATE && slot.payload().is_empty()
+fn ooq_slot_is_default(slot: &OoqMessage) -> bool {
+    match slot {
+        OoqMessage::Payload(payload) => payload.is_empty(),
+        OoqMessage::Eof => false,
+    }
 }
 
 impl OutOfOrderQueue {
@@ -457,23 +507,23 @@ impl OutOfOrderQueue {
         self.data
             .iter()
             .take(self.filled_front)
-            .map(|m| m.payload().len())
+            .map(|m| m.len_bytes())
             .sum()
     }
 
-    pub fn send_front_if_fits(
+    fn send_front_if_fits(
         &mut self,
         window: usize,
-        send_fn: impl FnOnce(UtpMessage) -> Result<(), UtpMessage>,
+        send_fn: impl FnOnce(OoqMessage) -> Result<(), OoqMessage>,
     ) -> Option<usize> {
         if self.filled_front == 0 {
             return None;
         }
-        if self.data[0].payload().len() > window {
+        if self.data[0].len_bytes() > window {
             return None;
         }
-        let msg = self.data.pop_front()?;
-        let len = msg.payload().len();
+        let msg = self.data.pop_front().unwrap();
+        let len = msg.len_bytes();
         match send_fn(msg) {
             Ok(()) => {}
             Err(msg) => {
@@ -582,6 +632,13 @@ impl OutOfOrderQueue {
             return Ok(AssemblerAddRemoveResult::Unavailable(msg));
         }
 
+        let msg = match msg.header.htype {
+            Type::ST_DATA if msg.payload().is_empty() => bail!("zero payload unsupported"),
+            Type::ST_DATA => OoqMessage::Payload(msg.data),
+            Type::ST_FIN => OoqMessage::Eof,
+            _ => bail!("invalid message, expected ST_DATA or ST_FIN"),
+        };
+
         let slot = self
             .data
             .get_mut(effective_offset)
@@ -591,7 +648,7 @@ impl OutOfOrderQueue {
         }
 
         self.len += 1;
-        self.len_bytes += msg.payload().len();
+        self.len_bytes += msg.len_bytes();
         *slot = msg;
 
         let range = self.filled_front..self.data.len();
@@ -602,7 +659,7 @@ impl OutOfOrderQueue {
             .take_while(|msg| !ooq_slot_is_default(msg))
             .fold((0, 0), |mut state, msg| {
                 state.0 += 1;
-                state.1 += msg.payload().len();
+                state.1 += msg.len_bytes();
                 state
             });
         self.filled_front += consumed_segments;
@@ -622,8 +679,7 @@ mod tests {
 
     use crate::{
         message::UtpMessage,
-        stream_dispatch::UserRxMessage,
-        stream_rx::{AssemblerAddRemoveResult, OutOfOrderQueue},
+        stream_rx::{AssemblerAddRemoveResult, OutOfOrderQueue, UserRxMessage},
         test_util::setup_test_logging,
     };
 
@@ -684,7 +740,7 @@ mod tests {
         let msg = msg(0, b"a");
 
         // fill RX
-        user_rx.enqueue_test(UserRxMessage::Msg(msg.clone()));
+        user_rx.enqueue_test(UserRxMessage::Payload(b"a".to_vec()));
 
         assert!(user_rx.shared.is_full_test());
 
@@ -706,7 +762,7 @@ mod tests {
         let msg = msg(0, b"a");
 
         // fill RX
-        user_rx.enqueue_test(UserRxMessage::Msg(msg.clone()));
+        user_rx.enqueue_test(UserRxMessage::Payload(msg.data.clone()));
 
         assert_eq!(
             user_rx.add_remove_test(msg.clone(), 1).await.unwrap(),

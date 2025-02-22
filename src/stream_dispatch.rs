@@ -124,21 +124,6 @@ impl VirtualSocketState {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum UserRxMessage {
-    Msg(UtpMessage),
-    Error(String),
-}
-
-impl UserRxMessage {
-    pub fn len_bytes(&self) -> usize {
-        match &self {
-            UserRxMessage::Msg(buf) => buf.payload().len(),
-            _ => 0,
-        }
-    }
-}
-
 // An equivalent of a TCP socket for uTP.
 struct VirtualSocket<T, Env> {
     state: VirtualSocketState,
@@ -743,8 +728,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         if let Some(e) = error {
-            self.user_rx
-                .enqueue_last_message(UserRxMessage::Error(format!("{e:#}")));
+            self.user_rx.enqueue_error(format!("{e:#}"));
         }
 
         // This will close the reader.
@@ -1076,7 +1060,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 match self
                     .user_rx
                     .add_remove(cx, msg, offset as usize)
-                    .context("fatal error in assembler")?
+                    .context("fatal error in user_rx")?
                 {
                     AssemblerAddRemoveResult::Consumed {
                         sequence_numbers,
