@@ -87,9 +87,6 @@ pub struct SocketOpts {
     /// How many bytes to allocate for each virtual socket's TX.
     pub vsock_tx_bufsize_bytes: Option<usize>,
 
-    /// How many out-of-order packets to track in the RX window.
-    pub max_rx_out_of_order_packets: Option<usize>,
-
     /// Disable Nagle's algorithm
     pub disable_nagle: bool,
 

@@ -1420,7 +1420,6 @@ async fn test_flow_control() {
     let opts = SocketOpts {
         mtu: Some(calc_mtu_for_mss(5)),
         vsock_rx_bufsize_bytes: Some(25), // Small receive buffer (~5 packets of size 5)
-        max_rx_out_of_order_packets: Some(5), // Small assembly queue
         ..Default::default()
     };
 

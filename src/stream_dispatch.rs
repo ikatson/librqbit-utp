@@ -1318,11 +1318,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         for _ in 0..MAX_ITERS {
             pending_if_cannot_send!(self.maybe_send_syn_ack(cx));
 
-            // Flow control: flush as many out of order messages to user RX as possible.
-            bail_if_err!(self.user_rx.flush(cx));
-
             // Read incoming stream.
             pending_if_cannot_send!(self.process_all_incoming_messages(cx));
+
+            // Flow control: flush as many out of order messages to user RX as possible.
+            bail_if_err!(self.user_rx.flush(cx));
 
             if self
                 .timers
