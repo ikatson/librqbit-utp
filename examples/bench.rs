@@ -52,8 +52,12 @@ struct BenchArgs {
     #[arg(long, default_value = "utp")]
     mode: Mode,
 
+    #[arg(long, default_value = "127.0.0.1:5001")]
+    server_listen_addr: SocketAddr,
+
     #[arg(long, default_value = "127.0.0.1:5002")]
     client_listen_addr: SocketAddr,
+
     #[arg(long, default_value = "127.0.0.1:5001")]
     client_connect_addr: SocketAddr,
 
@@ -62,15 +66,12 @@ struct BenchArgs {
     #[arg(long, default_value = "127.0.0.1:9002")]
     server_prometheus_listen_addr: SocketAddr,
 
-    #[arg(long, default_value = "127.0.0.1:5001")]
-    server_listen_addr: SocketAddr,
-
     #[arg(long, default_value = "librqbit-utp")]
     server_utp_kind: UtpKind,
     #[arg(long, default_value = "librqbit-utp")]
     client_utp_kind: UtpKind,
 
-    #[arg(long)]
+    #[arg(long, default_value = "1200")]
     udp_rcvbuf_kb: Option<usize>,
 
     #[arg(long)]
@@ -82,14 +83,11 @@ struct BenchArgs {
     #[arg(long, default_value = "bench")]
     program: Program,
 
-    #[arg(long)]
-    inprocess: bool,
-
     #[arg(long, default_value = "1")]
     connections: u16,
 
-    #[arg(long, default_value = "true")]
-    new_client_socket_per_connection: bool,
+    #[arg(long)]
+    same_client_socket_per_connection: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -211,7 +209,7 @@ impl BenchArgs {
 
         let mut handles = Vec::new();
 
-        let connector: Option<Connector> = if self.new_client_socket_per_connection {
+        let connector: Option<Connector> = if !self.same_client_socket_per_connection {
             None
         } else {
             Some(
