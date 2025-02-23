@@ -19,7 +19,7 @@ use crate::{
         DEFAULT_CONSERVATIVE_OUTGOING_MTU, DEFAULT_INCOMING_MTU,
         DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET, DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK,
         DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK, DEFAULT_MTU_AUTODETECT_IP,
-        DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IPV4_HEADER, MIN_UDP_HEADER, UTP_HEADER_SIZE,
+        DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IP_HEADER, UDP_HEADER, UTP_HEADER,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -127,16 +127,16 @@ impl SocketOpts {
 
         fn calc(mtu: usize) -> anyhow::Result<MtuCalc> {
             let max_packet_size = NonZeroUsize::new(
-                mtu.checked_sub(IPV4_HEADER)
+                mtu.checked_sub(IP_HEADER)
                     .context("MTU too low")?
-                    .checked_sub(MIN_UDP_HEADER)
+                    .checked_sub(UDP_HEADER)
                     .context("MTU too low")?,
             )
             .context("max_packet_size == 0")?;
             let max_payload_size = NonZeroUsize::new(
                 max_packet_size
                     .get()
-                    .checked_sub(UTP_HEADER_SIZE)
+                    .checked_sub(UTP_HEADER)
                     .context("MTU too low")?,
             )
             .context("MTU too low")?;
@@ -477,7 +477,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     ack_nr: 0.into(),
                     extensions: Default::default(),
                 };
-                let mut buf = [0u8; UTP_HEADER_SIZE];
+                let mut buf = [0u8; UTP_HEADER];
                 header.serialize(&mut buf).unwrap();
                 match self.socket.transport.send_to(&buf, addr).await {
                     Ok(len) if len == buf.len() => {}

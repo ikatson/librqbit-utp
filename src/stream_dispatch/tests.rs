@@ -10,7 +10,7 @@ use tokio::{
 use tracing::trace;
 
 use crate::{
-    constants::{IPV4_HEADER, MIN_UDP_HEADER, UTP_HEADER_SIZE},
+    constants::{IP_HEADER, UDP_HEADER, UTP_HEADER},
     message::UtpMessage,
     raw::{selective_ack::SelectiveAck, Type::*, UtpHeader},
     seq_nr::SeqNr,
@@ -28,7 +28,7 @@ fn make_msg(header: UtpHeader, payload: &str) -> UtpMessage {
 }
 
 const fn calc_mtu_for_mss(mss: usize) -> usize {
-    mss + UTP_HEADER_SIZE + MIN_UDP_HEADER + IPV4_HEADER
+    mss + UTP_HEADER + UDP_HEADER + IP_HEADER
 }
 
 struct TestVsock {

@@ -8,9 +8,10 @@ use std::{
 
 use tracing::Level;
 
-pub const IPV4_HEADER: usize = 20;
-pub const MIN_UDP_HEADER: usize = 8;
-pub const UTP_HEADER_SIZE: usize = 20;
+// TODO: this is set to 40 to support IPv6. Do this better, and split per impl.
+pub const IP_HEADER: usize = 40;
+pub const UDP_HEADER: usize = 8;
+pub const UTP_HEADER: usize = 20;
 
 // This is used to calculate the packet pool sizes.
 pub const DEFAULT_INCOMING_MTU: usize = 1520;

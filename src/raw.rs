@@ -5,7 +5,7 @@ use anyhow::{bail, Context};
 
 use tracing::{debug, trace};
 
-use crate::{constants::UTP_HEADER_SIZE, seq_nr::SeqNr};
+use crate::{constants::UTP_HEADER, seq_nr::SeqNr};
 
 const NO_NEXT_EXT: u8 = 0;
 const EXT_SELECTIVE_ACK: u8 = 1;
@@ -93,7 +93,7 @@ impl UtpHeader {
     }
 
     pub fn serialize(&self, buffer: &mut [u8]) -> anyhow::Result<usize> {
-        if buffer.len() < UTP_HEADER_SIZE {
+        if buffer.len() < UTP_HEADER {
             bail!("too small buffer");
         }
         const VERSION: u8 = 1;
@@ -152,7 +152,7 @@ impl UtpHeader {
 
     pub fn deserialize(orig_buffer: &[u8]) -> Option<(Self, usize)> {
         let mut buffer = orig_buffer;
-        if buffer.len() < UTP_HEADER_SIZE {
+        if buffer.len() < UTP_HEADER {
             return None;
         }
         let mut header = UtpHeader::default();
@@ -173,7 +173,7 @@ impl UtpHeader {
         header.seq_nr = u16::from_be_bytes(buffer[16..18].try_into().unwrap()).into();
         header.ack_nr = u16::from_be_bytes(buffer[18..20].try_into().unwrap()).into();
 
-        buffer = &buffer[UTP_HEADER_SIZE..];
+        buffer = &buffer[UTP_HEADER..];
 
         let mut total_ext_size = 0usize;
 
@@ -207,7 +207,7 @@ impl UtpHeader {
             buffer = buffer.get(2 + ext_len..)?;
         }
 
-        Some((header, UTP_HEADER_SIZE + total_ext_size))
+        Some((header, UTP_HEADER + total_ext_size))
     }
 }
 
