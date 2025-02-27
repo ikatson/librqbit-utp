@@ -6,10 +6,7 @@ use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
 pub fn update_optional_waker(waker: &mut Option<Waker>, cx: &std::task::Context<'_>) {
     match waker.as_mut() {
         Some(w) => {
-            if w.will_wake(cx.waker()) {
-                return;
-            }
-            *w = cx.waker().clone();
+            w.clone_from(cx.waker());
         }
         None => {
             waker.replace(cx.waker().clone());

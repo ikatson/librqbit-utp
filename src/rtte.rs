@@ -24,6 +24,15 @@ fn calc_rto(srtt: Duration, rttvar: Duration) -> Duration {
 
 const K: u32 = 4;
 
+// TODO: this was stabilized in Rust 1.81. Remove some time later.
+fn duration_abs_diff(dur: Duration, other: Duration) -> Duration {
+    if let Some(res) = dur.checked_sub(other) {
+        res
+    } else {
+        other.checked_sub(dur).unwrap()
+    }
+}
+
 #[derive(Clone, Copy)]
 enum RttState {
     Initial {
@@ -115,7 +124,7 @@ impl RttEstimator {
                 // alpha = 1/8
                 // beta = 1/4
 
-                *rttvar = *rttvar * 3 / 4 + srtt.abs_diff(new_rtt) / 4;
+                *rttvar = *rttvar * 3 / 4 + duration_abs_diff(*srtt, new_rtt) / 4;
                 *srtt = (*srtt * 7 + new_rtt) / 8;
                 *rto = calc_rto(*srtt, *rttvar);
             }
