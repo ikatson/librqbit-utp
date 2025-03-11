@@ -33,6 +33,7 @@ ringbuf = "0.4.7"
 metrics = { version = "0.24.1", optional = true }
 lazy_static = "1.5.0"
 socket2 = "0.5.8"
+dontfrag = { version = "1.0.1", features = ["tokio"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

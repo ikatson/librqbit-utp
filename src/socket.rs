@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use dontfrag::UdpSocketExt;
 use rustc_hash::FxHashMap as HashMap;
 use tokio_util::sync::CancellationToken;
 
@@ -18,7 +19,7 @@ use crate::{
     constants::{
         DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET, DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK,
         DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK, DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IPV4_HEADER,
-        IPV6_HEADER, UDP_HEADER, UTP_HEADER,
+        UDP_HEADER, UTP_HEADER,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -694,6 +695,14 @@ impl UtpSocketUdp {
         let mut sock = tokio::net::UdpSocket::bind(bind_addr)
             .await
             .context("error binding")?;
+
+        if bind_addr.is_ipv4() {
+            if let Err(e) = sock.set_dontfrag_v4(true) {
+                warn!("error setting IPV4_DONTFRAG: {e:#}");
+            }
+        } else if let Err(e) = sock.set_dontfrag_v6(true) {
+            debug!("error setting IPV6_DONTFRAG: {e:#}");
+        }
 
         if let Some(so_recvbuf) = opts.udp_socket_rx_bufsize_bytes {
             sock = set_udp_rcvbuf(sock, so_recvbuf)?;
