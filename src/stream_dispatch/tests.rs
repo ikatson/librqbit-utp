@@ -311,7 +311,7 @@ async fn test_sends_up_to_remote_window_only_multi_msg() {
     t.send_msg(
         UtpHeader {
             htype: ST_STATE,
-            seq_nr: 0.into(),
+            seq_nr: 1.into(),
             ack_nr: 100.into(),
             // This is enough to send "hello" in 3 messages
             wnd_size: 5,
