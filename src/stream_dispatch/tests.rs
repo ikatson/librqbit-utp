@@ -1709,7 +1709,7 @@ async fn test_selective_ack_retransmission() {
     // Send selective ACK indicating second packet was received but first wasn't
     let header = UtpHeader {
         htype: ST_STATE,
-        seq_nr: 0.into(),
+        seq_nr: 1.into(),
         ack_nr: 100.into(), // ACK previous packet
         wnd_size: 1024,
         extensions: crate::raw::Extensions {
@@ -1741,7 +1741,7 @@ async fn test_selective_ack_retransmission() {
     t.send_msg(
         UtpHeader {
             htype: ST_STATE,
-            seq_nr: 0.into(),
+            seq_nr: 1.into(),
             ack_nr: 101.into(),
             wnd_size: 1024,
             ..Default::default()
@@ -3009,7 +3009,7 @@ async fn test_mtu_probing() {
             )
         );
         if mtu as usize > FAKE_MTU_LIMIT {
-            t.env.increment_now(t.vsock.rtte.roundtrip_time());
+            t.env.increment_now(t.vsock.rtte.retransmission_timeout());
         } else {
             t.send_msg(
                 UtpHeader {
