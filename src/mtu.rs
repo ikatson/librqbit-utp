@@ -1,4 +1,4 @@
-use crate::constants::{UDP_HEADER, UTP_HEADER};
+use crate::constants::{IPV4_HEADER, IPV6_HEADER, UDP_HEADER, UTP_HEADER};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentSizes {
@@ -8,7 +8,7 @@ pub struct SegmentSizes {
 
 impl SegmentSizes {
     pub fn new(is_ipv4: bool, link_mtu: u16) -> Self {
-        let ip_header_size = if is_ipv4 { 20 } else { 40 };
+        let ip_header_size = if is_ipv4 { IPV4_HEADER } else { IPV6_HEADER };
         let default_min_mtu = if is_ipv4 { 576 } else { 1280 };
 
         let calc = |mtu: u16| mtu - ip_header_size - UTP_HEADER - UDP_HEADER;

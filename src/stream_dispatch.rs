@@ -684,7 +684,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 // In case the retransmit timer expired, this is not "real" expiry, but expiry due to us sending
                 // too large segment. So ignore the retransmit timer, pretend it didn't fire.
                 self.timers.retransmit.turn_off();
-                self.last_sent_seq_nr = rewind_to;
+                if self.last_sent_seq_nr > rewind_to {
+                    self.last_sent_seq_nr = rewind_to;
+                }
                 self.segment_sizes.on_probe_expired(payload_size);
             }
             PopExpiredProbe::NotExpired => {

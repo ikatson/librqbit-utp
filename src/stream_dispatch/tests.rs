@@ -2990,18 +2990,18 @@ async fn test_mtu_probing() {
         1280, // it shouldn't try increasing again as it's different only by 1
     ];
 
-    w.write_all(make_payload(10000).as_bytes()).await.unwrap();
+    w.write_all(make_payload(20000).as_bytes()).await.unwrap();
     for mtu in EXPECTED_MTU_LENGTHS.iter().copied() {
         let expected_payload_len = (mtu - IPV4_HEADER - UTP_HEADER - UDP_HEADER) as usize;
         trace!(mtu, expected_payload_len);
         t.poll_once_assert_pending().await;
         let sent = t.take_sent();
         assert_eq!(
-            sent,
-            vec![cmphead!(
+            *sent.last().unwrap(),
+            cmphead!(
                 ST_DATA,
                 payload = make_payload((mtu - IPV4_HEADER - UTP_HEADER - UDP_HEADER) as usize)
-            )]
+            )
         );
         if mtu as usize > FAKE_MTU_LIMIT {
             t.env.increment_now(t.vsock.rtte.roundtrip_time());
