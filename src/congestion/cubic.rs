@@ -68,7 +68,7 @@ impl Cubic {
 
 impl CongestionController for Cubic {
     fn window(&self) -> usize {
-        (self.cwnd.min(self.rwnd) * self.mss as f64) as usize
+        (self.cwnd.max(2.).min(self.rwnd) * self.mss as f64) as usize
     }
 
     fn sshthresh(&self) -> usize {
