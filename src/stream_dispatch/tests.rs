@@ -299,6 +299,11 @@ async fn test_sends_up_to_remote_window_only_multi_msg() {
     assert_eq!(t.take_sent().len(), 1); // syn ack
     assert_eq!(t.vsock.last_remote_window, 0);
 
+    // Hack: force congestion controller to have a larger window than 2 * MSS (4).
+    t.vsock.congestion_controller.set_remote_window(5);
+    t.vsock.congestion_controller.on_recovered(10000, 10000);
+    assert_eq!(t.vsock.congestion_controller.window(), 5);
+
     t.stream
         .as_mut()
         .unwrap()
