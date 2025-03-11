@@ -154,6 +154,7 @@ impl CongestionController for Cubic {
             self.ssthresh *= rescale;
             self.w_max *= rescale;
             self.w_max_last *= rescale;
+            self.mss = mss;
         }
     }
 }

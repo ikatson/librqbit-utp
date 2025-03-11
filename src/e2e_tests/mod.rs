@@ -13,7 +13,7 @@ use tokio::{
 };
 use tracing::{error_span, info, Instrument};
 
-use crate::{test_util::setup_test_logging, UtpSocketUdp};
+use crate::{test_util::setup_test_logging, SocketOpts, UtpSocketUdp};
 
 trait AcceptConnect {
     async fn bind(addr: SocketAddr) -> Self;
@@ -32,7 +32,18 @@ impl AcceptConnect for Arc<UtpSocketUdp> {
     }
 
     async fn bind(addr: SocketAddr) -> Self {
-        UtpSocketUdp::new_udp(addr).await.unwrap()
+        UtpSocketUdp::new_udp_with_opts(
+            addr,
+            SocketOpts {
+                congestion: crate::CongestionConfig {
+                    tracing: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
     }
 }
 

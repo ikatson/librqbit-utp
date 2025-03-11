@@ -718,7 +718,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.last_remote_window
         );
 
-        let rtt = self.rtte.roundtrip_time();
+        let rto = self.rtte.retransmission_timeout();
 
         while remaining > 0 && remote_window_remaining > 0 {
             let ss = self.segment_sizes.next_probe();
@@ -738,7 +738,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             let probe_expiry_time = if payload_size > min_ss as usize {
-                Some(self.this_poll.now + rtt)
+                Some(self.this_poll.now + rto)
             } else {
                 None
             };
@@ -1049,6 +1049,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         };
         self.segment_sizes
             .on_payload_delivered(result.on_ack_result.max_acked_payload_size);
+        self.congestion_controller
+            .set_mss(self.segment_sizes.mss() as usize);
 
         // Update RTT and RTO if not in recovery. In recovery we get very delayed info
         // for packets beyond sack depth.
@@ -1114,6 +1116,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 let hdr = msg.header;
 
                 self.segment_sizes.on_payload_delivered(msg.payload().len());
+                self.congestion_controller
+                    .set_mss(self.segment_sizes.mss() as usize);
 
                 match self
                     .user_rx

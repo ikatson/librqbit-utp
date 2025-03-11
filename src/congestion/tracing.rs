@@ -82,6 +82,12 @@ where
     }
 
     fn set_mss(&mut self, mss: usize) {
-        self.inner.set_mss(mss);
+        log_if_changed!(
+            CONGESTION_TRACING_LOG_LEVEL,
+            "set_mss",
+            self,
+            |s| s.inner,
+            |s| s.inner.set_mss(mss)
+        );
     }
 }
