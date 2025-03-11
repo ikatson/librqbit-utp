@@ -1,7 +1,7 @@
 mod rto;
 mod rtte;
 
-use std::{future::poll_fn, num::NonZeroUsize, pin::Pin, sync::Arc, task::Poll, time::Duration};
+use std::{future::poll_fn, pin::Pin, sync::Arc, task::Poll, time::Duration};
 
 use anyhow::Context;
 use futures::FutureExt;
@@ -13,7 +13,7 @@ use tokio::{
 use tracing::trace;
 
 use crate::{
-    constants::{IP_HEADER, UDP_HEADER, UTP_HEADER},
+    constants::{UDP_HEADER, UTP_HEADER},
     message::UtpMessage,
     raw::{selective_ack::SelectiveAck, Type::*, UtpHeader},
     seq_nr::SeqNr,
@@ -31,7 +31,8 @@ fn make_msg(header: UtpHeader, payload: &str) -> UtpMessage {
 }
 
 const fn calc_mtu_for_mss(mss: usize) -> usize {
-    mss + UTP_HEADER + UDP_HEADER + IP_HEADER
+    const IP_HEADER: usize = 20;
+    mss + UTP_HEADER as usize + UDP_HEADER as usize + IP_HEADER
 }
 
 struct TestVsock {
@@ -287,8 +288,13 @@ async fn test_sends_up_to_remote_window_only_single_msg() {
 #[tokio::test]
 async fn test_sends_up_to_remote_window_only_multi_msg() {
     setup_test_logging();
-    let mut t = make_test_vsock(Default::default(), true);
-    t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(2).unwrap();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(calc_mtu_for_mss(2)),
+            ..Default::default()
+        },
+        true,
+    );
     t.poll_once_assert_pending().await;
     assert_eq!(t.take_sent().len(), 1); // syn ack
     assert_eq!(t.vsock.last_remote_window, 0);
@@ -375,8 +381,13 @@ async fn test_basic_retransmission() {
 #[tokio::test]
 async fn test_fast_retransmit() {
     setup_test_logging();
-    let mut t = make_test_vsock(Default::default(), false);
-    t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(5).unwrap();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(calc_mtu_for_mss(5)),
+            ..Default::default()
+        },
+        false,
+    );
 
     // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
     t.vsock.rtte.force_timeout(Duration::from_secs(10));
@@ -685,12 +696,17 @@ async fn test_out_of_order_delivery() {
 #[tokio::test]
 async fn test_nagle_algorithm() {
     setup_test_logging();
-    let mut t = make_test_vsock(Default::default(), false);
+    let mut t = make_test_vsock(
+        SocketOpts {
+            // Set a large max payload size to ensure we're testing Nagle, not segmentation
+            link_mtu: Some(calc_mtu_for_mss(1024)),
+            ..Default::default()
+        },
+        false,
+    );
 
     // Enable Nagle (should be on by default, but let's be explicit)
     t.vsock.socket_opts.nagle = true;
-    // Set a large max payload size to ensure we're testing Nagle, not segmentation
-    t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(1024).unwrap();
 
     // Allow sending by setting window size
     t.send_msg(
@@ -1258,8 +1274,13 @@ async fn test_congestion_control_basics() {
 #[tokio::test]
 async fn test_duplicate_ack_only_on_st_state() {
     setup_test_logging();
-    let mut t = make_test_vsock(Default::default(), false);
-    t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(5).unwrap();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(calc_mtu_for_mss(5)),
+            ..Default::default()
+        },
+        false,
+    );
 
     // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
     t.vsock.rtte.force_timeout(Duration::from_secs(10));
@@ -1360,8 +1381,13 @@ async fn test_duplicate_ack_only_on_st_state() {
 #[tokio::test]
 async fn test_finack_not_sent_until_all_data_consumed() {
     setup_test_logging();
-    let mut t = make_test_vsock(Default::default(), false);
-    t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(5).unwrap();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(calc_mtu_for_mss(5)),
+            ..Default::default()
+        },
+        false,
+    );
 
     // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
     t.vsock.rtte.force_timeout(Duration::from_secs(10));
@@ -1423,7 +1449,7 @@ async fn test_flow_control() {
 
     // Configure socket with small buffers to test flow control
     let opts = SocketOpts {
-        mtu: Some(calc_mtu_for_mss(5)),
+        link_mtu: Some(calc_mtu_for_mss(5)),
         vsock_rx_bufsize_bytes: Some(25), // Small receive buffer (~5 packets of size 5)
         ..Default::default()
     };
@@ -1648,12 +1674,11 @@ async fn test_selective_ack_retransmission() {
     setup_test_logging();
     let mut t = make_test_vsock(
         SocketOpts {
-            mtu: Some(calc_mtu_for_mss(5)),
+            link_mtu: Some(calc_mtu_for_mss(5)),
             ..Default::default()
         },
         false,
     );
-    t.vsock.socket_opts.max_outgoing_payload_size = NonZeroUsize::new(5).unwrap();
 
     const FORCED_RETRANSMISSION_TIME: Duration = Duration::from_secs(1);
     t.vsock.rtte.force_timeout(FORCED_RETRANSMISSION_TIME);
@@ -1882,12 +1907,11 @@ async fn test_window_update_sent_when_window_less_than_mss() {
     let mss = 5;
     let opts = SocketOpts {
         vsock_rx_bufsize_bytes: Some(mss * 2),
-        mtu: Some(calc_mtu_for_mss(mss)),
+        link_mtu: Some(calc_mtu_for_mss(mss)),
         ..Default::default()
     };
 
     let mut t = make_test_vsock(opts, false);
-    assert_eq!(t.vsock.socket_opts.max_incoming_payload_size.get(), mss);
 
     // Fill buffer to just under MSS to get a small window
     t.send_data(1, t.vsock.seq_nr, "aaaaa");
@@ -1943,7 +1967,7 @@ async fn test_window_update_ack_after_read_with_waking() {
     let mss = 5;
     let opts = SocketOpts {
         vsock_rx_bufsize_bytes: Some(mss * 2),
-        mtu: Some(calc_mtu_for_mss(5)),
+        link_mtu: Some(calc_mtu_for_mss(5)),
         ..Default::default()
     };
 
@@ -2794,7 +2818,7 @@ async fn test_rto_not_stuck_in_congestion_control() {
     const MSS: usize = 5;
     let mut t = make_test_vsock(
         SocketOpts {
-            mtu: Some(calc_mtu_for_mss(MSS)),
+            link_mtu: Some(calc_mtu_for_mss(MSS)),
             congestion: crate::CongestionConfig {
                 tracing: true,
                 ..Default::default()

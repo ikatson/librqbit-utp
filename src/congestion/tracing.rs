@@ -80,4 +80,8 @@ where
     fn smss(&self) -> usize {
         self.inner.smss()
     }
+
+    fn set_mss(&mut self, mss: usize) {
+        self.inner.set_mss(mss);
+    }
 }

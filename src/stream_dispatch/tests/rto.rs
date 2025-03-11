@@ -18,7 +18,7 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
     const MSS: usize = 1;
     let mut t = make_test_vsock(
         SocketOpts {
-            mtu: Some(calc_mtu_for_mss(MSS)),
+            link_mtu: Some(calc_mtu_for_mss(MSS)),
             ..Default::default()
         },
         false,
@@ -160,7 +160,7 @@ async fn test_rto_single_packet_retransmission_smaller_than_mss() {
     setup_test_logging();
     let mut t = make_test_vsock(
         SocketOpts {
-            mtu: Some(calc_mtu_for_mss(5)),
+            link_mtu: Some(calc_mtu_for_mss(5)),
             disable_nagle: true,
             ..Default::default()
         },

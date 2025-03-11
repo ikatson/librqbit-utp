@@ -26,6 +26,8 @@ pub struct Segment {
     is_delivered: bool,
     sent: SentStatus,
 
+    mtu_probe_expiry: Option<Instant>,
+
     // IsLost() from rfc6675
     is_lost: bool,
     is_expired: bool,
@@ -64,7 +66,6 @@ pub struct Segments {
     segments: VecDeque<Segment>,
     // This is including unsent. So it's not FlightSize
     len_bytes: usize,
-    capacity: usize,
 
     // absolute offset in bytes since creation.
     offset: u64,
@@ -158,6 +159,8 @@ pub struct OnAckResult {
     // How many bytes we can remove from the beginning of TX queue.
     pub acked_bytes: usize,
 
+    pub max_acked_payload_size: usize,
+
     // How many segments in TX queue were marked delivered by SACK.
     pub newly_sacked_segment_count: usize,
 
@@ -202,8 +205,14 @@ impl std::fmt::Debug for Pipe {
     }
 }
 
+pub enum PopExpiredProbe {
+    Expired(usize),
+    NotExpired,
+    Empty,
+}
+
 impl Segments {
-    pub fn new(snd_una: SeqNr, tx_bytes: usize, smss: usize) -> Self {
+    pub fn new(snd_una: SeqNr) -> Self {
         Segments {
             segments: VecDeque::new(),
             // TODO: store total sacked (marked delivered through sack)
@@ -211,7 +220,6 @@ impl Segments {
             offset: 0,
             removed_offset: 0,
             sack_depth: 0,
-            capacity: tx_bytes / smss,
             last_sack_empty: false,
             snd_una,
         }
@@ -254,20 +262,13 @@ impl Segments {
         self.segments.is_empty()
     }
 
-    #[allow(unused)]
-    pub fn is_full(&self) -> bool {
-        self.segments.len() == self.capacity
-    }
-
     #[must_use]
-    pub fn enqueue(&mut self, payload_len: usize) -> bool {
-        if self.segments.len() == self.capacity {
-            return false;
-        }
+    pub fn enqueue(&mut self, payload_len: usize, mtu_probe_expiry: Option<Instant>) -> bool {
         self.segments.push_back(Segment {
             payload_size: payload_len,
             payload_offset_absolute: self.offset,
             is_delivered: false,
+            mtu_probe_expiry,
             sent: SentStatus::NotSent,
             is_lost: false,
             is_expired: false,
@@ -278,10 +279,31 @@ impl Segments {
         true
     }
 
+    pub fn pop_expired_mtu_probe(&mut self, now: Instant) -> PopExpiredProbe {
+        match self.segments.pop_back() {
+            Some(s) => match s.mtu_probe_expiry {
+                _ if s.is_delivered => {
+                    self.segments.push_back(s);
+                    PopExpiredProbe::Empty
+                }
+                Some(expires) if expires <= now => PopExpiredProbe::Expired(s.payload_size),
+                Some(_) => {
+                    self.segments.push_back(s);
+                    PopExpiredProbe::NotExpired
+                }
+                None => {
+                    self.segments.push_back(s);
+                    PopExpiredProbe::Empty
+                }
+            },
+            None => PopExpiredProbe::Empty,
+        }
+    }
+
     #[allow(unused)]
     pub fn stats(&self) -> impl std::fmt::Debug {
         // this is for debugging only
-        format!("headers: {}/{}", self.segments.len(), self.capacity)
+        format!("headers: {}", self.segments.len())
     }
 
     // Returns number of removed headers, and their comibined payload size.
@@ -290,6 +312,7 @@ impl Segments {
         let mut payload_size = 0;
         let mut newly_sacked_segment_count: usize = 0;
         let mut newly_sacked_byte_count: usize = 0;
+        let mut max_acked_payload_size: usize = 0;
 
         let mut new_rtt: Option<Duration> = None;
 
@@ -302,6 +325,7 @@ impl Segments {
                 payload_size += segment.payload_size;
                 self.snd_una += 1;
                 self.len_bytes -= segment.payload_size;
+                max_acked_payload_size = max_acked_payload_size.max(segment.payload_size);
             }
         }
 
@@ -318,6 +342,7 @@ impl Segments {
                     if !segment.is_delivered && is_sacked {
                         segment.is_delivered = true;
                         segment.update_rtt(now, &mut new_rtt);
+                        max_acked_payload_size = max_acked_payload_size.max(segment.payload_size);
                         newly_sacked_segment_count += 1;
                         newly_sacked_byte_count += segment.payload_size;
                     }
@@ -362,6 +387,7 @@ impl Segments {
         OnAckResult {
             acked_segments_count: removed,
             acked_bytes: payload_size,
+            max_acked_payload_size,
             newly_sacked_segment_count,
             newly_sacked_byte_count,
             new_rtt,
@@ -488,9 +514,9 @@ mod tests {
     use super::Segments;
 
     fn make_segments(start_seq_nr: u16, count: u16) -> Segments {
-        let mut ftx = Segments::new(start_seq_nr.into(), 64, 1);
+        let mut ftx = Segments::new(start_seq_nr.into());
         for _ in 0..count {
-            assert!(ftx.enqueue(1));
+            assert!(ftx.enqueue(1, None));
         }
 
         ftx
@@ -646,10 +672,10 @@ mod tests {
 
     #[test]
     fn test_iter_mut_offsets() {
-        let mut segs = Segments::new(0.into(), 1000, 10);
-        assert!(segs.enqueue(1));
-        assert!(segs.enqueue(2));
-        assert!(segs.enqueue(3));
+        let mut segs = Segments::new(0.into());
+        assert!(segs.enqueue(1, None));
+        assert!(segs.enqueue(2, None));
+        assert!(segs.enqueue(3, None));
 
         assert_eq!(
             segs.iter_mut_for_sending(None)
@@ -677,7 +703,7 @@ mod tests {
             vec![(1, 0, 2), (2, 2, 3)]
         );
 
-        assert!(segs.enqueue(4));
+        assert!(segs.enqueue(4, None));
         assert_eq!(
             segs.iter_mut_for_sending(None)
                 .map(|s| (s.seq_nr().0, s.payload_offset(), s.payload_size()))

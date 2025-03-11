@@ -1,6 +1,6 @@
 use std::{
     collections::{hash_map::Entry, VecDeque},
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     num::NonZeroUsize,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -16,10 +16,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     congestion::CongestionController,
     constants::{
-        DEFAULT_CONSERVATIVE_OUTGOING_MTU, DEFAULT_INCOMING_MTU,
         DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET, DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK,
-        DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK, DEFAULT_MTU_AUTODETECT_IP,
-        DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IP_HEADER, UDP_HEADER, UTP_HEADER,
+        DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK, DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IPV6_HEADER,
+        UDP_HEADER, UTP_HEADER,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -71,12 +70,7 @@ impl CongestionConfig {
 
 #[derive(Debug, Default, Clone)]
 pub struct SocketOpts {
-    /// The MTU to base calculations on. If not provided, will auto-detect.
-    pub mtu: Option<usize>,
-
-    /// If MTU is not provided, this address will be used to detect MTU
-    /// once.
-    pub mtu_autodetect_host: Option<IpAddr>,
+    pub link_mtu: Option<usize>,
 
     /// If set will try to send SO_RCVBUF option on the socket.
     /// If not set, will use OS default.
@@ -119,59 +113,6 @@ pub struct SocketOpts {
 
 impl SocketOpts {
     fn validate(&self) -> anyhow::Result<ValidatedSocketOpts> {
-        #[derive(Clone, Copy)]
-        struct MtuCalc {
-            max_packet_size: NonZeroUsize,
-            max_payload_size: NonZeroUsize,
-        }
-
-        fn calc(mtu: usize) -> anyhow::Result<MtuCalc> {
-            let max_packet_size = NonZeroUsize::new(
-                mtu.checked_sub(IP_HEADER)
-                    .context("MTU too low")?
-                    .checked_sub(UDP_HEADER)
-                    .context("MTU too low")?,
-            )
-            .context("max_packet_size == 0")?;
-            let max_payload_size = NonZeroUsize::new(
-                max_packet_size
-                    .get()
-                    .checked_sub(UTP_HEADER)
-                    .context("MTU too low")?,
-            )
-            .context("MTU too low")?;
-
-            Ok(MtuCalc {
-                max_packet_size,
-                max_payload_size,
-            })
-        }
-
-        let (incoming, outgoing) = match self.mtu {
-            Some(mtu) => {
-                let v = calc(mtu)?;
-                (v, v)
-            }
-            None => {
-                let autodetect_host = self
-                    .mtu_autodetect_host
-                    .unwrap_or(DEFAULT_MTU_AUTODETECT_IP);
-                match ::mtu::interface_and_mtu(autodetect_host) {
-                    Ok((iface, mtu)) => {
-                        trace!(?autodetect_host, iface, mtu, "autodetected MTU");
-                        let v = calc(mtu)?;
-                        (v, v)
-                    }
-                    Err(e) => {
-                        debug!(?autodetect_host, "error detecting MTU: {:#}", e);
-                        let incoming = calc(DEFAULT_INCOMING_MTU).unwrap();
-                        let outgoing = calc(DEFAULT_CONSERVATIVE_OUTGOING_MTU).unwrap();
-                        (incoming, outgoing)
-                    }
-                }
-            }
-        };
-
         let max_user_rx_buffered_bytes = NonZeroUsize::new(
             self.vsock_rx_bufsize_bytes
                 .unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK),
@@ -184,10 +125,15 @@ impl SocketOpts {
         )
         .context("invalid configuration: virtual_socket_tx_bytes = 0")?;
 
+        // 1500 is ethernet MTU.
+        let link_mtu = self.link_mtu.unwrap_or(1500);
+        let link_mtu: u16 = link_mtu.try_into().context("link mtu exceeds u16")?;
+        if link_mtu < IPV6_HEADER + UDP_HEADER + UTP_HEADER + 1 {
+            anyhow::bail!("provided link_mtu too low, not enough for even 1-byte packets");
+        }
+
         Ok(ValidatedSocketOpts {
-            max_incoming_packet_size: incoming.max_packet_size,
-            max_incoming_payload_size: incoming.max_payload_size,
-            max_outgoing_payload_size: outgoing.max_payload_size,
+            link_mtu,
             max_user_rx_buffered_bytes,
             virtual_socket_tx_bytes,
             nagle: !self.disable_nagle,
@@ -208,9 +154,7 @@ impl SocketOpts {
 
 #[derive(Clone)]
 pub(crate) struct ValidatedSocketOpts {
-    pub max_incoming_packet_size: NonZeroUsize,
-    pub max_incoming_payload_size: NonZeroUsize,
-    pub max_outgoing_payload_size: NonZeroUsize,
+    pub link_mtu: u16,
     pub max_user_rx_buffered_bytes: NonZeroUsize,
 
     pub virtual_socket_tx_bytes: NonZeroUsize,
@@ -477,7 +421,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     ack_nr: 0.into(),
                     extensions: Default::default(),
                 };
-                let mut buf = [0u8; UTP_HEADER];
+                let mut buf = [0u8; UTP_HEADER as usize];
                 header.serialize(&mut buf).unwrap();
                 match self.socket.transport.send_to(&buf, addr).await {
                     Ok(len) if len == buf.len() => {}

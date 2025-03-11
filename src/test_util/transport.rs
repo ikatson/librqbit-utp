@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     future::{poll_fn, Future},
-    net::{Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     sync::Arc,
     task::Poll,
 };
@@ -38,7 +38,6 @@ impl MockInterface {
         let env = self.env.clone();
 
         let opts = SocketOpts {
-            mtu_autodetect_host: Some(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST)),
             ..Default::default()
         };
 

@@ -93,7 +93,7 @@ impl UtpHeader {
     }
 
     pub fn serialize(&self, buffer: &mut [u8]) -> anyhow::Result<usize> {
-        if buffer.len() < UTP_HEADER {
+        if buffer.len() < UTP_HEADER as usize {
             bail!("too small buffer");
         }
         const VERSION: u8 = 1;
@@ -152,7 +152,7 @@ impl UtpHeader {
 
     pub fn deserialize(orig_buffer: &[u8]) -> Option<(Self, usize)> {
         let mut buffer = orig_buffer;
-        if buffer.len() < UTP_HEADER {
+        if buffer.len() < UTP_HEADER as usize {
             return None;
         }
         let mut header = UtpHeader::default();
@@ -173,7 +173,7 @@ impl UtpHeader {
         header.seq_nr = u16::from_be_bytes(buffer[16..18].try_into().unwrap()).into();
         header.ack_nr = u16::from_be_bytes(buffer[18..20].try_into().unwrap()).into();
 
-        buffer = &buffer[UTP_HEADER..];
+        buffer = &buffer[20..];
 
         let mut total_ext_size = 0usize;
 
@@ -207,7 +207,7 @@ impl UtpHeader {
             buffer = buffer.get(2 + ext_len..)?;
         }
 
-        Some((header, UTP_HEADER + total_ext_size))
+        Some((header, 20 + total_ext_size))
     }
 }
 

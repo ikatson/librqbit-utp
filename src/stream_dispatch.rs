@@ -4,6 +4,7 @@ mod tests;
 use std::{
     future::Future,
     net::SocketAddr,
+    num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
     task::Poll,
@@ -23,6 +24,7 @@ use crate::{
     },
     message::UtpMessage,
     metrics::METRICS,
+    mtu::SegmentSizes,
     raw::{Type, UtpHeader},
     recovery::Recovery,
     rtte::RttEstimator,
@@ -32,7 +34,7 @@ use crate::{
     stream::UtpStream,
     stream_rx::{AssemblerAddRemoveResult, UserRx},
     stream_tx::{UserTx, UtpStreamWriteHalf},
-    stream_tx_segments::{OnAckResult, Segments},
+    stream_tx_segments::{OnAckResult, PopExpiredProbe, Segments},
     traits::{Transport, UtpEnvironment},
     utils::{update_optional_waker, DropGuardSendBeforeDeath},
     UtpSocket,
@@ -181,6 +183,8 @@ struct VirtualSocket<T, Env> {
     // Unacked segments. Ready to send or retransmit.
     user_tx_segments: Segments,
 
+    segment_sizes: SegmentSizes,
+
     rtte: RttEstimator,
     congestion_controller: Box<dyn CongestionController>,
 
@@ -321,11 +325,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     // https://datatracker.ietf.org/doc/html/rfc9293#section-3.8.6.2.2
     fn rx_window(&self) -> u32 {
         let wnd = self.user_rx.remaining_rx_window() as u32;
-        if (wnd as usize) < self.socket_opts.max_incoming_payload_size.get() {
+        let rmss = self.segment_sizes.mss() as usize;
+        if (wnd as usize) < rmss {
             return 0;
         }
-        let rmss = self.socket_opts.max_incoming_payload_size.get() as u32;
-        wnd - (wnd % rmss)
+        wnd - (wnd % rmss as u32)
     }
 
     fn send_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
@@ -406,7 +410,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             let mut cwnd = rec.cwnd();
             let mut sent = 0;
-            let mss = self.socket_opts.max_outgoing_payload_size.get();
+            let mss = self.segment_sizes.mss() as usize;
             while rec.total_retransmitted_segments() == 0 || cwnd > mss {
                 let mut seg = match it.next() {
                     Some(seg) => seg,
@@ -668,6 +672,22 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(());
         }
 
+        match self
+            .user_tx_segments
+            .pop_expired_mtu_probe(self.this_poll.now)
+        {
+            PopExpiredProbe::Expired(size) => {
+                debug!(size, "MTU probe expired");
+                self.timers.retransmit.turn_off();
+                self.segment_sizes.on_probe_expired(size);
+            }
+            PopExpiredProbe::NotExpired => {
+                trace!("MTU probe hasnt expired yet");
+                return Ok(());
+            }
+            PopExpiredProbe::Empty => {}
+        }
+
         let segmented_len = self.user_tx_segments.total_len_bytes();
 
         if g.len() < self.user_tx_segments.total_len_bytes() {
@@ -690,12 +710,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.last_remote_window
         );
 
-        while !self.user_tx_segments.is_full() && remaining > 0 && remote_window_remaining > 0 {
-            let max_payload_size = self
-                .socket_opts
-                .max_outgoing_payload_size
-                .get()
-                .min(remote_window_remaining);
+        let rtt = self.rtte.roundtrip_time();
+
+        while remaining > 0 && remote_window_remaining > 0 {
+            let ss = self.segment_sizes.next_probe();
+            let min_ss = self.segment_sizes.mss();
+            let max_payload_size = (ss as usize).min(remote_window_remaining);
             let payload_size = max_payload_size.min(remaining);
 
             // Run Nagle algorithm to prevent sending too many small segments.
@@ -704,17 +724,30 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 let data_in_flight = !self.user_tx_segments.is_empty();
 
                 if self.socket_opts.nagle && !can_send_full_payload && data_in_flight {
-                    trace!(payload_size, max_payload_size, "nagle: buffering more data");
+                    trace!(max_payload_size, "nagle: buffering more data");
                     break;
                 }
             }
 
-            if !self.user_tx_segments.enqueue(payload_size) {
+            let probe_expiry_time = if payload_size > min_ss as usize {
+                Some(self.this_poll.now + rtt)
+            } else {
+                None
+            };
+
+            if !self
+                .user_tx_segments
+                .enqueue(payload_size, probe_expiry_time)
+            {
                 bail!("bug, can't enqueue next segment")
             }
             remaining -= payload_size;
             remote_window_remaining -= payload_size;
             trace!(bytes = payload_size, "segmented");
+
+            if probe_expiry_time.is_some() {
+                break;
+            }
         }
 
         trace!(
@@ -722,7 +755,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             remote_window_remaining,
             user_tx_segments_segments = self.user_tx_segments.total_len_packets(),
             user_tx_segments_bytes = self.user_tx_segments.total_len_bytes(),
-            user_tx_segments_full = self.user_tx_segments.is_full(),
             "split_tx_queue_into_segments finished",
         );
 
@@ -1007,6 +1039,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .user_tx_segments
                 .remove_up_to_ack(self.this_poll.now, &msg.header),
         };
+        self.segment_sizes
+            .on_payload_delivered(result.on_ack_result.max_acked_payload_size);
 
         // Update RTT and RTO if not in recovery. In recovery we get very delayed info
         // for packets beyond sack depth.
@@ -1071,6 +1105,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 let assembler_was_empty = self.user_rx.assembler_empty();
                 let hdr = msg.header;
 
+                self.segment_sizes.on_payload_delivered(msg.payload().len());
+
                 match self
                     .user_rx
                     .add_remove(cx, msg, offset as usize)
@@ -1120,8 +1156,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                 if !self.immediate_ack_to_transmit() && self.consumed_but_unacked_bytes > 0 {
                     let delay = if self.consumed_but_unacked_bytes
-                        >= SOFT_IMMEDIATE_ACK_EVERY_RMSS
-                            * self.socket_opts.max_incoming_payload_size.get()
+                        >= SOFT_IMMEDIATE_ACK_EVERY_RMSS * self.segment_sizes.mss() as usize
                     {
                         Duration::from_millis(1)
                     } else {
@@ -1158,14 +1193,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
         // if we need to send a window update, also send immediately.
         // TODO: this is clumsy, but should do the job in case the reader was fully flow controlled.
-        let rmss = self.socket_opts.max_incoming_payload_size.get() as u32;
+        // NOTE: relies on rx_window being clamped by mss
         let current = self.rx_window();
-        if current < rmss && self.last_sent_window >= rmss
-            || self.last_sent_window < rmss && current >= rmss
-        {
+        let changed = (current == 0) ^ (self.last_sent_window == 0);
+        if changed {
             trace!(
                 self.last_sent_window,
-                rmss,
                 current = self.rx_window(),
                 "need to send a window update"
             );
@@ -1179,12 +1212,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn immediate_ack_to_transmit(&self) -> bool {
         self.should_send_window_update()
             || self.consumed_but_unacked_bytes
-                >= HARD_IMMEDIATE_ACK_EVERY_RMSS * self.socket_opts.max_incoming_payload_size.get()
+                >= HARD_IMMEDIATE_ACK_EVERY_RMSS * self.segment_sizes.mss() as usize
     }
 
     fn force_immediate_ack(&mut self) {
-        self.consumed_but_unacked_bytes =
-            HARD_IMMEDIATE_ACK_EVERY_RMSS * self.socket_opts.max_incoming_payload_size.get();
+        self.consumed_but_unacked_bytes = usize::MAX;
     }
 
     fn ack_to_transmit(&self) -> bool {
@@ -1510,9 +1542,11 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             state,
         } = args;
 
+        let ss = SegmentSizes::new(remote.is_ipv4(), socket.opts().link_mtu);
+
         let (user_rx, read_half) = UserRx::build(
             socket.opts().max_user_rx_buffered_bytes,
-            socket.opts().max_incoming_payload_size,
+            NonZeroUsize::new(ss.mss() as usize).unwrap(),
         );
 
         let user_tx = UserTx::new(socket.opts().virtual_socket_tx_bytes);
@@ -1525,13 +1559,11 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
 
         let vsock = VirtualSocket {
             state,
+            segment_sizes: ss,
             env,
             socket_opts: socket.opts().clone(),
             congestion_controller: {
-                let mut ctrl = socket
-                    .opts()
-                    .congestion
-                    .create(now, socket.opts().max_incoming_payload_size.get());
+                let mut ctrl = socket.opts().congestion.create(now, ss.mss() as usize);
                 ctrl.set_remote_window(remote_window as usize);
                 ctrl
             },
@@ -1559,11 +1591,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             rto_retransmissions: 0,
             consumed_but_unacked_bytes: 0,
             rx,
-            user_tx_segments: Segments::new(
-                seq_nr,
-                socket.opts().virtual_socket_tx_bytes.get(),
-                socket.opts().max_outgoing_payload_size.get(),
-            ),
+            user_tx_segments: Segments::new(seq_nr),
             user_tx,
             rtte: {
                 let mut rtte = RttEstimator::default();
@@ -1574,7 +1602,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             },
             this_poll: ThisPoll {
                 now,
-                tmp_buf: vec![0u8; socket.opts().max_incoming_packet_size.get()],
+                tmp_buf: vec![0u8; ss.max_ss() as usize],
                 transport_pending: false,
             },
             parent_span,

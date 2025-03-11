@@ -12,6 +12,8 @@ pub trait CongestionController: Send + Sync + core::fmt::Debug {
 
     fn sshthresh(&self) -> usize;
 
+    fn set_mss(&mut self, mss: usize);
+
     fn smss(&self) -> usize;
 
     fn on_recovered(&mut self, new_cwnd_bytes: usize, new_sshthresh: usize);

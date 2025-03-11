@@ -14,7 +14,7 @@ async fn test_rtte_set_and_updated() {
     setup_test_logging();
     let mut t = make_test_vsock(
         SocketOpts {
-            mtu: Some(calc_mtu_for_mss(1)),
+            link_mtu: Some(calc_mtu_for_mss(1)),
             ..Default::default()
         },
         false,

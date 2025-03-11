@@ -145,6 +145,17 @@ impl CongestionController for Cubic {
     fn smss(&self) -> usize {
         self.mss
     }
+
+    // TODO: keep calculations in bytes not to rescale for simplicity?
+    fn set_mss(&mut self, mss: usize) {
+        if self.mss != mss {
+            let rescale = self.mss as f64 / mss as f64;
+            self.cwnd *= rescale;
+            self.ssthresh *= rescale;
+            self.w_max *= rescale;
+            self.w_max_last *= rescale;
+        }
+    }
 }
 
 // K is the number of seconds required to get back to w_max.

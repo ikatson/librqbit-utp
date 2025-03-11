@@ -1,20 +1,17 @@
 // TODO: make MTU configurable and auto-detectable,
 // or at least shrink it down for VPNs and other common shrink reasons.
 
-use std::{
-    net::{IpAddr, Ipv4Addr},
-    time::Duration,
-};
+use std::time::Duration;
 
 use tracing::Level;
 
-// TODO: this is set to 40 to support IPv6. Do this better, and split per impl.
-pub const IP_HEADER: usize = 40;
-pub const UDP_HEADER: usize = 8;
-pub const UTP_HEADER: usize = 20;
+#[allow(unused)]
+pub const IPV4_HEADER: u16 = 20;
+pub const IPV6_HEADER: u16 = 40;
 
-// This is used to calculate the packet pool sizes.
-pub const DEFAULT_INCOMING_MTU: usize = 1520;
+pub const UDP_HEADER: u16 = 8;
+pub const UTP_HEADER: u16 = 20;
+
 // By default, flow control (dropping incoming packets) starts after this
 // many bytes are unread in user's stream reader.
 pub const DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK: usize = 1024 * 1024;
@@ -22,9 +19,6 @@ pub const DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK: usize = 1024 * 1024;
 pub const DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK: usize = 1024 * 1024;
 // Outgoing MTU is autodetected using this IP. It's used to calculate the maximum uTP
 // segment size we can send.
-pub const DEFAULT_MTU_AUTODETECT_IP: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
-// This MTU is used in case it can't be autodetected. Very conservative to support VPNs / tunneling etc.
-pub const DEFAULT_CONSERVATIVE_OUTGOING_MTU: usize = 1280;
 
 // Delayed ACK timer. Linux has 40ms, so we set to it too.
 pub const ACK_DELAY: Duration = Duration::from_millis(40);
