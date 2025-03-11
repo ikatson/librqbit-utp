@@ -17,7 +17,8 @@ impl std::fmt::Debug for UtpMessage {
         if cfg!(test) {
             write!(
                 f,
-                ":payload={:?}",
+                ":payload_len={}:payload={:?}",
+                self.payload().len(),
                 std::str::from_utf8(self.payload()).unwrap()
             )
         } else {

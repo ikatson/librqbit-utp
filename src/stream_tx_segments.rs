@@ -206,7 +206,10 @@ impl std::fmt::Debug for Pipe {
 }
 
 pub enum PopExpiredProbe {
-    Expired(usize),
+    Expired {
+        rewind_to: SeqNr,
+        payload_size: usize,
+    },
     NotExpired,
     Empty,
 }
@@ -286,7 +289,10 @@ impl Segments {
                     self.segments.push_back(s);
                     PopExpiredProbe::Empty
                 }
-                Some(expires) if expires <= now => PopExpiredProbe::Expired(s.payload_size),
+                Some(expires) if expires <= now => PopExpiredProbe::Expired {
+                    payload_size: s.payload_size,
+                    rewind_to: self.snd_una + self.segments.len() as u16 - 1,
+                },
                 Some(_) => {
                     self.segments.push_back(s);
                     PopExpiredProbe::NotExpired

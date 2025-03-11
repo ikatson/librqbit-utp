@@ -676,10 +676,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .user_tx_segments
             .pop_expired_mtu_probe(self.this_poll.now)
         {
-            PopExpiredProbe::Expired(size) => {
-                debug!(size, "MTU probe expired");
+            PopExpiredProbe::Expired {
+                rewind_to,
+                payload_size,
+            } => {
+                debug!(payload_size, ?self.last_sent_seq_nr, ?rewind_to, "MTU probe expired");
+                // In case the retransmit timer expired, this is not "real" expiry, but expiry due to us sending
+                // too large segment. So ignore the retransmit timer, pretend it didn't fire.
                 self.timers.retransmit.turn_off();
-                self.segment_sizes.on_probe_expired(size);
+                self.last_sent_seq_nr = rewind_to;
+                self.segment_sizes.on_probe_expired(payload_size);
             }
             PopExpiredProbe::NotExpired => {
                 trace!("MTU probe hasnt expired yet");

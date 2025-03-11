@@ -28,6 +28,11 @@ impl std::fmt::Debug for CmpUtpHeader {
         w!(seq_nr);
         w!(ack_nr);
         w!(wnd_size);
+        write!(
+            f,
+            ":payload_len={}",
+            self.payload.as_ref().map(|p| p.len()).unwrap_or_default()
+        )?;
         w!(payload);
         Ok(())
     }
