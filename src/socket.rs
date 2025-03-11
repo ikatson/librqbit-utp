@@ -17,8 +17,8 @@ use crate::{
     congestion::CongestionController,
     constants::{
         DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET, DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK,
-        DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK, DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IPV6_HEADER,
-        UDP_HEADER, UTP_HEADER,
+        DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK, DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IPV4_HEADER,
+        IPV6_HEADER, UDP_HEADER, UTP_HEADER,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -128,8 +128,9 @@ impl SocketOpts {
         // 1500 is ethernet MTU.
         let link_mtu = self.link_mtu.unwrap_or(1500);
         let link_mtu: u16 = link_mtu.try_into().context("link mtu exceeds u16")?;
-        if link_mtu < IPV6_HEADER + UDP_HEADER + UTP_HEADER + 1 {
-            anyhow::bail!("provided link_mtu too low, not enough for even 1-byte packets");
+        let min_mtu = IPV4_HEADER + UDP_HEADER + UTP_HEADER + 1;
+        if link_mtu < min_mtu {
+            anyhow::bail!("provided link_mtu ({link_mtu}) too low, not enough for even 1-byte IPv4 packets (min {min_mtu})");
         }
 
         Ok(ValidatedSocketOpts {

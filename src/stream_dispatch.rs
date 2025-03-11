@@ -20,7 +20,7 @@ use crate::{
     congestion::CongestionController,
     constants::{
         calc_pipe_expiry, ACK_DELAY, HARD_IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL,
-        RTTE_TRACING_LOG_LEVEL, SOFT_IMMEDIATE_ACK_EVERY_RMSS, SYNACK_RESEND_INTERNAL,
+        RTTE_TRACING_LOG_LEVEL, SOFT_IMMEDIATE_ACK_EVERY_RMSS, SYNACK_RESEND_INTERNAL, UTP_HEADER,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -1128,7 +1128,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         }
 
                         self.last_consumed_remote_seq_nr += sequence_numbers as u16;
-                        self.consumed_but_unacked_bytes += bytes;
+                        self.consumed_but_unacked_bytes =
+                            self.consumed_but_unacked_bytes.saturating_add(bytes);
                         trace!(self.consumed_but_unacked_bytes);
                     }
                     AssemblerAddRemoveResult::Unavailable(_) => {
@@ -1602,7 +1603,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             },
             this_poll: ThisPoll {
                 now,
-                tmp_buf: vec![0u8; ss.max_ss() as usize],
+                tmp_buf: vec![0u8; (ss.max_ss() + UTP_HEADER) as usize],
                 transport_pending: false,
             },
             parent_span,

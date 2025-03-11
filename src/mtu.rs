@@ -9,15 +9,14 @@ pub struct SegmentSizes {
 impl SegmentSizes {
     pub fn new(is_ipv4: bool, link_mtu: u16) -> Self {
         let ip_header_size = if is_ipv4 { 20 } else { 40 };
-        let min_mtu = if is_ipv4 { 576 } else { 1280 };
+        let default_min_mtu = if is_ipv4 { 576 } else { 1280 };
 
-        let calc = |ss: u16| ss - ip_header_size - UTP_HEADER - UDP_HEADER;
+        let calc = |mtu: u16| mtu - ip_header_size - UTP_HEADER - UDP_HEADER;
 
-        let min_possible_mtu = ip_header_size + UDP_HEADER + UTP_HEADER + 1;
         // If the user provided too small MTU, clamp it up to 1 byte.
-        let lmtu = link_mtu.max(min_possible_mtu);
-        let min_mtu = min_mtu.min(lmtu);
-        let max_mtu = lmtu;
+        let link_mtu = link_mtu.max(ip_header_size + UDP_HEADER + UTP_HEADER + 1);
+        let min_mtu = default_min_mtu.min(link_mtu);
+        let max_mtu = link_mtu;
 
         let min_ss = calc(min_mtu);
         let max_ss = calc(max_mtu);
