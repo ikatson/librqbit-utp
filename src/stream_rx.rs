@@ -1,3 +1,12 @@
+/// The receiving side of uTP stream abstraction.
+///
+/// Users read from UtpStreamReadHalf. When there's nothing more to read
+/// the task waits until the dispatcher puts more data in there.
+///
+/// Messages are assembled from out of order here too.
+///
+/// The dispatcher puts data here via add_remove(). If the messages were in-order, or
+/// became ready for in-order delivery, they'll get put into UtpStreamReadHalf.
 use std::{
     collections::VecDeque,
     num::NonZeroUsize,
@@ -317,6 +326,8 @@ impl UserRx {
         self.shared.locked.lock().reader_dropped
     }
 
+    /// How many bytes does the user half have available. If the user is not reading, and the buffer is filled up,
+    /// this will be 0.
     pub fn remaining_rx_window(&self) -> usize {
         if self.is_reader_dropped() {
             0
@@ -326,6 +337,7 @@ impl UserRx {
         }
     }
 
+    /// Inform the read half that the socket is closed - there will be no more data.
     pub fn mark_vsock_closed(&self) {
         let mut g = self.shared.locked.lock();
         if !g.vsock_closed {
@@ -339,6 +351,8 @@ impl UserRx {
         }
     }
 
+    /// Flush the outstanding messages to user read half.
+    /// Returns the number of bytes flushed.
     pub fn flush(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<usize> {
         let filled_front_bytes: usize = self.ooq.filled_front_bytes();
         let mut remaining_rx_window = {
@@ -395,6 +409,7 @@ impl UserRx {
         Ok(flushed_bytes)
     }
 
+    /// Enqueue an error into read half to be consumed by the user.
     pub fn enqueue_error(&self, msg: String) {
         let mut g = self.shared.locked.lock();
         g.queue.push_back(UserRxMessage::Error(msg));
@@ -405,6 +420,7 @@ impl UserRx {
         }
     }
 
+    /// Generate a selective ACK message if there are out of order packets.
     pub fn selective_ack(&self) -> Option<SelectiveAck> {
         self.ooq.selective_ack()
     }
@@ -414,15 +430,19 @@ impl UserRx {
         self.shared.locked.lock().queue.len_bytes()
     }
 
+    /// Is assembler empty
     pub fn assembler_empty(&self) -> bool {
         self.ooq.is_empty()
     }
 
+    /// How many packets does ooq have
     #[cfg(test)]
     pub fn assembler_packets(&self) -> usize {
         self.ooq.stored_packets()
     }
 
+    /// The main function for the dispatcher - gets called when new data arrives at a particular offset.
+    /// It's lazy - doesn't flush right away for performance. The caller needs to flush() periodically.
     pub fn add_remove(
         &mut self,
         cx: &mut std::task::Context<'_>,

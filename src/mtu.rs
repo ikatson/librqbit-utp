@@ -1,8 +1,13 @@
+// Calculations for payload sizes that we should be sending, based on MTU and successfully
+// delivered payloads so far. Binary searches (probes) the payload size until convergence.
 use crate::constants::{IPV4_HEADER, IPV6_HEADER, UDP_HEADER, UTP_HEADER};
 
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentSizes {
+    // The minimum uTP payload size that we know can go through the link.
     min_ss: u16,
+    // The maximum uTP payload size to probe for. Calculated from link MTU
+    // (default 1500, ethernet)
     max_ss: u16,
 }
 

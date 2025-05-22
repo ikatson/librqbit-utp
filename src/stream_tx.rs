@@ -1,3 +1,5 @@
+/// The user-facing writer side for uTP stream (UtpStreamWriteHalf).
+/// The user calls AsyncWrite on it to write the data to the stream.
 use std::{
     num::NonZeroUsize,
     sync::Arc,
@@ -87,6 +89,7 @@ impl UserTxLocked {
     }
 }
 
+/// The shared data between dispatcher and UtpStreamWriteHalf.
 pub struct UserTx {
     pub locked: Mutex<UserTxLocked>,
 }

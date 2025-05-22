@@ -684,6 +684,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 // In case the retransmit timer expired, this is not "real" expiry, but expiry due to us sending
                 // too large segment. So ignore the retransmit timer, pretend it didn't fire.
                 self.timers.retransmit.turn_off();
+
+                // TODO: do we need to IF here? Maybe min instead?
                 if self.last_sent_seq_nr > rewind_to {
                     self.last_sent_seq_nr = rewind_to;
                 }
@@ -769,6 +771,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(())
     }
 
+    /// Before dying, ensure cleanup and notifications are done.
     fn just_before_death(
         &mut self,
         cx: &mut std::task::Context<'_>,
@@ -1288,6 +1291,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .min(pipe_expiry_timer)
     }
 
+    /// If this is an incoming connection, send back an ACK.
     fn maybe_send_syn_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
         let sent_count = match self.state {
             VirtualSocketState::SynReceived => 0,
@@ -1353,12 +1357,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         const MAX_ITERS: usize = 2;
 
         for _ in 0..MAX_ITERS {
+            // If this is an incoming connection, send back an ACK.
             pending_if_cannot_send!(self.maybe_send_syn_ack(cx));
 
             // Read incoming stream.
             pending_if_cannot_send!(self.process_all_incoming_messages(cx));
 
-            // Flow control: flush as many out of order messages to user RX as possible.
+            // Flow control: flush as many in-order messages to user RX as possible.
             bail_if_err!(self.user_rx.flush(cx));
 
             if self

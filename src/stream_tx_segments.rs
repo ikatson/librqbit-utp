@@ -3,7 +3,20 @@
 //
 // When an ACK arrives this tells us how much (if any) bytes we can
 // remove from the actual TX (bytes) that are stored in struct UserTx.
-
+//
+// The actual data is kept in UserTx, this only contains metadata about segments we created, sent and delivered.
+// Tracks RTT and other stats per segment.
+//
+// Main flow:
+// 1. New segment(s) to be sent is created via enqueue().
+// 2. They are iterated to be sent via iter_mut_for_sending(), and marked as sent (if sent).
+// 3. Once they are delivered as indicated by ACK, remove_up_to_ack() is called.
+//
+// The last segment MAY be an MTU probe, where we try to send a segment larger than
+// a known working size, in attempt to increase throughput. If it's not delivered in time,
+// it's removed and will need to be requeued again.
+//
+// The downside is no new segments can be enqueued while an MTU probe is outstanding.
 use std::{
     collections::VecDeque,
     time::{Duration, Instant},
@@ -265,6 +278,10 @@ impl Segments {
         self.segments.is_empty()
     }
 
+    /// Enqueue a segment for sending at the end. If it's an MTU probe, mtu_probe_expiry is not None.
+    /// Returns if the segment was enqueued or not.
+    ///
+    /// TODO: if there's an outstanding MTU probe, don't allow enqueueing
     #[must_use]
     pub fn enqueue(&mut self, payload_len: usize, mtu_probe_expiry: Option<Instant>) -> bool {
         self.segments.push_back(Segment {
@@ -282,6 +299,7 @@ impl Segments {
         true
     }
 
+    /// Try to pop an MTU probe if it's expired.
     pub fn pop_expired_mtu_probe(&mut self, now: Instant) -> PopExpiredProbe {
         match self.segments.pop_back() {
             Some(s) => match s.mtu_probe_expiry {

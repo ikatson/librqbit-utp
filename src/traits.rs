@@ -9,6 +9,9 @@ use tokio::net::UdpSocket;
 
 use crate::metrics::METRICS;
 
+/// An abstraction for underlying transport. UDP is default, but can be swapped to a custom transport.
+///
+/// Tests use mock transport.
 pub trait Transport: Send + Sync + Unpin + 'static {
     fn recv_from<'a>(
         &'a self,
