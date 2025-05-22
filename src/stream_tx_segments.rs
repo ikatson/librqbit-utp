@@ -527,6 +527,7 @@ impl Segments {
                     .unwrap() as usize,
                 segment: seg,
             })
+            .filter(|s| !s.is_delivered())
     }
 }
 
