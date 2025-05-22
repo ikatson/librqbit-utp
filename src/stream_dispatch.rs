@@ -672,9 +672,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(());
         }
 
-        match self
+        match trace_dbg!(self
             .user_tx_segments
-            .pop_expired_mtu_probe(self.this_poll.now)
+            .pop_expired_mtu_probe(self.this_poll.now))
         {
             PopExpiredProbe::Expired {
                 rewind_to,

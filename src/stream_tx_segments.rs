@@ -218,6 +218,7 @@ impl std::fmt::Debug for Pipe {
     }
 }
 
+#[derive(Debug)]
 pub enum PopExpiredProbe {
     Expired {
         rewind_to: SeqNr,

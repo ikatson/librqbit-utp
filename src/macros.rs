@@ -28,6 +28,15 @@ macro_rules! log_every_ms {
 }
 
 #[allow(unused)]
+macro_rules! trace_dbg {
+    ($e:expr) => {{
+        let expr = $e;
+        trace!(?expr);
+        $e
+    }};
+}
+
+#[allow(unused)]
 macro_rules! trace_every_ms {
     ($dur:expr, $($rest:tt)*) => {
         log_every_ms!($dur, tracing::Level::TRACE, $($rest)*);
