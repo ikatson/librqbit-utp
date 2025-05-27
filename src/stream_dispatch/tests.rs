@@ -3071,3 +3071,55 @@ async fn test_rto_single_packet_retransmission() {
     t.poll_once_assert_pending().await;
     t.assert_sent_empty_msg("After second RTO, no additional packets should be sent until ACK");
 }
+
+// This would test an edge case where on RTO we send only one packet EVEN if more packets fit into the window.
+#[tokio::test]
+async fn test_rto_single_packet_retransmission_smaller_than_mss() {
+    setup_test_logging();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            mtu: Some(calc_mtu_for_mss(5)),
+            disable_nagle: true,
+            ..Default::default()
+        },
+        false,
+    );
+    // Allow sending by setting window size
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            seq_nr: 1.into(),
+            ack_nr: t.vsock.seq_nr,
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
+
+    let (_r, mut w) = t.stream.take().unwrap().split();
+    w.write_all(b"a").await.unwrap();
+
+    // Writing in small pieces
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_DATA, seq_nr = 101, payload = "a")]
+    );
+
+    w.write_all(b"bcde").await.unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_DATA, seq_nr = 102, payload = "bcde")]
+    );
+
+    // Trigger a timeout. Should retransmit only ONE packet and do nothing on second poll.
+    t.env.increment_now(Duration::from_secs(10));
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_DATA, seq_nr = 101, payload = "a")]
+    );
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+}
