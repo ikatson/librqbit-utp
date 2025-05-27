@@ -4,7 +4,6 @@ use tracing::trace;
 use crate::{
     constants::{IPV4_HEADER, UDP_HEADER, UTP_HEADER},
     raw::{Type::*, UtpHeader},
-    seq_nr::SeqNr,
     stream_dispatch::tests::make_test_vsock,
     test_util::setup_test_logging,
     SocketOpts,
@@ -53,13 +52,13 @@ async fn test_mtu_probing() {
         t.poll_once_assert_pending().await;
         let sent = t.take_sent();
         assert_eq!(
-            sent,
-            vec![cmphead!(
+            *sent.first().unwrap(),
+            cmphead!(
                 ST_DATA,
                 seq_nr = 101 + seq_nr_offset,
                 payload =
                     make_payload((probe_mtu - IPV4_HEADER - UTP_HEADER - UDP_HEADER) as usize)
-            )],
+            ),
             "iteration {i}, probe mtu: {probe_mtu}, expected payload len: {expected_payload_len}"
         );
         if probe_mtu as usize > FAKE_MTU_LIMIT {

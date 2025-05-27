@@ -32,7 +32,7 @@ macro_rules! trace_dbg {
     ($e:expr) => {{
         let expr = $e;
         trace!(?expr);
-        $e
+        expr
     }};
 }
 

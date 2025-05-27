@@ -684,6 +684,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 // In case the retransmit timer expired, this is not "real" expiry, but expiry due to us sending
                 // too large segment. So ignore the retransmit timer, pretend it didn't fire.
                 self.timers.retransmit.turn_off();
+                self.rto_retransmissions = 0;
 
                 // TODO: do we need to IF here? Maybe min instead?
                 if self.last_sent_seq_nr > rewind_to {
@@ -756,6 +757,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             trace!(bytes = payload_size, "segmented");
 
             if probe_expiry_time.is_some() {
+                debug!(payload_size, "MTU probing, not segmenting more data");
                 break;
             }
         }
