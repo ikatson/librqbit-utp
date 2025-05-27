@@ -349,7 +349,7 @@ async fn test_basic_retransmission() {
     );
 
     // Wait for retransmission timeout
-    t.env.increment_now(Duration::from_secs(1));
+    t.env.increment_now(t.vsock.rtte.retransmission_timeout());
     t.poll_once_assert_pending().await;
 
     // Should retransmit the same data
@@ -363,7 +363,7 @@ async fn test_basic_retransmission() {
     t.assert_sent_empty();
 
     // Wait again for 2nd retransmission.
-    t.env.increment_now(Duration::from_secs(1));
+    t.env.increment_now(t.vsock.rtte.retransmission_timeout());
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
@@ -1583,7 +1583,7 @@ async fn test_retransmission_behavior() {
     t.assert_sent_empty_msg("Should not retransmit before timeout");
 
     // After timeout, packet should be retransmitted
-    t.env.increment_now(Duration::from_secs(1));
+    t.env.increment_now(Duration::from_secs(3));
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
@@ -1597,7 +1597,7 @@ async fn test_retransmission_behavior() {
     );
 
     // Second timeout should trigger another retransmission with doubled timeout
-    t.env.increment_now(Duration::from_secs(2));
+    t.env.increment_now(Duration::from_secs(6));
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
@@ -2022,7 +2022,7 @@ async fn test_inactivity_timeout() {
 
     // Set up socket with a short inactivity timeout
     let opts = SocketOpts {
-        remote_inactivity_timeout: Some(Duration::from_secs(1)),
+        remote_inactivity_timeout: Some(Duration::from_secs(5)),
         ..Default::default()
     };
     let mut t = make_test_vsock(opts, false);
@@ -2049,7 +2049,7 @@ async fn test_inactivity_timeout() {
 
     // Wait just under timeout - connection should still be alive, but we
     // should get a retransmission.
-    t.env.increment_now(Duration::from_millis(900));
+    t.env.increment_now(Duration::from_millis(4900));
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
@@ -2076,7 +2076,7 @@ async fn test_inactivity_timeout() {
     t.assert_sent_empty();
 
     // Wait just under timeout again - connection should still be alive
-    t.env.increment_now(Duration::from_millis(900));
+    t.env.increment_now(Duration::from_millis(4900));
     t.poll_once_assert_pending().await;
     t.assert_sent_empty_msg("Should not send anything before timeout");
 
@@ -2104,7 +2104,7 @@ async fn test_inactivity_timeout() {
     );
 
     // Wait past timeout - connection should error out as nothing received.
-    t.env.increment_now(Duration::from_secs(1));
+    t.env.increment_now(Duration::from_secs(5));
     let result = t.poll_once().await;
     // Should get inactivity timeout error
     match result {
@@ -3072,7 +3072,8 @@ async fn test_rto_single_packet_retransmission() {
     t.assert_sent_empty_msg("After second RTO, no additional packets should be sent until ACK");
 }
 
-// This would test an edge case where on RTO we send only one packet EVEN if more packets fit into the window.
+// This would test an edge case where on RTO we send only one packet even
+// if more packets fit into the window.
 #[tokio::test]
 async fn test_rto_single_packet_retransmission_smaller_than_mss() {
     setup_test_logging();
