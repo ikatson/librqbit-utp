@@ -1,0 +1,2 @@
+- [ ] rtt: must measure before updating congestion controller
+- [ ] RTO: only send one packet

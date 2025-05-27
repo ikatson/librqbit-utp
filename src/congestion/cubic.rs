@@ -33,10 +33,11 @@ impl core::fmt::Debug for Cubic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cwnd={},cwnd_mss={:.2},sshthresh_mss:{:.2}",
+            "cwnd={},cwnd_mss={:.2},sshthresh_mss:{:.2}:mss:{}",
             self.window(),
             self.cwnd,
-            self.ssthresh
+            self.ssthresh,
+            self.mss
         )
     }
 }
@@ -116,8 +117,7 @@ impl CongestionController for Cubic {
             // Slow start
             self.cwnd += len as f64 / self.mss as f64;
         } else {
-            // During congestion avoidance, window is computed using CUBIC. By the time we get here,
-            //
+            // During congestion avoidance, window is computed using CUBIC.
             let t = now - self.last_congestion_event;
             let w_cubic_v = w_cubic(t, self.k, self.w_max);
             let rtt = rtte.roundtrip_time();
