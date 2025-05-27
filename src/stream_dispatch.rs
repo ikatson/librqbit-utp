@@ -98,12 +98,12 @@ impl VirtualSocketState {
     // True if we are not sending any more data.
     fn is_local_fin_or_later(&self) -> bool {
         match self {
-            VirtualSocketState::SynReceived { .. }
+            VirtualSocketState::SynReceived
             | VirtualSocketState::SynAckSent { .. }
-            | VirtualSocketState::Established { .. } => false,
-            VirtualSocketState::Closed { .. }
+            | VirtualSocketState::Established => false,
+            VirtualSocketState::Closed
             | VirtualSocketState::FinWait1 { .. }
-            | VirtualSocketState::FinWait2 { .. }
+            | VirtualSocketState::FinWait2
             | VirtualSocketState::LastAck { .. } => true,
         }
     }
@@ -932,7 +932,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (Established, ST_DATA | ST_STATE) => {}
 
             // Fin received in an expected state, but its sequence number is wrong
-            (Established | FinWait1 { .. } | FinWait2 { .. }, ST_FIN)
+            (Established | FinWait1 { .. } | FinWait2, ST_FIN)
                 if hdr.seq_nr != self.last_consumed_remote_seq_nr + 1 =>
             {
                 debug!(
