@@ -1,3 +1,5 @@
+mod rtte;
+
 use std::{future::poll_fn, num::NonZeroUsize, pin::Pin, sync::Arc, task::Poll, time::Duration};
 
 use anyhow::Context;
@@ -152,7 +154,9 @@ fn make_test_vsock(opts: SocketOpts, is_incoming: bool) -> TestVsock {
             wnd_size: 1024 * 1024,
             ..Default::default()
         };
-        StreamArgs::new_outgoing(&remote_ack, env.now(), env.now())
+        let now = env.now();
+        env.increment_now(Duration::from_secs(1));
+        StreamArgs::new_outgoing(&remote_ack, now, env.now())
     };
     make_test_vsock_args(opts, args, env)
 }

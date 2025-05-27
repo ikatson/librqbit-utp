@@ -792,22 +792,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // TODO: figure out why did I put this here?
             self.timers.remote_inactivity_timer = None;
 
-            // Update RTT and RTO if not in recovery. In recovery we get very delayed info
-            // for packets beyond sack depth.
-            if let (false, Some(rtt)) =
-                (self.recovery.is_recovering(), result.on_ack_result.new_rtt)
-            {
-                METRICS.rtt.record(rtt.as_secs_f64());
-                log_every_ms_if_changed!(
-                    500,
-                    RTTE_TRACING_LOG_LEVEL,
-                    "rtte:sample",
-                    self,
-                    |s| s.rtte,
-                    |s| s.rtte.sample(rtt)
-                );
-            }
-
             // Reset retransmit timer.
             if self.user_tx_segments.is_empty() && self.state.our_fin_if_unacked().is_none() {
                 // rfc6298 5.2. If all outstanding data ACKed, turn off the timer.
@@ -1008,6 +992,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .remove_up_to_ack(self.this_poll.now, &msg.header),
         };
 
+        // Update RTT and RTO if not in recovery. In recovery we get very delayed info
+        // for packets beyond sack depth.
+        tracing::info!(new_rtt=?result.on_ack_result.new_rtt);
+        if let (false, Some(rtt)) = (self.recovery.is_recovering(), result.on_ack_result.new_rtt) {
+            METRICS.rtt.record(rtt.as_secs_f64());
+            log_every_ms_if_changed!(
+                500,
+                RTTE_TRACING_LOG_LEVEL,
+                "rtte:sample",
+                self,
+                |s| s.rtte,
+                |s| s.rtte.sample(rtt)
+            );
+        }
         self.congestion_controller
             .set_remote_window(msg.header.wnd_size as usize);
         self.congestion_controller.on_ack(

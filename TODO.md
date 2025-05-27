@@ -1,2 +1,3 @@
 - [ ] rtt: must measure before updating congestion controller
+  - [ ] rtt isn't set at all in certain cases, which causes then cwnd computation to be incorrect
 - [ ] RTO: only send one packet
