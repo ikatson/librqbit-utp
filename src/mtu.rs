@@ -2,7 +2,7 @@
 // delivered payloads so far. Binary searches (probes) the payload size until convergence.
 use crate::constants::{IPV4_HEADER, IPV6_HEADER, UDP_HEADER, UTP_HEADER};
 
-const PROBE_EXPIRY_COOLDOWN_PACKETS: u16 = 2;
+const PROBE_EXPIRY_COOLDOWN_PACKETS: u16 = 3;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentSizes {
@@ -52,6 +52,7 @@ impl SegmentSizes {
 
     pub fn next_segment_size(&mut self) -> u16 {
         if self.cooldown_remaining_packets == 0 {
+            self.cooldown_remaining_packets = PROBE_EXPIRY_COOLDOWN_PACKETS;
             return self.next_probe();
         }
         self.cooldown_remaining_packets = self.cooldown_remaining_packets.saturating_sub(1);
@@ -68,6 +69,5 @@ impl SegmentSizes {
 
     pub fn on_probe_expired(&mut self, size: usize) {
         self.max_ss = self.max_ss.min(size as u16).max(self.min_ss);
-        self.cooldown_remaining_packets = PROBE_EXPIRY_COOLDOWN_PACKETS;
     }
 }
