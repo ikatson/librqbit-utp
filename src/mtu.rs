@@ -2,6 +2,8 @@
 // delivered payloads so far. Binary searches (probes) the payload size until convergence.
 use crate::constants::{IPV4_HEADER, IPV6_HEADER, UDP_HEADER, UTP_HEADER};
 
+const PROBE_EXPIRY_COOLDOWN_PACKETS: u16 = 2;
+
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentSizes {
     // The minimum uTP payload size that we know can go through the link.
@@ -9,6 +11,8 @@ pub struct SegmentSizes {
     // The maximum uTP payload size to probe for. Calculated from link MTU
     // (default 1500, ethernet)
     max_ss: u16,
+
+    cooldown_remaining_packets: u16,
 }
 
 impl SegmentSizes {
@@ -25,7 +29,11 @@ impl SegmentSizes {
 
         let min_ss = calc(min_mtu);
         let max_ss = calc(max_mtu);
-        Self { min_ss, max_ss }
+        Self {
+            min_ss,
+            max_ss,
+            cooldown_remaining_packets: 1,
+        }
     }
 
     pub fn on_payload_delivered(&mut self, payload_size: usize) {
@@ -42,7 +50,15 @@ impl SegmentSizes {
         self.max_ss
     }
 
-    pub fn next_probe(&self) -> u16 {
+    pub fn next_segment_size(&mut self) -> u16 {
+        if self.cooldown_remaining_packets == 0 {
+            return self.next_probe();
+        }
+        self.cooldown_remaining_packets = self.cooldown_remaining_packets.saturating_sub(1);
+        self.min_ss
+    }
+
+    fn next_probe(&self) -> u16 {
         self.min_ss + (self.max_ss - self.min_ss) / 2
     }
 
@@ -51,6 +67,7 @@ impl SegmentSizes {
     }
 
     pub fn on_probe_expired(&mut self, size: usize) {
-        self.max_ss = self.max_ss.min(size as u16).max(self.min_ss)
+        self.max_ss = self.max_ss.min(size as u16).max(self.min_ss);
+        self.cooldown_remaining_packets = PROBE_EXPIRY_COOLDOWN_PACKETS;
     }
 }

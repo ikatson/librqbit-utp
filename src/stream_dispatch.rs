@@ -724,7 +724,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let rto = self.rtte.retransmission_timeout();
 
         while remaining > 0 && remote_window_remaining > 0 {
-            let ss = self.segment_sizes.next_probe();
+            let ss = self.segment_sizes.next_segment_size();
             let min_ss = self.segment_sizes.mss();
             let max_payload_size = (ss as usize).min(remote_window_remaining);
             let payload_size = max_payload_size.min(remaining);
