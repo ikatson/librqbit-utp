@@ -2931,7 +2931,7 @@ async fn test_rto_not_stuck_in_congestion_control() {
 }
 
 #[tokio::test]
-async fn test_rto_single_packet_retransmission() {
+async fn test_rto_single_packet_retransmission_mss_sized() {
     setup_test_logging();
     // Use MSS of 1 to create the smallest possible packet
     const MSS: usize = 1;

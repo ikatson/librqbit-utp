@@ -148,6 +148,9 @@ struct VirtualSocket<T, Env> {
     // 3. ST_FIN is sent.
     seq_nr: SeqNr,
 
+    // How many consecutive RTO retransmissions happened.
+    rto_retransmissions: usize,
+
     // This is used to rewind state back for retransmission.
     // All packets after this number will get resent (ST_DATA, ST_FIN).
     last_sent_seq_nr: SeqNr,
@@ -352,6 +355,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     self.recovery.on_rto_timeout(self.last_sent_seq_nr);
                     // Rewind back last sent seq_nr so that normal sending resumes.
                     self.last_sent_seq_nr = seg.seq_nr();
+                    self.rto_retransmissions += 1;
                 } else {
                     // This will retry on next poll.
                     return Ok(());
@@ -369,6 +373,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     }
                 }
             }
+        }
+
+        // We are in RTO retransmission mode, don't send anything.
+        if self.rto_retransmissions > 0 {
+            trace!(
+                rto_retransmissions = self.rto_retransmissions,
+                "not sending anything while in RTO processing"
+            );
+            return Ok(());
         }
 
         if self.user_tx_segments.is_empty() {
@@ -791,6 +804,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         {
             // TODO: figure out why did I put this here?
             self.timers.remote_inactivity_timer = None;
+
+            // Exit RTO mode.
+            self.rto_retransmissions = 0;
 
             // Reset retransmit timer.
             if self.user_tx_segments.is_empty() && self.state.our_fin_if_unacked().is_none() {
@@ -1540,6 +1556,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_sent_seq_nr,
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
+            rto_retransmissions: 0,
             consumed_but_unacked_bytes: 0,
             rx,
             user_tx_segments: Segments::new(
