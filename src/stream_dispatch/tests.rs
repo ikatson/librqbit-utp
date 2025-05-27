@@ -3048,18 +3048,15 @@ async fn test_rto_single_packet_retransmission() {
         congestion_controller = ?t.vsock.congestion_controller,
         "congestion after second ACK",
     );
+
+    // Packets 103 and 104 should be in the network. MAYBE more, that depends on congestion calculations.
     assert_eq!(
         t.take_sent(),
-        vec![
-            cmphead!(ST_DATA, seq_nr = 104, payload = "d"),
-            cmphead!(ST_DATA, seq_nr = 105, payload = "e"),
-            // cmphead!(ST_DATA, seq_nr = 104, payload = "d"),
-            // cmphead!(ST_DATA, seq_nr = 104, payload = "d")
-        ],
+        vec![cmphead!(ST_DATA, seq_nr = 104, payload = "d"),],
         "After second ACK, should send next packet"
     );
 
-    // Let's trigger another timeout for the third packet
+    // Trigger another timeout for the third packet
     t.env.increment_now(rto);
     t.poll_once_assert_pending().await;
 

@@ -33,10 +33,11 @@ impl core::fmt::Debug for Cubic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cwnd={},cwnd_mss={:.2},sshthresh_mss:{:.2}:mss:{}",
+            "cwnd={},cwnd_mss={:.2},sshthresh_mss:{:.2}:w_max:{:.2},mss:{}",
             self.window(),
             self.cwnd,
             self.ssthresh,
+            self.w_max,
             self.mss
         )
     }
@@ -77,6 +78,7 @@ impl CongestionController for Cubic {
     fn on_retransmission_timeout(&mut self, _now: Instant) {
         // CUBIC https://datatracker.ietf.org/doc/html/rfc8312#section-4.7
         self.ssthresh = (self.cwnd * BETA_CUBIC).max(2.);
+        self.w_max = self.cwnd;
         self.cwnd = 1.
     }
 
@@ -122,6 +124,8 @@ impl CongestionController for Cubic {
             let w_cubic_v = w_cubic(t, self.k, self.w_max);
             let rtt = rtte.roundtrip_time();
             let w_est_v = w_est(t, rtt, self.w_max);
+
+            tracing::info!(w_est_v);
 
             if w_cubic_v < w_est_v {
                 // TCP friendly region
