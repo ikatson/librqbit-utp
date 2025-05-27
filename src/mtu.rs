@@ -2,8 +2,6 @@
 // delivered payloads so far. Binary searches (probes) the payload size until convergence.
 use crate::constants::{IPV4_HEADER, IPV6_HEADER, UDP_HEADER, UTP_HEADER};
 
-const PROBE_EXPIRY_COOLDOWN_PACKETS: u16 = 3;
-
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentSizes {
     // The minimum uTP payload size that we know can go through the link.
@@ -13,17 +11,40 @@ pub struct SegmentSizes {
     max_ss: u16,
 
     cooldown_remaining_packets: u16,
+    cooldown_max_packets: u16,
+}
+
+pub struct SegmentSizesConfig {
+    pub is_ipv4: bool,
+    pub link_mtu: u16,
+    pub probe_expiry_cooldown_packets: u16,
+}
+
+impl Default for SegmentSizesConfig {
+    fn default() -> Self {
+        Self {
+            is_ipv4: true,
+            link_mtu: 1500,
+            probe_expiry_cooldown_packets: 3,
+        }
+    }
 }
 
 impl SegmentSizes {
-    pub fn new(is_ipv4: bool, link_mtu: u16) -> Self {
-        let ip_header_size = if is_ipv4 { IPV4_HEADER } else { IPV6_HEADER };
-        let default_min_mtu = if is_ipv4 { 576 } else { 1280 };
+    pub fn new(config: SegmentSizesConfig) -> Self {
+        let ip_header_size = if config.is_ipv4 {
+            IPV4_HEADER
+        } else {
+            IPV6_HEADER
+        };
+        let default_min_mtu = if config.is_ipv4 { 576 } else { 1280 };
 
         let calc = |mtu: u16| mtu - ip_header_size - UTP_HEADER - UDP_HEADER;
 
         // If the user provided too small MTU, clamp it up to 1 byte.
-        let link_mtu = link_mtu.max(ip_header_size + UDP_HEADER + UTP_HEADER + 1);
+        let link_mtu = config
+            .link_mtu
+            .max(ip_header_size + UDP_HEADER + UTP_HEADER + 1);
         let min_mtu = default_min_mtu.min(link_mtu);
         let max_mtu = link_mtu;
 
@@ -33,6 +54,7 @@ impl SegmentSizes {
             min_ss,
             max_ss,
             cooldown_remaining_packets: 1,
+            cooldown_max_packets: config.probe_expiry_cooldown_packets,
         }
     }
 
@@ -52,11 +74,16 @@ impl SegmentSizes {
 
     pub fn next_segment_size(&mut self) -> u16 {
         if self.cooldown_remaining_packets == 0 {
-            self.cooldown_remaining_packets = PROBE_EXPIRY_COOLDOWN_PACKETS;
+            self.cooldown_remaining_packets = self.cooldown_max_packets;
             return self.next_probe();
         }
         self.cooldown_remaining_packets = self.cooldown_remaining_packets.saturating_sub(1);
         self.min_ss
+    }
+
+    #[cfg(test)]
+    pub fn set_probe_expiry_cooldown_max_packets(&mut self, new_value: u16) {
+        self.cooldown_max_packets = new_value
     }
 
     fn next_probe(&self) -> u16 {

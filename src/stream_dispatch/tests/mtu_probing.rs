@@ -53,6 +53,11 @@ async fn test_mtu_probing() {
 
     const RWND: u32 = calc_payload_size(1280) as u32 * 6 - 1;
 
+    // The data below assumes we send 3 packets with minimum segment size before sending an MTU probe.
+    t.vsock
+        .segment_sizes
+        .set_probe_expiry_cooldown_max_packets(3);
+
     let commands = [
         ExpectSend(vec![
             cmphead!(ST_DATA, seq_nr = 101, payload = p(576)),

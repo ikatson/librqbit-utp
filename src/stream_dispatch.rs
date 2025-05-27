@@ -24,7 +24,7 @@ use crate::{
     },
     message::UtpMessage,
     metrics::METRICS,
-    mtu::SegmentSizes,
+    mtu::{SegmentSizes, SegmentSizesConfig},
     raw::{Type, UtpHeader},
     recovery::Recovery,
     rtte::RttEstimator,
@@ -1562,7 +1562,11 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             state,
         } = args;
 
-        let ss = SegmentSizes::new(remote.is_ipv4(), socket.opts().link_mtu);
+        let ss = SegmentSizes::new(SegmentSizesConfig {
+            is_ipv4: remote.is_ipv4(),
+            link_mtu: socket.opts().link_mtu,
+            ..Default::default()
+        });
 
         let (user_rx, read_half) = UserRx::build(
             socket.opts().max_user_rx_buffered_bytes,
