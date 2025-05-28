@@ -300,6 +300,24 @@ impl Segments {
         true
     }
 
+    pub fn pop_mtu_probe(&mut self, seq_nr: SeqNr) -> bool {
+        let last_segment_seq_nr = self.snd_una + self.segments.len() as u16;
+        match self.segments.pop_back() {
+            Some(s)
+                if last_segment_seq_nr == seq_nr
+                    && s.mtu_probe_expiry.is_some()
+                    && !s.is_delivered =>
+            {
+                true
+            }
+            Some(s) => {
+                self.segments.push_back(s);
+                false
+            }
+            None => false,
+        }
+    }
+
     /// Try to pop an MTU probe if it's expired.
     pub fn pop_expired_mtu_probe(&mut self, now: Instant) -> PopExpiredProbe {
         match self.segments.pop_back() {

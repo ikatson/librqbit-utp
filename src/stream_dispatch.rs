@@ -212,6 +212,8 @@ struct ThisPoll {
 
     // Set if the transport can't send anything this poll.
     transport_pending: bool,
+
+    restart: bool,
 }
 
 #[derive(Default)]
@@ -515,6 +517,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         let mut sent_count = 0;
 
+        let mut message_too_long = None;
+
         // Send the stuff we haven't sent yet, up to sender's window.
         for mut item in self
             .user_tx_segments
@@ -526,22 +530,47 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 break;
             }
 
-            if send_data!(self, cx, header, item)? {
-                trace!(
-                    %header.seq_nr,
-                    %header.ack_nr,
-                    payload_size = item.payload_size(),
-                    remaining_cwnd,
-                    "sent ST_DATA"
-                );
-                remaining_cwnd -= item.payload_size();
-                sent_count += 1;
-            } else {
-                break;
+            match send_data!(self, cx, header, item) {
+                Ok(true) => {
+                    trace!(
+                        %header.seq_nr,
+                        %header.ack_nr,
+                        payload_size = item.payload_size(),
+                        remaining_cwnd,
+                        "sent ST_DATA"
+                    );
+                    remaining_cwnd -= item.payload_size();
+                    sent_count += 1;
+                }
+                // Transport was pending, need to retry
+                Ok(false) => {
+                    break;
+                }
+                // If we couldn't send due to message size, we need to tweak MTU if possible and then retry.
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.raw_os_error() == Some(libc::EMSGSIZE)) =>
+                {
+                    let seq_nr = item.seq_nr();
+                    let size = item.payload_size();
+                    debug!(
+                        ?seq_nr,
+                        payload_size = size,
+                        "got message too long error: {e:#}"
+                    );
+                    message_too_long = Some((seq_nr, size));
+                    break;
+                }
+                Err(e) => return Err(e),
             }
+        }
 
-            if self.this_poll.transport_pending {
-                break;
+        if let Some((seq_nr, size)) = message_too_long {
+            if self.user_tx_segments.pop_mtu_probe(seq_nr) {
+                self.segment_sizes.on_probe_expired(size);
+                self.this_poll.restart = true;
+            } else {
+                bail!("got EMSGSIZE error, but the last message was not a matching MTU probe that we could pop.");
             }
         }
 
@@ -1340,7 +1369,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         macro_rules! bail_if_err {
             ($e:expr) => {
                 match $e {
-                    Ok(val) => val,
+                    Ok(()) => {
+                        if self.this_poll.restart {
+                            continue;
+                        }
+                    }
                     Err(e) => {
                         self.just_before_death(cx, Some(&e));
                         return Poll::Ready(Err(e));
@@ -1351,21 +1384,24 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         macro_rules! pending_if_cannot_send {
             ($e:expr) => {{
-                let val = bail_if_err!($e);
+                bail_if_err!($e);
                 if self.this_poll.transport_pending {
                     return Poll::Pending;
                 }
-                val
+                if self.this_poll.restart {
+                    continue;
+                }
             }};
         }
 
-        // Doing this once here not to upgrade too often below.
-        self.this_poll.transport_pending = false;
-        self.this_poll.now = self.env.now();
+        self.this_poll.restart = true;
 
-        const MAX_ITERS: usize = 2;
+        // Restart can be set by functions within.
+        while self.this_poll.restart {
+            self.this_poll.transport_pending = false;
+            self.this_poll.now = self.env.now();
+            self.this_poll.restart = false;
 
-        for _ in 0..MAX_ITERS {
             // If this is an incoming connection, send back an ACK.
             pending_if_cannot_send!(self.maybe_send_syn_ack(cx));
 
@@ -1373,7 +1409,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             pending_if_cannot_send!(self.process_all_incoming_messages(cx));
 
             // Flow control: flush as many in-order messages to user RX as possible.
-            bail_if_err!(self.user_rx.flush(cx));
+            bail_if_err!(self.user_rx.flush(cx).map(|_| ()));
 
             if self
                 .timers
@@ -1402,7 +1438,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             pending_if_cannot_send!(self.maybe_send_fin(cx));
 
             // Send an ACK if nothing sent yet and sending an ACK is necessary.
-            pending_if_cannot_send!(self.maybe_send_ack(cx));
+            pending_if_cannot_send!(self.maybe_send_ack(cx).map(|_| ()));
 
             // Quit normally if both sides sent FIN and ACKed each other.
             if self.state_is_closed() {
@@ -1432,6 +1468,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         return Poll::Pending;
                     } else {
                         trace!(deadline = ?instant - self.this_poll.now, "failed arming timer, continuing poll loop");
+                        self.this_poll.restart = true;
                         continue;
                     }
                 }
@@ -1439,9 +1476,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         }
 
-        Poll::Ready(Err(anyhow::anyhow!(
-            "bug: too many iterations in dispatcher",
-        )))
+        Poll::Pending
     }
 }
 
@@ -1635,6 +1670,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 now,
                 tmp_buf: vec![0u8; (ss.max_ss() + UTP_HEADER) as usize],
                 transport_pending: false,
+                restart: false,
             },
             parent_span,
             drop_guard: DropGuardSendBeforeDeath::new(
