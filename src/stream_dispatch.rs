@@ -1097,7 +1097,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         // Update RTT and RTO if not in recovery. In recovery we get very delayed info
         // for packets beyond sack depth.
-        tracing::info!(new_rtt=?result.on_ack_result.new_rtt);
         if let (false, Some(rtt)) = (self.recovery.is_recovering(), result.on_ack_result.new_rtt) {
             METRICS.rtt.record(rtt.as_secs_f64());
             log_every_ms_if_changed!(
