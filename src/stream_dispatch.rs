@@ -241,60 +241,67 @@ macro_rules! on_packet_sent {
     }};
 }
 
+// This macro exists to prevent borrow checker errors as the code inside uses a bunch of
+// fields on "self" but the caller also uses a bunch of fields on self.
 macro_rules! send_data {
     ($self:expr, $cx:expr, $header:expr, $segment_iter_item:expr) => {{
-        if $segment_iter_item.retransmit_count()
-            == $self.socket_opts.max_segment_retransmissions.get()
-        {
-            METRICS.max_retransmissions_reached.increment(1);
-            anyhow::bail!("max number of retransmissions reached");
-        }
-
-        $header.set_type(Type::ST_DATA);
-        $header.seq_nr = $segment_iter_item.seq_nr();
-        $header.timestamp_microseconds =
-            ($self.env.now() - $self.socket_created).as_micros() as u32;
-        $header.timestamp_difference_microseconds = $header
-            .timestamp_microseconds
-            .wrapping_sub($self.last_remote_timestamp);
-
-        let len = $header
-            .serialize_with_payload(&mut $self.this_poll.tmp_buf, |b| {
-                let offset = $segment_iter_item.payload_offset();
-                let len = $segment_iter_item.payload_size();
-                let g = $self.user_tx.locked.lock();
-                g.fill_buffer_from_ring_buffer(b, offset, len)
-                    .context("error filling output buffer from user_tx")?;
-                Ok(len)
-            })
-            .context("bug: wasn't able to serialize the buffer")?;
-
-        $self.this_poll.transport_pending =
-            $self
-                .socket
-                .try_poll_send_to($cx, &$self.this_poll.tmp_buf[..len], $self.remote)?;
-        if !$self.this_poll.transport_pending {
-            // This time better be as precise as possible as we are using it to
-            // calculate recovery pipe (estimate of how many packets are in transit).
-            // see rfc6675.
-            $segment_iter_item.on_sent($self.env.now());
-            on_packet_sent!($self, $header);
-
-            #[cfg(feature = "per-connection-metrics")]
-            $self.metrics.sent_bytes.increment(len as u64);
-
-            if $segment_iter_item.seq_nr() > $self.last_sent_seq_nr {
-                $self.last_sent_seq_nr = $segment_iter_item.seq_nr();
-                $self.seq_nr = $segment_iter_item.seq_nr() + 1;
+        // A closure so that we can use "?" inside the block.
+        let mut tmp_closure = || {
+            if $segment_iter_item.retransmit_count()
+                == $self.socket_opts.max_segment_retransmissions.get()
+            {
+                METRICS.max_retransmissions_reached.increment(1);
+                anyhow::bail!("max number of retransmissions reached");
             }
 
-            // rfc6298 5.1
-            $self
-                .timers
-                .retransmit
-                .arm($self.this_poll.now, $self.rtte.retransmission_timeout());
-        }
-        !$self.this_poll.transport_pending
+            $header.set_type(Type::ST_DATA);
+            $header.seq_nr = $segment_iter_item.seq_nr();
+            $header.timestamp_microseconds =
+                ($self.env.now() - $self.socket_created).as_micros() as u32;
+            $header.timestamp_difference_microseconds = $header
+                .timestamp_microseconds
+                .wrapping_sub($self.last_remote_timestamp);
+
+            let len = $header
+                .serialize_with_payload(&mut $self.this_poll.tmp_buf, |b| {
+                    let offset = $segment_iter_item.payload_offset();
+                    let len = $segment_iter_item.payload_size();
+                    let g = $self.user_tx.locked.lock();
+                    g.fill_buffer_from_ring_buffer(b, offset, len)
+                        .context("error filling output buffer from user_tx")?;
+                    Ok(len)
+                })
+                .context("bug: wasn't able to serialize the buffer")?;
+
+            $self.this_poll.transport_pending = $self.socket.try_poll_send_to(
+                $cx,
+                &$self.this_poll.tmp_buf[..len],
+                $self.remote,
+            )?;
+            if !$self.this_poll.transport_pending {
+                // This time better be as precise as possible as we are using it to
+                // calculate recovery pipe (estimate of how many packets are in transit).
+                // see rfc6675.
+                $segment_iter_item.on_sent($self.env.now());
+                on_packet_sent!($self, $header);
+
+                #[cfg(feature = "per-connection-metrics")]
+                $self.metrics.sent_bytes.increment(len as u64);
+
+                if $segment_iter_item.seq_nr() > $self.last_sent_seq_nr {
+                    $self.last_sent_seq_nr = $segment_iter_item.seq_nr();
+                    $self.seq_nr = $segment_iter_item.seq_nr() + 1;
+                }
+
+                // rfc6298 5.1
+                $self
+                    .timers
+                    .retransmit
+                    .arm($self.this_poll.now, $self.rtte.retransmission_timeout());
+            }
+            Ok(!$self.this_poll.transport_pending)
+        };
+        tmp_closure()
     }};
 }
 
@@ -346,7 +353,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             METRICS.rto_timeouts_count.increment(1);
 
             if let Some(mut seg) = self.user_tx_segments.iter_mut_for_sending(None).next() {
-                if send_data!(self, cx, header, seg) {
+                if send_data!(self, cx, header, seg)? {
                     debug!(
                         %header.seq_nr,
                         %header.ack_nr,
@@ -437,7 +444,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     }
                 }
 
-                if send_data!(self, cx, header, seg) {
+                if send_data!(self, cx, header, seg)? {
                     event!(
                         RECOVERY_TRACING_LOG_LEVEL,
                         %header.seq_nr,
@@ -519,7 +526,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 break;
             }
 
-            if send_data!(self, cx, header, item) {
+            if send_data!(self, cx, header, item)? {
                 trace!(
                     %header.seq_nr,
                     %header.ack_nr,
