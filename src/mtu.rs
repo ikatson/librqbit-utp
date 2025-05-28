@@ -94,7 +94,17 @@ impl SegmentSizes {
         self.next_probe() > self.min_ss
     }
 
-    pub fn on_probe_expired(&mut self, size: usize) {
+    pub fn on_probe_failed(&mut self, size: usize) {
         self.max_ss = self.max_ss.min(size as u16).max(self.min_ss);
+    }
+
+    pub fn log_debug(&self) -> impl std::fmt::Debug + '_ {
+        struct D<'a>(&'a SegmentSizes);
+        impl std::fmt::Debug for D<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "min_ss={}:max_ss={}", self.0.min_ss, self.0.max_ss)
+            }
+        }
+        D(self)
     }
 }

@@ -556,7 +556,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     debug!(
                         ?seq_nr,
                         payload_size = size,
-                        "got message too long error: {e:#}"
+                        "got message too long (EMSGSIZE): {e:#}"
                     );
                     message_too_long = Some((seq_nr, size));
                     break;
@@ -567,7 +567,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         if let Some((seq_nr, size)) = message_too_long {
             if self.user_tx_segments.pop_mtu_probe(seq_nr) {
-                self.segment_sizes.on_probe_expired(size);
+                debug!("popped too large MTU probe, will retry");
+                self.segment_sizes.on_probe_failed(size);
                 self.this_poll.restart = true;
             } else {
                 bail!("got EMSGSIZE error, but the last message was not a matching MTU probe that we could pop.");
@@ -708,9 +709,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(());
         }
 
-        match trace_dbg!(self
+        match self
             .user_tx_segments
-            .pop_expired_mtu_probe(self.this_poll.now))
+            .pop_expired_mtu_probe(self.this_poll.now)
         {
             PopExpiredProbe::Expired {
                 rewind_to,
@@ -726,7 +727,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 if self.last_sent_seq_nr > rewind_to {
                     self.last_sent_seq_nr = rewind_to;
                 }
-                self.segment_sizes.on_probe_expired(payload_size);
+                self.segment_sizes.on_probe_failed(payload_size);
             }
             PopExpiredProbe::NotExpired => {
                 trace!("MTU probe hasnt expired yet");
@@ -803,6 +804,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             remote_window_remaining,
             user_tx_segments_segments = self.user_tx_segments.total_len_packets(),
             user_tx_segments_bytes = self.user_tx_segments.total_len_bytes(),
+            segment_sizes = ?self.segment_sizes.log_debug(),
             "split_tx_queue_into_segments finished",
         );
 
