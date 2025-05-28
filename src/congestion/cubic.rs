@@ -125,8 +125,6 @@ impl CongestionController for Cubic {
             let rtt = rtte.roundtrip_time();
             let w_est_v = w_est(t, rtt, self.w_max);
 
-            tracing::info!(w_est_v);
-
             if w_cubic_v < w_est_v {
                 // TCP friendly region
                 self.cwnd = w_est_v;

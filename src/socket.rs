@@ -30,7 +30,7 @@ use crate::{
     utils::{DropGuardSendBeforeDeath, FnDropGuard},
 };
 use crate::{spawn_utils::spawn_with_cancel, UtpStream};
-use anyhow::{bail, Context};
+use anyhow::Context;
 use tokio::sync::{
     mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
@@ -838,7 +838,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
         addr: SocketAddr,
-    ) -> anyhow::Result<bool> {
+    ) -> std::io::Result<bool> {
         // TODO: uncomment to simulate packet loss.
         // if rand::Rng::gen_bool(&mut rand::thread_rng(), 0.01) {
         //     return Ok(true);
@@ -855,11 +855,12 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             }
             Poll::Ready(Err(e)) => {
                 METRICS.send_errors.increment(1);
-                bail!(
+                warn!(
                     "error sending to UDP socket addr={}, len={}: {e:#}",
                     addr,
                     buf.len()
                 );
+                return Err(e);
             }
             Poll::Pending => {
                 METRICS.send_poll_pending.increment(1);

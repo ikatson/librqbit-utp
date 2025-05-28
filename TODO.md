@@ -2,4 +2,9 @@
   - [x] rtt isn't set at all in certain cases, which causes then cwnd computation to be incorrect
 - [x] RTO: only send one packet
 
-- [ ] MTU probing: don't probe consecutive segments, otherwise it'll timeout several times in a row
+- [x] MTU probing: don't probe consecutive segments, otherwise it'll timeout several times in a row
+- [ ] MTU probing: probes should happen on a timer basis, not on number of packets
+- [ ] MTU probing: set minimum default MSS to smth less conservative than 576
+
+With dontfrag:
+- [ ] error sending to UDP socket addr=45.142.177.18:5001, len=1356: Message too long (os error 40)
