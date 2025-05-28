@@ -87,7 +87,7 @@ impl SegmentSizes {
     }
 
     fn next_probe(&self) -> u16 {
-        self.min_ss + (self.max_ss - self.min_ss) / 2
+        (self.min_ss + (self.max_ss - self.min_ss) / 2 + 1).min(self.max_ss)
     }
 
     pub fn is_probing(&self) -> bool {
@@ -95,7 +95,10 @@ impl SegmentSizes {
     }
 
     pub fn on_probe_failed(&mut self, size: usize) {
-        self.max_ss = self.max_ss.min(size as u16).max(self.min_ss);
+        self.max_ss = self
+            .max_ss
+            .min((size as u16).saturating_sub(1))
+            .max(self.min_ss);
     }
 
     pub fn log_debug(&self) -> impl std::fmt::Debug + '_ {

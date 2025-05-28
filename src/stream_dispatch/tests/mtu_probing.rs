@@ -61,86 +61,87 @@ async fn test_mtu_probing() {
     let commands = [
         ExpectSend(vec![
             cmphead!(ST_DATA, seq_nr = 101, payload = p(576)),
-            cmphead!(ST_DATA, seq_nr = 102, payload = p(1038)), // (1500 + 576) / 2: first probe, successful
+            cmphead!(ST_DATA, seq_nr = 102, payload = p(1039)), // (1500 + 576) / 2 + 1: first probe, successful
         ]),
         Ack(102),
         ExpectSend(vec![
-            cmphead!(ST_DATA, seq_nr = 103, payload = p(1038)),
-            cmphead!(ST_DATA, seq_nr = 104, payload = p(1038)),
-            cmphead!(ST_DATA, seq_nr = 105, payload = p(1038)),
-            cmphead!(ST_DATA, seq_nr = 106, payload = p(1269)), // (1500 + 1038) / 2: second probe, successful
+            cmphead!(ST_DATA, seq_nr = 103, payload = p(1039)),
+            cmphead!(ST_DATA, seq_nr = 104, payload = p(1039)),
+            cmphead!(ST_DATA, seq_nr = 105, payload = p(1039)),
+            cmphead!(ST_DATA, seq_nr = 106, payload = p(1270)), // (1500 + 1039) / 2 + 1: second probe, successful
         ]),
         Ack(106),
         ExpectSend(vec![
-            cmphead!(ST_DATA, seq_nr = 107, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 108, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 109, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 110, payload = p(1384)), // (1500 + 1269) / 2: third probe, unsuccessful
+            cmphead!(ST_DATA, seq_nr = 107, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 108, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 109, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 110, payload = p(1386)), // (1500 + 1270) / 2 + 1: third probe, unsuccessful
         ]),
         Ack(109),
         WaitForRto,
         ExpectSend(vec![
-            cmphead!(ST_DATA, seq_nr = 110, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 111, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 112, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 113, payload = p(1326)), // 4th probe, unsuccessful
+            cmphead!(ST_DATA, seq_nr = 110, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 111, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 112, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 113, payload = p(1328)), // 4th probe, unsuccessful
         ]),
         Ack(112),
         WaitForRto,
         ExpectSend(vec![
-            cmphead!(ST_DATA, seq_nr = 113, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 114, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 115, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 116, payload = p(1297)), // 5th probe, unsuccessful
+            cmphead!(ST_DATA, seq_nr = 113, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 114, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 115, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 116, payload = p(1299)), // 5th probe, unsuccessful
         ]),
         Ack(115),
         WaitForRto,
         ExpectSend(vec![
-            cmphead!(ST_DATA, seq_nr = 116, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 117, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 118, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 119, payload = p(1283)), // 6th probe, unsuccessful
+            cmphead!(ST_DATA, seq_nr = 116, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 117, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 118, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 119, payload = p(1285)), // 6th probe, unsuccessful
         ]),
         Ack(118),
         WaitForRto,
         ExpectSend(vec![
-            cmphead!(ST_DATA, seq_nr = 119, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 120, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 121, payload = p(1269)),
-            cmphead!(ST_DATA, seq_nr = 122, payload = p(1276)), // 7th probe, successful
+            cmphead!(ST_DATA, seq_nr = 119, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 120, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 121, payload = p(1270)),
+            cmphead!(ST_DATA, seq_nr = 122, payload = p(1278)), // 7th probe, successful
         ]),
         Ack(122),
         ExpectSend(vec![
-            cmphead!(ST_DATA, seq_nr = 123, payload = p(1276)),
-            cmphead!(ST_DATA, seq_nr = 124, payload = p(1276)),
-            cmphead!(ST_DATA, seq_nr = 125, payload = p(1276)),
-            cmphead!(ST_DATA, seq_nr = 126, payload = p(1279)), // 8th probe, successful
+            cmphead!(ST_DATA, seq_nr = 123, payload = p(1278)),
+            cmphead!(ST_DATA, seq_nr = 124, payload = p(1278)),
+            cmphead!(ST_DATA, seq_nr = 125, payload = p(1278)),
+            cmphead!(ST_DATA, seq_nr = 126, payload = p(1282)), // 8th probe, unsuccessful
         ]),
-        Ack(126),
-        ExpectSend(vec![
-            cmphead!(ST_DATA, seq_nr = 127, payload = p(1279)),
-            cmphead!(ST_DATA, seq_nr = 128, payload = p(1279)),
-            cmphead!(ST_DATA, seq_nr = 129, payload = p(1279)),
-            cmphead!(ST_DATA, seq_nr = 130, payload = p(1281)), // 9th probe, unsuccessful
-        ]),
-        Ack(129),
+        Ack(125),
         WaitForRto,
         ExpectSend(vec![
-            cmphead!(ST_DATA, seq_nr = 130, payload = p(1279)),
-            cmphead!(ST_DATA, seq_nr = 131, payload = p(1279)),
-            cmphead!(ST_DATA, seq_nr = 132, payload = p(1279)),
-            cmphead!(ST_DATA, seq_nr = 133, payload = p(1280)), // 10th probe, successful
+            cmphead!(ST_DATA, seq_nr = 126, payload = p(1278)),
+            cmphead!(ST_DATA, seq_nr = 127, payload = p(1278)),
+            cmphead!(ST_DATA, seq_nr = 128, payload = p(1278)),
+            cmphead!(ST_DATA, seq_nr = 129, payload = p(1280)), // 9th probe, successful
         ]),
-        Ack(133),
+        Ack(129),
+        ExpectSend(vec![
+            cmphead!(ST_DATA, seq_nr = 130, payload = p(1280)),
+            cmphead!(ST_DATA, seq_nr = 131, payload = p(1280)),
+            cmphead!(ST_DATA, seq_nr = 132, payload = p(1280)),
+            cmphead!(ST_DATA, seq_nr = 133, payload = p(1281)), // 10th probe, unsuccessful
+        ]),
+        Ack(132),
+        WaitForRto,
         // At this point final MTU was found, and we don't need to be limited by probes, but rather by other factors.
         // In this test's case we'll get limited by remote window.
         ExpectSend(vec![
+            cmphead!(ST_DATA, seq_nr = 133, payload = p(1280)),
             cmphead!(ST_DATA, seq_nr = 134, payload = p(1280)),
             cmphead!(ST_DATA, seq_nr = 135, payload = p(1280)),
             cmphead!(ST_DATA, seq_nr = 136, payload = p(1280)),
             cmphead!(ST_DATA, seq_nr = 137, payload = p(1280)),
-            cmphead!(ST_DATA, seq_nr = 138, payload = p(1280)),
-            cmphead!(ST_DATA, seq_nr = 139, payload = p(1279)), // limited by rwnd, no nagle
+            cmphead!(ST_DATA, seq_nr = 138, payload = p(1279)), // limited by rwnd, no nagle
         ]),
     ];
 
