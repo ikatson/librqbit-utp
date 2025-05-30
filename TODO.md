@@ -1,3 +1,8 @@
+- [ ] packet loss handling:
+  - [ ] connect: need to retry SYN packets
+  - [ ] MTU probing: don't probe if packet loss is likely. Probe only when the network conditions are stable.
+        This can be measured with e.g. RTT variance.
+
 - [x] rtt: must measure before updating congestion controller
   - [x] rtt isn't set at all in certain cases, which causes then cwnd computation to be incorrect
 - [x] RTO: only send one packet

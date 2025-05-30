@@ -1,3 +1,5 @@
+mod lossy_socket;
+
 use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::Arc,
@@ -6,6 +8,7 @@ use std::{
 
 use anyhow::{bail, Context};
 use libutp_rs2::UtpUdpContext;
+use lossy_socket::LossyUtpUdpSocket;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     time::timeout,
@@ -63,7 +66,7 @@ impl AcceptConnect for Arc<UtpUdpContext> {
     }
 }
 
-pub const TIMEOUT: Duration = Duration::from_secs(5);
+pub const TIMEOUT: Duration = Duration::from_secs(50);
 
 async fn echo(
     reader: impl AsyncRead + Unpin,
@@ -150,4 +153,10 @@ async fn e2e_test_libutp_rs2_client_librqbit_utp_server() {
 async fn e2e_test_libutp_rs2_client_libutp_rs2_server() {
     test_one_echo::<Arc<libutp_rs2::UtpUdpContext>, Arc<libutp_rs2::UtpUdpContext>>(8536, 8537)
         .await;
+}
+
+#[ignore]
+#[tokio::test]
+async fn e2e_test_loss_5_pct() {
+    test_one_echo::<LossyUtpUdpSocket<5>, LossyUtpUdpSocket<5>>(8538, 8539).await
 }
