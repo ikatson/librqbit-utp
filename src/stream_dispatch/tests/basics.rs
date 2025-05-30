@@ -1,53 +1,16 @@
-use std::time::Duration;
-
 use tokio::io::AsyncWriteExt;
 use tracing::trace;
 
 use crate::{
     raw::{Type::*, UtpHeader},
     stream_dispatch::{
-        tests::{calc_mtu_for_mss, make_test_vsock, make_test_vsock_args},
+        tests::{make_test_vsock, make_test_vsock_args},
         StreamArgs,
     },
     test_util::{env::MockUtpEnvironment, setup_test_logging},
     traits::UtpEnvironment,
     SocketOpts,
 };
-
-#[tokio::test]
-async fn test_delayed_ack_sent_once() {
-    setup_test_logging();
-
-    let mut t = make_test_vsock(Default::default(), false);
-    t.poll_once_assert_pending().await;
-    t.assert_sent_empty();
-
-    t.send_msg(
-        UtpHeader {
-            htype: ST_DATA,
-            seq_nr: 1.into(),
-            ack_nr: t.vsock.seq_nr,
-            ..Default::default()
-        },
-        "hello",
-    );
-    t.poll_once_assert_pending().await;
-    assert_eq!(&t.read_all_available().await.unwrap(), b"hello");
-    t.assert_sent_empty();
-
-    // Pretend it's 1 second later.
-    t.env.increment_now(Duration::from_secs(1));
-    t.poll_once_assert_pending().await;
-    assert_eq!(&t.read_all_available().await.unwrap(), b"");
-    // Assert an ACK was sent.
-    let sent = t.take_sent();
-    assert_eq!(sent, vec![cmphead! {ST_STATE, ack_nr=1}]);
-
-    // Assert nothing else is sent later.
-    t.env.increment_now(Duration::from_secs(1));
-    t.poll_once_assert_pending().await;
-    t.assert_sent_empty();
-}
 
 #[tokio::test]
 async fn test_doesnt_send_until_window_updated() {
@@ -86,107 +49,6 @@ async fn test_doesnt_send_until_window_updated() {
         t.take_sent(),
         vec![cmphead!(ST_DATA, ack_nr = 0, payload = "hello")]
     );
-}
-
-#[tokio::test]
-async fn test_sends_up_to_remote_window_only_single_msg() {
-    setup_test_logging();
-    let mut t = make_test_vsock(Default::default(), true);
-    t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(ST_STATE, ack_nr = 0)],
-        "intial SYN-ACK should be sent"
-    );
-    assert_eq!(t.vsock.last_remote_window, 0);
-
-    t.stream
-        .as_mut()
-        .unwrap()
-        .write_all(b"hello")
-        .await
-        .unwrap();
-    t.poll_once_assert_pending().await;
-    t.assert_sent_empty();
-
-    t.send_msg(
-        UtpHeader {
-            htype: ST_STATE,
-            seq_nr: 0.into(),
-            ack_nr: 100.into(),
-            wnd_size: 4,
-            ..Default::default()
-        },
-        "hello",
-    );
-    t.poll_once_assert_pending().await;
-
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 101,
-            ack_nr = 0,
-            payload = "hell"
-        )]
-    );
-
-    // Until window updates and/or we receive an ACK, we don't send anything
-    t.poll_once_assert_pending().await;
-    assert_eq!(t.take_sent().len(), 0);
-}
-
-#[tokio::test]
-async fn test_sends_up_to_remote_window_only_multi_msg() {
-    setup_test_logging();
-    let mut t = make_test_vsock(
-        SocketOpts {
-            link_mtu: Some(calc_mtu_for_mss(2)),
-            ..Default::default()
-        },
-        true,
-    );
-    t.poll_once_assert_pending().await;
-    assert_eq!(t.take_sent().len(), 1); // syn ack
-    assert_eq!(t.vsock.last_remote_window, 0);
-
-    // Hack: force congestion controller to have a larger window than 2 * MSS (4).
-    t.vsock.congestion_controller.set_remote_window(5);
-    t.vsock.congestion_controller.on_recovered(10000, 10000);
-    assert_eq!(t.vsock.congestion_controller.window(), 5);
-
-    t.stream
-        .as_mut()
-        .unwrap()
-        .write_all(b"hello world")
-        .await
-        .unwrap();
-    t.poll_once_assert_pending().await;
-    t.assert_sent_empty();
-
-    t.send_msg(
-        UtpHeader {
-            htype: ST_STATE,
-            seq_nr: 1.into(),
-            ack_nr: 100.into(),
-            // This is enough to send "hello" in 3 messages
-            wnd_size: 5,
-            ..Default::default()
-        },
-        "hello",
-    );
-    t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![
-            cmphead!(ST_DATA, seq_nr = 101, payload = "he"),
-            cmphead!(ST_DATA, seq_nr = 102, payload = "ll"),
-            cmphead!(ST_DATA, seq_nr = 103, payload = "o")
-        ]
-    );
-
-    t.poll_once_assert_pending().await;
-    t.assert_sent_empty();
 }
 
 #[tokio::test]

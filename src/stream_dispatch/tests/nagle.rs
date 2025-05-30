@@ -15,6 +15,7 @@ async fn test_nagle_algorithm() {
         SocketOpts {
             // Set a large max payload size to ensure we're testing Nagle, not segmentation
             link_mtu: Some(calc_mtu_for_mss(1024)),
+            disable_nagle: false, // it's default anyway, but setting explicitly
             ..Default::default()
         },
         false,

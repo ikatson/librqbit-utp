@@ -9,6 +9,8 @@ use crate::{
     test_util::setup_test_logging,
 };
 
+// Test that congestion control works without testing specific algorithms.
+// E.g. increases window on ACKs, reduces on loss etc.
 #[tokio::test]
 async fn test_congestion_control_basics() {
     setup_test_logging();

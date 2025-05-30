@@ -1,6 +1,6 @@
-mod api;
 mod basics;
 mod congestion;
+mod delayed_ack;
 mod fast_retransmit;
 mod flow_control;
 mod inactivity_timeout;
@@ -9,6 +9,7 @@ mod nagle;
 mod retransmit_timer;
 mod rtte;
 mod shutdown;
+mod stream_api;
 
 use std::{sync::Arc, task::Poll, time::Duration};
 

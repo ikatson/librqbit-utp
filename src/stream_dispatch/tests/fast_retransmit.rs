@@ -11,6 +11,76 @@ use crate::{
 };
 
 #[tokio::test]
+async fn test_fast_retransmit() {
+    setup_test_logging();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(calc_mtu_for_mss(5)),
+            ..Default::default()
+        },
+        false,
+    );
+
+    // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
+    t.vsock.rtte.force_timeout(Duration::from_secs(10));
+
+    let mut ack = UtpHeader {
+        htype: ST_STATE,
+        seq_nr: 0.into(),
+        ack_nr: 99.into(),
+        wnd_size: 1024,
+        ..Default::default()
+    };
+
+    // Allow sending by setting window size
+    t.send_msg(ack, "");
+
+    // Write enough data to generate multiple packets
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(b"helloworld")
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+
+    assert_eq!(
+        t.take_sent(),
+        vec![
+            cmphead!(ST_DATA, seq_nr = 101, payload = "hello"),
+            cmphead!(ST_DATA, seq_nr = 102, payload = "world")
+        ]
+    );
+
+    // Simulate receiving duplicate ACKs (as if first packet was lost but later ones arrived)
+    ack.ack_nr = 101.into();
+
+    // First ACK
+    t.send_msg(ack, "");
+
+    // First duplicate ACK
+    t.send_msg(ack, "");
+
+    // Second duplicate ACK
+    t.send_msg(ack, "");
+
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty_msg("Should not retransmit yet");
+
+    // Third duplicate ACK should trigger fast retransmit
+    t.send_msg(ack, "");
+
+    t.poll_once_assert_pending().await;
+    trace!("s");
+
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_DATA, seq_nr = 102, payload = "world")],
+        "Should have retransmitted second packet"
+    );
+}
+
+#[tokio::test]
 async fn test_duplicate_ack_counted_only_on_st_state() {
     setup_test_logging();
     let mut t = make_test_vsock(
@@ -114,75 +184,5 @@ async fn test_duplicate_ack_counted_only_on_st_state() {
             cmphead!(ST_FIN, seq_nr = 103, ack_nr = 3)
         ],
         "Should have triggered fast retransmit"
-    );
-}
-
-#[tokio::test]
-async fn test_fast_retransmit() {
-    setup_test_logging();
-    let mut t = make_test_vsock(
-        SocketOpts {
-            link_mtu: Some(calc_mtu_for_mss(5)),
-            ..Default::default()
-        },
-        false,
-    );
-
-    // Set a large retransmission timeout so we know fast retransmit is triggering, not RTO
-    t.vsock.rtte.force_timeout(Duration::from_secs(10));
-
-    let mut ack = UtpHeader {
-        htype: ST_STATE,
-        seq_nr: 0.into(),
-        ack_nr: 99.into(),
-        wnd_size: 1024,
-        ..Default::default()
-    };
-
-    // Allow sending by setting window size
-    t.send_msg(ack, "");
-
-    // Write enough data to generate multiple packets
-    t.stream
-        .as_mut()
-        .unwrap()
-        .write_all(b"helloworld")
-        .await
-        .unwrap();
-    t.poll_once_assert_pending().await;
-
-    assert_eq!(
-        t.take_sent(),
-        vec![
-            cmphead!(ST_DATA, seq_nr = 101, payload = "hello"),
-            cmphead!(ST_DATA, seq_nr = 102, payload = "world")
-        ]
-    );
-
-    // Simulate receiving duplicate ACKs (as if first packet was lost but later ones arrived)
-    ack.ack_nr = 101.into();
-
-    // First ACK
-    t.send_msg(ack, "");
-
-    // First duplicate ACK
-    t.send_msg(ack, "");
-
-    // Second duplicate ACK
-    t.send_msg(ack, "");
-
-    t.poll_once_assert_pending().await;
-    t.assert_sent_empty_msg("Should not retransmit yet");
-
-    // Third duplicate ACK should trigger fast retransmit
-    t.send_msg(ack, "");
-
-    t.poll_once_assert_pending().await;
-    trace!("s");
-
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 102, payload = "world")],
-        "Should have retransmitted second packet"
     );
 }

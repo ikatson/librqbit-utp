@@ -321,7 +321,7 @@ async fn test_rto_not_stuck_in_congestion_control() {
 }
 
 #[tokio::test]
-async fn test_basic_retransmission() {
+async fn test_basic_retransmission_0() {
     setup_test_logging();
     let mut t = make_test_vsock(Default::default(), false);
 
@@ -362,6 +362,114 @@ async fn test_basic_retransmission() {
     assert_eq!(
         t.take_sent(),
         vec![cmphead!(ST_DATA, seq_nr = seq_nr, payload = "hello")]
+    );
+}
+
+#[tokio::test]
+async fn test_basic_retransmission_1() {
+    setup_test_logging();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            ..Default::default()
+        },
+        false,
+    );
+
+    // Allow sending by setting window size
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            seq_nr: 0.into(),
+            ack_nr: t.vsock.seq_nr,
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
+
+    // Write some test data
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(b"hello world")
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+
+    // Initial send
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(
+            ST_DATA,
+            seq_nr = 101,
+            ack_nr = 0,
+            payload = "hello world"
+        )],
+        "should send data initially"
+    );
+
+    // No retransmission should occur before timeout
+    t.env.increment_now(Duration::from_millis(100));
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty_msg("Should not retransmit before timeout");
+
+    // After timeout, packet should be retransmitted
+    t.env.increment_now(Duration::from_secs(3));
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(
+            ST_DATA,
+            seq_nr = 101,
+            ack_nr = 0,
+            payload = "hello world"
+        )],
+        "should retransmit"
+    );
+
+    // Second timeout should trigger another retransmission with doubled timeout
+    t.env.increment_now(Duration::from_secs(6));
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(
+            ST_DATA,
+            seq_nr = 101,
+            ack_nr = 0,
+            payload = "hello world"
+        )],
+        "should retransmit after second timeout"
+    );
+
+    // Now ACK the packet - should stop retransmissions
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            seq_nr: 0.into(),
+            ack_nr: 101.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+
+    // No more retransmissions should occur
+    t.env.increment_now(Duration::from_secs(4));
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty_msg("Should not retransmit after ACK");
+
+    // Write new data - should use next sequence number
+    t.stream.as_mut().unwrap().write_all(b"test").await.unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(
+            ST_DATA,
+            seq_nr = 102,
+            ack_nr = 0,
+            payload = "test"
+        )]
     );
 }
 
@@ -558,114 +666,6 @@ async fn test_rto_single_packet_retransmission_smaller_than_mss() {
     );
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
-}
-
-#[tokio::test]
-async fn test_retransmission_behavior() {
-    setup_test_logging();
-    let mut t = make_test_vsock(
-        SocketOpts {
-            ..Default::default()
-        },
-        false,
-    );
-
-    // Allow sending by setting window size
-    t.send_msg(
-        UtpHeader {
-            htype: ST_STATE,
-            seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
-            wnd_size: 1024,
-            ..Default::default()
-        },
-        "",
-    );
-
-    // Write some test data
-    t.stream
-        .as_mut()
-        .unwrap()
-        .write_all(b"hello world")
-        .await
-        .unwrap();
-    t.poll_once_assert_pending().await;
-
-    // Initial send
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 101,
-            ack_nr = 0,
-            payload = "hello world"
-        )],
-        "should send data initially"
-    );
-
-    // No retransmission should occur before timeout
-    t.env.increment_now(Duration::from_millis(100));
-    t.poll_once_assert_pending().await;
-    t.assert_sent_empty_msg("Should not retransmit before timeout");
-
-    // After timeout, packet should be retransmitted
-    t.env.increment_now(Duration::from_secs(3));
-    t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 101,
-            ack_nr = 0,
-            payload = "hello world"
-        )],
-        "should retransmit"
-    );
-
-    // Second timeout should trigger another retransmission with doubled timeout
-    t.env.increment_now(Duration::from_secs(6));
-    t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 101,
-            ack_nr = 0,
-            payload = "hello world"
-        )],
-        "should retransmit after second timeout"
-    );
-
-    // Now ACK the packet - should stop retransmissions
-    t.send_msg(
-        UtpHeader {
-            htype: ST_STATE,
-            seq_nr: 0.into(),
-            ack_nr: 101.into(),
-            wnd_size: 1024,
-            ..Default::default()
-        },
-        "",
-    );
-    t.poll_once_assert_pending().await;
-
-    // No more retransmissions should occur
-    t.env.increment_now(Duration::from_secs(4));
-    t.poll_once_assert_pending().await;
-    t.assert_sent_empty_msg("Should not retransmit after ACK");
-
-    // Write new data - should use next sequence number
-    t.stream.as_mut().unwrap().write_all(b"test").await.unwrap();
-    t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 102,
-            ack_nr = 0,
-            payload = "test"
-        )]
-    );
 }
 
 #[tokio::test]
