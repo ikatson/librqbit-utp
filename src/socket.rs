@@ -855,7 +855,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             }
             Poll::Ready(Err(e)) => {
                 METRICS.send_errors.increment(1);
-                warn!(
+                debug!(
                     "error sending to UDP socket addr={}, len={}: {e:#}",
                     addr,
                     buf.len()
