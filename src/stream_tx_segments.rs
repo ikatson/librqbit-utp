@@ -39,7 +39,7 @@ pub struct Segment {
     is_delivered: bool,
     sent: SentStatus,
 
-    mtu_probe_expiry: Option<Instant>,
+    is_mtu_probe: bool,
 
     // IsLost() from rfc6675
     is_lost: bool,
@@ -64,6 +64,18 @@ impl Segment {
                 *rtt = rtt_min(*rtt, Some(now - sent_ts));
             }
         }
+    }
+
+    pub fn retransmit_count(&self) -> usize {
+        match self.sent {
+            SentStatus::NotSent => 0,
+            SentStatus::SentTime(..) => 0,
+            SentStatus::Retransmitted { count, .. } => count,
+        }
+    }
+
+    pub fn is_mtu_probe(&self) -> bool {
+        self.is_mtu_probe
     }
 
     fn last_sent(&self) -> Option<Instant> {
@@ -118,6 +130,11 @@ impl SegmentForSending<'_> {
     pub fn seq_nr(&self) -> SeqNr {
         self.seq_nr
     }
+
+    pub fn is_mtu_probe(&self) -> bool {
+        self.segment.is_mtu_probe()
+    }
+
     pub fn is_delivered(&self) -> bool {
         self.segment.is_delivered
     }
@@ -129,11 +146,7 @@ impl SegmentForSending<'_> {
     }
 
     pub fn retransmit_count(&self) -> usize {
-        match self.segment.sent {
-            SentStatus::NotSent => 0,
-            SentStatus::SentTime(..) => 0,
-            SentStatus::Retransmitted { count, .. } => count,
-        }
+        self.segment.retransmit_count()
     }
 
     pub fn on_sent(&mut self, now: Instant) {
@@ -284,12 +297,12 @@ impl Segments {
     ///
     /// TODO: if there's an outstanding MTU probe, don't allow enqueueing
     #[must_use]
-    pub fn enqueue(&mut self, payload_len: usize, mtu_probe_expiry: Option<Instant>) -> bool {
+    pub fn enqueue(&mut self, payload_len: usize, is_mtu_probe: bool) -> bool {
         self.segments.push_back(Segment {
             payload_size: payload_len,
             payload_offset_absolute: self.offset,
             is_delivered: false,
-            mtu_probe_expiry,
+            is_mtu_probe,
             sent: SentStatus::NotSent,
             is_lost: false,
             is_expired: false,
@@ -303,13 +316,7 @@ impl Segments {
     pub fn pop_mtu_probe(&mut self, seq_nr: SeqNr) -> bool {
         let last_segment_seq_nr = self.snd_una + self.segments.len() as u16 - 1;
         match self.segments.pop_back() {
-            Some(s)
-                if last_segment_seq_nr == seq_nr
-                    && s.mtu_probe_expiry.is_some()
-                    && !s.is_delivered =>
-            {
-                true
-            }
+            Some(s) if last_segment_seq_nr == seq_nr && s.is_mtu_probe && !s.is_delivered => true,
             Some(s) => {
                 self.segments.push_back(s);
                 false
@@ -319,22 +326,28 @@ impl Segments {
     }
 
     /// Try to pop an MTU probe if it's expired.
-    pub fn pop_expired_mtu_probe(&mut self, now: Instant) -> PopExpiredProbe {
+    pub fn pop_expired_mtu_probe(
+        &mut self,
+        retransmit_timed_out: bool,
+        max_probe_retransmissions: usize,
+    ) -> PopExpiredProbe {
         match self.segments.pop_back() {
-            Some(s) => match s.mtu_probe_expiry {
-                _ if s.is_delivered => {
+            Some(s) => match (retransmit_timed_out, s.is_mtu_probe) {
+                (_, _) if s.is_delivered => {
                     self.segments.push_back(s);
                     PopExpiredProbe::Empty
                 }
-                Some(expires) if expires <= now => PopExpiredProbe::Expired {
-                    payload_size: s.payload_size,
-                    rewind_to: self.snd_una + self.segments.len() as u16 - 1,
-                },
-                Some(_) => {
+                (true, true) if s.retransmit_count() >= max_probe_retransmissions => {
+                    PopExpiredProbe::Expired {
+                        payload_size: s.payload_size,
+                        rewind_to: self.snd_una + self.segments.len() as u16 - 1,
+                    }
+                }
+                (_, true) => {
                     self.segments.push_back(s);
                     PopExpiredProbe::NotExpired
                 }
-                None => {
+                (_, false) => {
                     self.segments.push_back(s);
                     PopExpiredProbe::Empty
                 }
@@ -560,7 +573,7 @@ mod tests {
     fn make_segments(start_seq_nr: u16, count: u16) -> Segments {
         let mut ftx = Segments::new(start_seq_nr.into());
         for _ in 0..count {
-            assert!(ftx.enqueue(1, None));
+            assert!(ftx.enqueue(1, false));
         }
 
         ftx
@@ -717,9 +730,9 @@ mod tests {
     #[test]
     fn test_iter_mut_offsets() {
         let mut segs = Segments::new(0.into());
-        assert!(segs.enqueue(1, None));
-        assert!(segs.enqueue(2, None));
-        assert!(segs.enqueue(3, None));
+        assert!(segs.enqueue(1, false));
+        assert!(segs.enqueue(2, false));
+        assert!(segs.enqueue(3, false));
 
         assert_eq!(
             segs.iter_mut_for_sending(None)
@@ -747,7 +760,7 @@ mod tests {
             vec![(1, 0, 2), (2, 2, 3)]
         );
 
-        assert!(segs.enqueue(4, None));
+        assert!(segs.enqueue(4, false));
         assert_eq!(
             segs.iter_mut_for_sending(None)
                 .map(|s| (s.seq_nr().0, s.payload_offset(), s.payload_size()))

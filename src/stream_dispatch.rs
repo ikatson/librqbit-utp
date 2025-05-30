@@ -369,13 +369,17 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         payload_size = seg.payload_size(),
                         "RTO expired: sent ST_DATA"
                     );
-                    self.congestion_controller
-                        .on_retransmission_timeout(self.this_poll.now);
-                    self.rtte.on_rto_timeout();
-                    self.recovery.on_rto_timeout(self.last_sent_seq_nr);
-                    // Rewind back last sent seq_nr so that normal sending resumes.
-                    self.last_sent_seq_nr = seg.seq_nr();
-                    self.rto_retransmissions += 1;
+                    if !seg.is_mtu_probe() {
+                        self.congestion_controller
+                            .on_retransmission_timeout(self.this_poll.now);
+                        self.rtte.on_rto_timeout();
+                        self.recovery.on_rto_timeout(self.last_sent_seq_nr);
+
+                        // Rewind back last sent seq_nr so that normal sending resumes.
+                        // TODO: this is unnecessary, we should get rid of it
+                        self.last_sent_seq_nr = seg.seq_nr();
+                        self.rto_retransmissions += 1;
+                    }
                 } else {
                     // This will retry on next poll.
                     return Ok(());
@@ -721,7 +725,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         match self
             .user_tx_segments
-            .pop_expired_mtu_probe(self.this_poll.now)
+            .pop_expired_mtu_probe(self.timers.retransmit.expired(self.this_poll.now), 0)
         {
             PopExpiredProbe::Expired {
                 rewind_to,
@@ -743,7 +747,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 trace!("MTU probe hasnt expired yet");
                 return Ok(());
             }
-            PopExpiredProbe::Empty => {}
+            PopExpiredProbe::Empty => {
+                trace!("MTU probe empty");
+            }
         }
 
         let segmented_len = self.user_tx_segments.total_len_bytes();
@@ -768,8 +774,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.last_remote_window
         );
 
-        let rto = self.rtte.retransmission_timeout();
-
         while remaining > 0 && remote_window_remaining > 0 {
             let ss = self.segment_sizes.next_segment_size();
             let min_ss = self.segment_sizes.mss();
@@ -787,23 +791,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
-            let probe_expiry_time = if payload_size > min_ss as usize {
-                Some(self.this_poll.now + rto)
-            } else {
-                None
-            };
+            let is_mtu_probe = payload_size > min_ss as usize;
 
-            if !self
-                .user_tx_segments
-                .enqueue(payload_size, probe_expiry_time)
-            {
+            if !self.user_tx_segments.enqueue(payload_size, is_mtu_probe) {
                 bail!("bug, can't enqueue next segment")
             }
             remaining -= payload_size;
             remote_window_remaining -= payload_size;
             trace!(bytes = payload_size, "segmented");
 
-            if probe_expiry_time.is_some() {
+            if is_mtu_probe {
                 debug!(payload_size, "MTU probing, not segmenting more data");
                 break;
             }
