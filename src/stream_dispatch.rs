@@ -296,10 +296,11 @@ macro_rules! send_data {
                 }
 
                 // rfc6298 5.1
-                $self
-                    .timers
-                    .retransmit
-                    .arm($self.this_poll.now, $self.rtte.retransmission_timeout());
+                $self.timers.retransmit.arm(
+                    $self.this_poll.now,
+                    $self.rtte.retransmission_timeout(),
+                    false,
+                );
             }
             Ok(!$self.this_poll.transport_pending)
         };
@@ -356,6 +357,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             if let Some(mut seg) = self.user_tx_segments.iter_mut_for_sending(None).next() {
                 if send_data!(self, cx, header, seg)? {
+                    // Restart the timer.
+                    self.timers.retransmit.arm(
+                        self.env.now(),
+                        self.rtte.retransmission_timeout(),
+                        true,
+                    );
                     debug!(
                         %header.seq_nr,
                         %header.ack_nr,
@@ -684,9 +691,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         fin.set_type(Type::ST_FIN);
         fin.seq_nr = seq_nr;
         if self.send_control_packet(cx, fin)? {
-            self.timers
-                .retransmit
-                .arm(self.this_poll.now, self.rtte.retransmission_timeout());
+            self.timers.retransmit.arm(
+                self.this_poll.now,
+                self.rtte.retransmission_timeout(),
+                false,
+            );
             self.timers.remote_inactivity_timer =
                 Some(self.this_poll.now + self.socket_opts.remote_inactivity_timeout);
             self.last_sent_seq_nr = seq_nr;
@@ -899,9 +908,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             } else {
                 // rfc6298 5.3. When an ACK is received that acknowledges new data, restart the
                 // retransmission timer.
-                self.timers
-                    .retransmit
-                    .arm(self.this_poll.now, self.rtte.retransmission_timeout());
+                self.timers.retransmit.arm(
+                    self.this_poll.now,
+                    self.rtte.retransmission_timeout(),
+                    true,
+                );
             }
         }
 
@@ -1762,16 +1773,18 @@ impl RetransmitTimer {
         *self = RetransmitTimer::Idle
     }
 
-    fn arm(&mut self, now: Instant, delay: Duration) {
+    fn arm(&mut self, now: Instant, delay: Duration, restart: bool) {
         *self = match *self {
-            // rfc6298 5.1
             RetransmitTimer::Idle => RetransmitTimer::Retransmit {
                 expires_at: now + delay,
                 delay,
             },
-            // rfc6298 5.3
-            RetransmitTimer::Retransmit { .. } => RetransmitTimer::Retransmit {
+            RetransmitTimer::Retransmit { .. } if restart => RetransmitTimer::Retransmit {
                 expires_at: now + delay,
+                delay,
+            },
+            RetransmitTimer::Retransmit { expires_at, .. } => RetransmitTimer::Retransmit {
+                expires_at: (now + delay).min(expires_at),
                 delay,
             },
         };

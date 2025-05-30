@@ -5,13 +5,12 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    constants::{IPV4_HEADER, UDP_HEADER, UTP_HEADER},
     raw::{Type::*, UtpHeader},
     stream_dispatch::{
         tests::{calc_mtu_for_mss, make_test_vsock},
         RetransmitTimer,
     },
-    test_util::{cmphead::CmpUtpHeader, setup_test_logging},
+    test_util::setup_test_logging,
     SocketOpts,
 };
 
