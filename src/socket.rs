@@ -110,6 +110,11 @@ pub struct SocketOpts {
     /// If true, will wait for ACK of FIN. By default we don't wait
     /// as it's not required for torrents.
     pub dont_wait_for_lastack: bool,
+
+    /// How many times should the MTU probes be retransmitted. By default it's 1, so that
+    /// MTU probing can handle a bit of packet loss. If it's 0, we would mark RTO'ed probes as failed
+    /// sooner and thus perf would be better.
+    pub mtu_probe_max_retransmissions: Option<usize>,
 }
 
 impl SocketOpts {
@@ -150,6 +155,7 @@ impl SocketOpts {
                 .max_live_vsocks
                 .unwrap_or(DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET),
             wait_for_last_ack: !self.dont_wait_for_lastack,
+            mtu_probe_max_retransmissions: self.mtu_probe_max_retransmissions.unwrap_or(1),
         })
     }
 }
@@ -168,6 +174,8 @@ pub(crate) struct ValidatedSocketOpts {
     pub max_active_streams: usize,
 
     pub wait_for_last_ack: bool,
+
+    pub mtu_probe_max_retransmissions: usize,
 }
 
 pub(crate) struct RequestWithSpan<V> {

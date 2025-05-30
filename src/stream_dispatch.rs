@@ -723,10 +723,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(());
         }
 
-        match self
-            .user_tx_segments
-            .pop_expired_mtu_probe(self.timers.retransmit.expired(self.this_poll.now), 0)
-        {
+        match self.user_tx_segments.pop_expired_mtu_probe(
+            self.timers.retransmit.expired(self.this_poll.now),
+            self.socket_opts.mtu_probe_max_retransmissions,
+        ) {
             PopExpiredProbe::Expired {
                 rewind_to,
                 payload_size,

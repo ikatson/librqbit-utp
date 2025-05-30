@@ -30,6 +30,7 @@ async fn test_mtu_probing() {
     let mut t = make_test_vsock(
         SocketOpts {
             link_mtu: Some(1500),
+            mtu_probe_max_retransmissions: Some(0),
             disable_nagle: true,
             ..Default::default()
         },
