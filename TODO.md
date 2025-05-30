@@ -7,4 +7,7 @@
 - [ ] MTU probing: set minimum default MSS to smth less conservative than 576
 
 With dontfrag:
-- [ ] error sending to UDP socket addr=45.142.177.18:5001, len=1356: Message too long (os error 40)
+- [x] error sending to UDP socket addr=45.142.177.18:5001, len=1356: Message too long (os error 40)
+
+- [ ] retransmit: looks like we are resetting the timer too often. We must not reset it if no new data is acked.
+      newly set packets should arm, but NOT rearm the timer
