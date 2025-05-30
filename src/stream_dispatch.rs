@@ -569,6 +569,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if self.user_tx_segments.pop_mtu_probe(seq_nr) {
                 debug!("popped too large MTU probe, will retry");
                 self.segment_sizes.on_probe_failed(size);
+                self.segment_sizes.disarm_cooldown();
                 self.this_poll.restart = true;
             } else {
                 bail!("got EMSGSIZE error, but the last message was not a matching MTU probe that we could pop.");

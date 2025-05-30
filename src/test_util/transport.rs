@@ -132,26 +132,43 @@ impl Transport for MockUtpTransport {
     }
 }
 
+#[derive(Default)]
+struct RememberingTransportLocked {
+    messages: Vec<Msg>,
+    max_payload_len: Option<usize>,
+}
+
 #[derive(Clone)]
 pub struct RememberingTransport {
     pub bind_addr: SocketAddr,
-    pub messages: Arc<Mutex<Vec<Msg>>>,
+    locked: Arc<Mutex<RememberingTransportLocked>>,
 }
 
 impl RememberingTransport {
     pub fn new(bind_addr: SocketAddr) -> Self {
         Self {
             bind_addr,
-            messages: Default::default(),
+            locked: Default::default(),
         }
     }
 
-    pub fn send(&self, addr: SocketAddr, buf: &[u8]) {
-        self.messages.lock().push((addr, buf.to_owned()));
+    pub fn set_max_payload_len(&mut self, len: usize) {
+        self.locked.lock().max_payload_len = Some(len);
+    }
+
+    pub fn send(&self, addr: SocketAddr, buf: &[u8]) -> std::io::Result<()> {
+        let mut g = self.locked.lock();
+        if g.max_payload_len.is_some_and(|l| buf.len() > l) {
+            // NOTE: we STILL push the message so that we can detect it later.
+            g.messages.push((addr, buf.to_owned()));
+            return Err(std::io::Error::from_raw_os_error(libc::EMSGSIZE));
+        }
+        g.messages.push((addr, buf.to_owned()));
+        Ok(())
     }
 
     pub fn take_sent(&self) -> Vec<Msg> {
-        std::mem::take(&mut self.messages.lock())
+        std::mem::take(&mut self.locked.lock().messages)
     }
 
     pub fn take_sent_utpmessages(&self) -> Vec<UtpMessage> {
@@ -171,7 +188,7 @@ impl Transport for RememberingTransport {
     }
 
     async fn send_to<'a>(&'a self, buf: &'a [u8], target: SocketAddr) -> std::io::Result<usize> {
-        self.send(target, buf);
+        self.send(target, buf)?;
         Ok(buf.len())
     }
 
@@ -181,7 +198,7 @@ impl Transport for RememberingTransport {
         buf: &[u8],
         target: SocketAddr,
     ) -> Poll<std::io::Result<usize>> {
-        self.send(target, buf);
+        self.send(target, buf)?;
         Poll::Ready(Ok(buf.len()))
     }
 

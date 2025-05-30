@@ -10,6 +10,18 @@ use crate::{
     SocketOpts,
 };
 
+fn make_payload(len: usize) -> String {
+    String::from_utf8(vec![b'a'; len]).unwrap()
+}
+
+const fn calc_payload_size(mtu: u16) -> usize {
+    (mtu - IPV4_HEADER - UTP_HEADER - UDP_HEADER) as usize
+}
+
+fn p(mtu: u16) -> String {
+    make_payload(calc_payload_size(mtu))
+}
+
 #[tokio::test]
 async fn test_mtu_probing() {
     setup_test_logging();
@@ -24,18 +36,6 @@ async fn test_mtu_probing() {
         false,
     );
     let (_r, mut w) = t.stream.take().unwrap().split();
-
-    fn make_payload(len: usize) -> String {
-        String::from_utf8(vec![b'a'; len]).unwrap()
-    }
-
-    const fn calc_payload_size(mtu: u16) -> usize {
-        (mtu - IPV4_HEADER - UTP_HEADER - UDP_HEADER) as usize
-    }
-
-    fn p(mtu: u16) -> String {
-        make_payload(calc_payload_size(mtu))
-    }
 
     // Force congestion controller to have a very high window so that it doesn't interfere.
     t.vsock
@@ -170,6 +170,114 @@ async fn test_mtu_probing() {
                 t.poll_once_assert_pending().await;
                 t.assert_sent_empty();
                 t.env.increment_now(t.vsock.rtte.retransmission_timeout());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn probe_retry_if_emsgsize() {
+    setup_test_logging();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            disable_nagle: true,
+            ..Default::default()
+        },
+        false,
+    );
+
+    const FAKE_MTU: usize = 1000;
+
+    // Anything above this will trigger emsgsize, and we should retry immediately.
+    t.transport
+        .set_max_payload_len((FAKE_MTU as u16 - IPV4_HEADER - UDP_HEADER) as usize);
+    t.vsock
+        .segment_sizes
+        .set_probe_expiry_cooldown_max_packets(2);
+
+    // Force congestion controller to have a very high window so that it doesn't interfere.
+    t.vsock
+        .congestion_controller
+        .on_recovered(1024 * 1024, 100 * 1024 * 1024);
+
+    let (_r, mut w) = t.stream.take().unwrap().split();
+    w.write_all(make_payload(30000).as_bytes()).await.unwrap();
+
+    #[derive(Debug)]
+    enum TestCommand {
+        ExpectSend(Vec<CmpUtpHeader>),
+        Ack(u16),
+    }
+
+    use TestCommand::*;
+
+    let commands = [
+        ExpectSend(vec![
+            cmphead!(ST_DATA, seq_nr = 101, payload = p(576)),
+            cmphead!(ST_DATA, seq_nr = 102, payload = p(1039)), // (1500 + 576) / 2 + 1: first probe, unsuccessful. Will retry immediately.
+            cmphead!(ST_DATA, seq_nr = 102, payload = p(808)),  // 2nd probe, successful
+        ]),
+        Ack(102),
+        ExpectSend(vec![
+            cmphead!(ST_DATA, seq_nr = 103, payload = p(808)), // cooldown
+            cmphead!(ST_DATA, seq_nr = 104, payload = p(808)), // cooldown
+            cmphead!(ST_DATA, seq_nr = 105, payload = p(924)), // 3rd probe, successful
+        ]),
+        Ack(105),
+        ExpectSend(vec![
+            cmphead!(ST_DATA, seq_nr = 106, payload = p(924)), // cooldown
+            cmphead!(ST_DATA, seq_nr = 107, payload = p(924)), // cooldown
+            cmphead!(ST_DATA, seq_nr = 108, payload = p(982)), // 4th probe, successful
+        ]),
+        Ack(108),
+        ExpectSend(vec![
+            cmphead!(ST_DATA, seq_nr = 109, payload = p(982)), // cooldown
+            cmphead!(ST_DATA, seq_nr = 110, payload = p(982)), // cooldown
+            cmphead!(ST_DATA, seq_nr = 111, payload = p(1011)), // 5th probe, unsuccessful
+            cmphead!(ST_DATA, seq_nr = 111, payload = p(997)), // 6th probe, successful
+        ]),
+        Ack(111),
+        ExpectSend(vec![
+            cmphead!(ST_DATA, seq_nr = 112, payload = p(997)), // cooldown
+            cmphead!(ST_DATA, seq_nr = 113, payload = p(997)), // cooldown
+            cmphead!(ST_DATA, seq_nr = 114, payload = p(1004)), // unsuccessful
+            cmphead!(ST_DATA, seq_nr = 114, payload = p(1001)), // unsuccessful
+            cmphead!(ST_DATA, seq_nr = 114, payload = p(999)), // successful
+        ]),
+        Ack(114),
+        ExpectSend(vec![
+            cmphead!(ST_DATA, seq_nr = 115, payload = p(999)), // cooldown
+            cmphead!(ST_DATA, seq_nr = 116, payload = p(999)), // cooldown
+            cmphead!(ST_DATA, seq_nr = 117, payload = p(1000)), // successful
+        ]),
+        Ack(117),
+        ExpectSend(vec![
+            cmphead!(ST_DATA, seq_nr = 118, payload = p(1000)),
+            cmphead!(ST_DATA, seq_nr = 119, payload = p(1000)),
+            cmphead!(ST_DATA, seq_nr = 120, payload = p(1000)),
+            cmphead!(ST_DATA, seq_nr = 121, payload = p(1000)),
+            cmphead!(ST_DATA, seq_nr = 122, payload = p(999)), // limited by RWND (see below)
+        ]),
+    ];
+
+    for command in commands {
+        match command {
+            ExpectSend(sent) => {
+                t.poll_once_assert_pending().await;
+                assert_eq!(t.take_sent(), sent)
+            }
+            Ack(seq_nr) => {
+                t.env.increment_now(Duration::from_secs(1));
+                t.send_msg(
+                    UtpHeader {
+                        htype: ST_STATE,
+                        seq_nr: 1.into(),
+                        wnd_size: (calc_payload_size(1000) * 5) as u32 - 1,
+                        ack_nr: seq_nr.into(),
+                        ..Default::default()
+                    },
+                    "",
+                );
             }
         }
     }

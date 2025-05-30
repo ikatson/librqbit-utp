@@ -101,6 +101,10 @@ impl SegmentSizes {
             .max(self.min_ss);
     }
 
+    pub fn disarm_cooldown(&mut self) {
+        self.cooldown_remaining_packets = 0;
+    }
+
     pub fn log_debug(&self) -> impl std::fmt::Debug + '_ {
         struct D<'a>(&'a SegmentSizes);
         impl std::fmt::Debug for D<'_> {
