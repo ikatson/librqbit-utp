@@ -1148,17 +1148,19 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         );
 
         let offset = msg.header.seq_nr - (self.last_consumed_remote_seq_nr + 1);
-        if offset < 0 {
-            trace!(
-                %self.last_consumed_remote_seq_nr,
-                "dropping message, we already ACKed it"
-            );
-            METRICS.incoming_already_acked_data_packets.increment(1);
-            return Ok(result);
-        }
 
         match msg.header.get_type() {
             ST_DATA => {
+                if offset < 0 {
+                    trace!(
+                        %self.last_consumed_remote_seq_nr,
+                        "ignoring message, we already processed it. There might be packet loss, resending ACK."
+                    );
+                    self.force_immediate_ack();
+                    METRICS.incoming_already_acked_data_packets.increment(1);
+                    return Ok(result);
+                }
+
                 trace!(payload_size = msg.payload().len(), "received ST_DATA");
                 trace!(
                     offset,
@@ -1241,7 +1243,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                 self.force_immediate_ack();
 
-                if !previously_seen_remote_fin {
+                // TODO: if offset < 0, there's something very weird going on, do whatever.
+                if !previously_seen_remote_fin && offset >= 0 {
                     self.last_consumed_remote_seq_nr = hdr.seq_nr;
                     self.user_rx.add_remove(cx, msg, offset as usize)?;
                     self.user_tx.mark_vsock_closed();
