@@ -371,17 +371,25 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         payload_size = seg.payload_size(),
                         "RTO expired: sent ST_DATA"
                     );
+
+                    // RTO triggers a bunch of behaviors to reduce congestion and slow everything down.
+                    // However for MTU probes we don't need that as they are presumably lost not due to
+                    // congestion, but due to them being too large.
                     if !seg.is_mtu_probe() {
                         self.congestion_controller
                             .on_retransmission_timeout(self.this_poll.now);
                         self.rtte.on_rto_timeout();
                         self.recovery.on_rto_timeout(self.last_sent_seq_nr);
-
-                        // Rewind back last sent seq_nr so that normal sending resumes.
-                        // TODO: this is unnecessary, we should get rid of it
-                        self.last_sent_seq_nr = seg.seq_nr();
-                        self.rto_retransmissions += 1;
                     }
+
+                    // Rewind back last sent seq_nr so that normal sending resumes.
+                    // The RFC doesn't seem to say that we should resend all outstanding data.
+                    // However that's what smoltcp does. In the real world it would usually rely on SACK
+                    // info.
+                    // If we don't do this, then all subsequent lost packets will trigger an RTO.
+                    self.last_sent_seq_nr = seg.seq_nr();
+                    // Increase the counter so that we don't send anything past it until it gets ACKed.
+                    self.rto_retransmissions += 1;
                 } else {
                     // This will retry on next poll.
                     return Ok(());
