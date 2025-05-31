@@ -74,6 +74,14 @@ impl Segment {
         }
     }
 
+    pub fn send_count(&self) -> usize {
+        match self.sent {
+            SentStatus::NotSent => 0,
+            SentStatus::SentTime(..) => 1,
+            SentStatus::Retransmitted { count, .. } => count + 1,
+        }
+    }
+
     pub fn is_mtu_probe(&self) -> bool {
         self.is_mtu_probe
     }
@@ -121,6 +129,10 @@ impl SegmentForSending<'_> {
 
     pub fn is_expired(&self) -> bool {
         self.segment.is_expired
+    }
+
+    pub fn send_count(&self) -> usize {
+        self.segment.send_count()
     }
 
     pub fn has_sacks_after_it(&self) -> bool {

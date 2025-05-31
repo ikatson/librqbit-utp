@@ -214,7 +214,7 @@ async fn test_resource_cleanup_with_pending_data() {
             htype: ST_STATE,
             seq_nr: 0.into(),
             ack_nr: 100.into(),
-            wnd_size: 1024,
+            wnd_size: 3, // small window so that we don't send everything right away
             ..Default::default()
         },
         "",
@@ -233,10 +233,7 @@ async fn test_resource_cleanup_with_pending_data() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![
-            cmphead!(ST_DATA, seq_nr = 101, ack_nr = 0, payload = "hello"),
-            cmphead!(ST_FIN, seq_nr = 102, ack_nr = 0)
-        ]
+        vec![cmphead!(ST_DATA, seq_nr = 101, ack_nr = 0, payload = "hel"),]
     );
 
     // Nothing else should be sent before ACK.
@@ -248,10 +245,7 @@ async fn test_resource_cleanup_with_pending_data() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![
-            cmphead!(ST_DATA, seq_nr = 101, ack_nr = 0, payload = "hello"),
-            cmphead!(ST_FIN, seq_nr = 102, ack_nr = 0)
-        ]
+        vec![cmphead!(ST_DATA, seq_nr = 101, ack_nr = 0, payload = "hel"),]
     );
 
     // Send ACK for DATA
@@ -267,21 +261,41 @@ async fn test_resource_cleanup_with_pending_data() {
     );
 
     t.poll_once_assert_pending().await;
-    t.assert_sent_empty();
+    assert_eq!(
+        t.take_sent(),
+        vec![
+            cmphead!(ST_DATA, seq_nr = 102, ack_nr = 0, payload = "lo"),
+            cmphead!(ST_FIN, seq_nr = 103, ack_nr = 0)
+        ]
+    );
+
+    // Send ACK for DATA
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            seq_nr: 0.into(),
+            ack_nr: 102.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
 
     tracing::trace!("waiting for FIN retransmission");
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
     t.env.increment_now(rto);
     t.poll_once_assert_pending().await;
     // Should retransmit FIN
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_FIN, seq_nr = 102, ack_nr = 0)],
+        vec![cmphead!(ST_FIN, seq_nr = 103, ack_nr = 0)],
         "should retransmit FIN"
     );
     assert_eq!(
         t.vsock.state,
         VirtualSocketState::FinWait1 {
-            our_fin: 102.into()
+            our_fin: 103.into()
         }
     );
 

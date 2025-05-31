@@ -214,6 +214,8 @@ struct ThisPoll {
     transport_pending: bool,
 
     restart: bool,
+
+    unsegmented_data: usize,
 }
 
 #[derive(Default)]
@@ -813,6 +815,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             "split_tx_queue_into_segments finished",
         );
 
+        self.this_poll.unsegmented_data = remaining;
+
         Ok(())
     }
 
@@ -1376,6 +1380,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         });
     }
 
+    fn unsent_data_exists(&mut self) -> bool {
+        // either unsegmented data exists, or unsent data exists or both
+        self.this_poll.unsegmented_data > 0
+            || self
+                .user_tx_segments
+                .iter_mut_for_sending(None)
+                .any(|s| s.send_count() == 0)
+    }
+
     fn poll(&mut self, cx: &mut std::task::Context<'_>) -> Poll<anyhow::Result<()>> {
         macro_rules! bail_if_err {
             ($e:expr) => {
@@ -1439,8 +1452,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // (Re)send tx queue.
             pending_if_cannot_send!(self.send_tx_queue(cx));
 
-            if (self.user_rx.is_reader_dropped() && self.user_tx.is_writer_dropped())
-                || self.user_tx.is_writer_shutdown()
+            if ((self.user_rx.is_reader_dropped() && self.user_tx.is_writer_dropped())
+                || self.user_tx.is_writer_shutdown())
+                && !self.unsent_data_exists()
             {
                 self.transition_to_fin_sent();
             }
@@ -1682,6 +1696,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 tmp_buf: vec![0u8; (ss.max_ss() + UTP_HEADER) as usize],
                 transport_pending: false,
                 restart: false,
+                unsegmented_data: 0,
             },
             parent_span,
             drop_guard: DropGuardSendBeforeDeath::new(
