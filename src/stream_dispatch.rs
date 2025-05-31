@@ -747,9 +747,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 trace!("MTU probe hasnt expired yet");
                 return Ok(());
             }
-            PopExpiredProbe::Empty => {
-                trace!("MTU probe empty");
-            }
+            PopExpiredProbe::Empty => {}
         }
 
         let segmented_len = self.user_tx_segments.total_len_bytes();
