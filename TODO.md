@@ -1,5 +1,6 @@
 - [ ] packet loss handling:
   - [ ] connect: need to retry SYN packets
+  - [x] MTU probing: send more than one probe to reduce corruption due to packet loss
   - [ ] MTU probing: don't probe if packet loss is likely. Probe only when the network conditions are stable.
         This can be measured with e.g. RTT variance.
 
@@ -13,6 +14,5 @@
 
 With dontfrag:
 - [x] error sending to UDP socket addr=45.142.177.18:5001, len=1356: Message too long (os error 40)
-
-- [ ] retransmit: looks like we are resetting the timer too often. We must not reset it if no new data is acked.
+- [x] retransmit: looks like we are resetting the timer too often. We must not reset it if no new data is acked.
       newly set packets should arm, but NOT rearm the timer

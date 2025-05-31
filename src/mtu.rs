@@ -1,7 +1,5 @@
 // Calculations for payload sizes that we should be sending, based on MTU and successfully
 // delivered payloads so far. Binary searches (probes) the payload size until convergence.
-//
-// TODO: if the probe is delivered but ACK is lost due to packet loss, this will corrupt the stream.
 use crate::constants::{IPV4_HEADER, IPV6_HEADER, UDP_HEADER, UTP_HEADER};
 
 #[derive(Clone, Copy, Debug)]
