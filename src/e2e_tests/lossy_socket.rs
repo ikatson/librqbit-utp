@@ -121,6 +121,7 @@ impl<const LOSS_PCT: usize> AcceptConnect for LossyUtpUdpSocket<LOSS_PCT> {
                 },
                 dont_wait_for_lastack: false,
                 remote_inactivity_timeout: Some(Duration::from_secs(10)),
+                mtu_probe_max_retransmissions: Some(3),
                 ..Default::default()
             },
         )

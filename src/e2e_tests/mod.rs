@@ -160,3 +160,9 @@ async fn e2e_test_libutp_rs2_client_libutp_rs2_server() {
 async fn e2e_test_loss_5_pct() {
     test_one_echo::<LossyUtpUdpSocket<5>, LossyUtpUdpSocket<5>>(8538, 8539).await
 }
+
+#[ignore]
+#[tokio::test]
+async fn e2e_test_loss_20_pct() {
+    test_one_echo::<LossyUtpUdpSocket<20>, LossyUtpUdpSocket<20>>(8540, 8541).await
+}
