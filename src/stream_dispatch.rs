@@ -521,11 +521,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if cwnd < mss {
                 match rec.pipe_estimate.recalc_timer {
                     Some(t) => {
-                        self.timers.recovery_pipe_expiry = Some(t);
+                        self.timers.recovery_pipe_expiry.set(t);
                     }
                     None if sent > 0 => {
-                        self.timers.recovery_pipe_expiry =
-                            Some(self.this_poll.now + calc_pipe_expiry(self.rtte.roundtrip_time()));
+                        self.timers.recovery_pipe_expiry.arm(
+                            self.this_poll.now,
+                            calc_pipe_expiry(self.rtte.roundtrip_time()),
+                            true,
+                            "cwnd < mss && sent > 0",
+                        );
                     }
                     _ => {}
                 }
@@ -1364,11 +1368,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         };
         let inactivity_poll = self.timers.remote_inactivity_timer.poll_at();
 
-        let pipe_expiry_timer = self
-            .timers
-            .recovery_pipe_expiry
-            .take()
-            .map_or(PollAt::Ingress, PollAt::Time);
+        let pipe_expiry_timer = self.timers.recovery_pipe_expiry.take().poll_at();
 
         // We wait for the earliest of our timers to fire.
         self.timers
@@ -1700,7 +1700,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 retransmit: Timer::default(),
                 sleep: Box::pin(tokio::time::sleep(Duration::from_secs(0))),
                 ack_delay_timer: Timer::default(),
-                recovery_pipe_expiry: None,
+                recovery_pipe_expiry: Timer::default(),
                 remote_inactivity_timer: {
                     let mut timer = Timer::default();
                     if rtt.is_none() {
@@ -1777,6 +1777,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
 const TIMER_RETRANSMIT: u8 = 0;
 const TIMER_INACTIVITY: u8 = 1;
 const TIMER_ACK_DELAY: u8 = 2;
+const TIMER_RECOVERY_PIPE: u8 = 3;
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
 enum Timer<const NAME: u8> {
@@ -1793,6 +1794,7 @@ impl<const NAME: u8> Timer<NAME> {
             TIMER_RETRANSMIT => "retransmit",
             TIMER_INACTIVITY => "inactivity",
             TIMER_ACK_DELAY => "ack delay",
+            TIMER_RECOVERY_PIPE => "recovery pipe",
             _ => "unknown",
         }
     }
@@ -1802,6 +1804,12 @@ impl<const NAME: u8> Timer<NAME> {
             Timer::Idle => false,
             Timer::Armed { expires_at } => *expires_at <= now,
         }
+    }
+
+    fn take(&mut self) -> Self {
+        let v = *self;
+        *self = Timer::Idle;
+        v
     }
 
     fn poll_at(&self) -> PollAt {
@@ -1816,6 +1824,10 @@ impl<const NAME: u8> Timer<NAME> {
             trace!(reason, "turning off {} timer", self.name())
         }
         *self = Timer::Idle
+    }
+
+    fn set(&mut self, expires_at: Instant) {
+        *self = Timer::Armed { expires_at }
     }
 
     fn arm(&mut self, now: Instant, delay: Duration, restart: bool, reason: &'static str) {
@@ -1853,9 +1865,7 @@ impl<const NAME: u8> Timer<NAME> {
 struct Timers {
     sleep: Pin<Box<Sleep>>,
     remote_inactivity_timer: Timer<TIMER_INACTIVITY>,
-
-    // TODO: change to Timer
-    recovery_pipe_expiry: Option<Instant>,
+    recovery_pipe_expiry: Timer<TIMER_RECOVERY_PIPE>,
     retransmit: Timer<TIMER_RETRANSMIT>,
     ack_delay_timer: Timer<TIMER_ACK_DELAY>,
 }
