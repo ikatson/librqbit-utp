@@ -237,11 +237,7 @@ macro_rules! on_packet_sent {
         $self.last_sent_ack_nr = $header.ack_nr;
         $self.last_sent_window = $header.wnd_size;
         $self.consumed_but_unacked_bytes = 0;
-        $self.timers.reset_delayed_ack_timer();
-        if matches!($header.get_type(), Type::ST_DATA) {
-            $self.timers.remote_inactivity_timer =
-                Some($self.this_poll.now + $self.socket_opts.remote_inactivity_timeout);
-        }
+        $self.timers.ack_delay_timer.turn_off("ACK sent");
     }};
 }
 
@@ -302,6 +298,14 @@ macro_rules! send_data {
                     $self.this_poll.now,
                     $self.rtte.retransmission_timeout(),
                     false,
+                    "rfc6298 5.1",
+                );
+
+                $self.timers.remote_inactivity_timer.arm(
+                    $self.this_poll.now,
+                    $self.socket_opts.remote_inactivity_timeout,
+                    false,
+                    "expecting reply on ST_DATA",
                 );
             }
             Ok(!$self.this_poll.transport_pending)
@@ -357,14 +361,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             debug!("retransmit timer expired");
             METRICS.rto_timeouts_count.increment(1);
 
-            if let Some(mut seg) = self.user_tx_segments.iter_mut_for_sending(None).next() {
+            let seg = self.user_tx_segments.iter_mut_for_sending(None).next();
+            if let Some(mut seg) = seg {
                 if send_data!(self, cx, header, seg)? {
-                    // Restart the timer.
-                    self.timers.retransmit.arm(
-                        self.env.now(),
-                        self.rtte.retransmission_timeout(),
-                        true,
-                    );
                     debug!(
                         %header.seq_nr,
                         %header.ack_nr,
@@ -381,6 +380,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         self.rtte.on_rto_timeout();
                         self.recovery.on_rto_timeout(self.last_sent_seq_nr);
                     }
+
+                    // Restart the timer.
+                    self.timers.retransmit.arm(
+                        self.env.now(),
+                        self.rtte.retransmission_timeout(),
+                        true,
+                        "rfc6298 5.6",
+                    );
 
                     // Rewind back last sent seq_nr so that normal sending resumes.
                     // The RFC doesn't seem to say that we should resend all outstanding data.
@@ -400,10 +407,24 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     Some(our_fin_seq_nr) if self.last_sent_seq_nr == our_fin_seq_nr => {
                         debug!("RTO: rewinding self.last_sent_seq_nr to retransmit FIN");
                         self.last_sent_seq_nr -= 1;
+                        if self.maybe_send_fin(cx)? {
+                            self.congestion_controller
+                                .on_retransmission_timeout(self.this_poll.now);
+                            self.rtte.on_rto_timeout();
+                            self.recovery.on_rto_timeout(self.last_sent_seq_nr);
+                            self.timers.retransmit.arm(
+                                self.env.now(),
+                                self.rtte.retransmission_timeout(),
+                                true,
+                                "rfc6298 5.6",
+                            );
+                        }
                     }
                     _ => {
                         debug!("retransmit timer expired, but nothing to send");
-                        self.timers.retransmit.turn_off();
+                        self.timers
+                            .retransmit
+                            .turn_off("RTO expired, but nothing to send");
                     }
                 }
             }
@@ -627,7 +648,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 trace!("delayed ack expired, sending ACK");
                 self.send_ack(cx)
             } else {
-                self.timers.reset_delayed_ack_timer();
+                self.timers
+                    .ack_delay_timer
+                    .turn_off("delayed ACK expired but nothing to send");
                 Ok(false)
             }
         } else {
@@ -686,19 +709,19 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.send_control_packet(cx, header)
     }
 
-    fn maybe_send_fin(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
+    fn maybe_send_fin(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
         if self.this_poll.transport_pending {
-            return Ok(());
+            return Ok(false);
         }
 
         let seq_nr = match self.state.our_fin_if_unacked() {
             Some(seq_nr) => seq_nr,
-            None => return Ok(()),
+            None => return Ok(false),
         };
 
         // Only send fin after all the outstanding data was sent.
         if seq_nr - self.last_sent_seq_nr != 1 {
-            return Ok(());
+            return Ok(false);
         }
 
         let mut fin = self.outgoing_header();
@@ -709,12 +732,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.this_poll.now,
                 self.rtte.retransmission_timeout(),
                 false,
+                "rfc6298 5.1",
             );
-            self.timers.remote_inactivity_timer =
-                Some(self.this_poll.now + self.socket_opts.remote_inactivity_timeout);
             self.last_sent_seq_nr = seq_nr;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn split_tx_queue_into_segments(
@@ -744,7 +767,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 debug!(payload_size, ?self.last_sent_seq_nr, ?rewind_to, "MTU probe expired");
                 // In case the retransmit timer expired, this is not "real" expiry, but expiry due to us sending
                 // too large segment. So ignore the retransmit timer, pretend it didn't fire.
-                self.timers.retransmit.turn_off();
+                self.timers.retransmit.turn_off("MTU probe is not real RTO");
                 self.rto_retransmissions = 0;
 
                 // TODO: do we need to IF here? Maybe min instead?
@@ -902,16 +925,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if result.on_ack_result.acked_segments_count > 0
             || result.on_ack_result.newly_sacked_segment_count > 0
         {
-            // TODO: figure out why did I put this here?
-            self.timers.remote_inactivity_timer = None;
-
             // Exit RTO mode.
             self.rto_retransmissions = 0;
 
             // Reset retransmit timer.
             if self.user_tx_segments.is_empty() && self.state.our_fin_if_unacked().is_none() {
                 // rfc6298 5.2. If all outstanding data ACKed, turn off the timer.
-                self.timers.retransmit.turn_off();
+                self.timers.retransmit.turn_off("rfc6298 5.2");
+
+                self.timers.remote_inactivity_timer.turn_off("TX is empty");
             } else {
                 // rfc6298 5.3. When an ACK is received that acknowledges new data, restart the
                 // retransmission timer.
@@ -919,6 +941,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     self.this_poll.now,
                     self.rtte.retransmission_timeout(),
                     true,
+                    "rfc6298 5.3",
+                );
+
+                self.timers.remote_inactivity_timer.arm(
+                    self.this_poll.now,
+                    self.socket_opts.remote_inactivity_timeout,
+                    true,
+                    "remote advanced",
                 );
             }
         }
@@ -1023,7 +1053,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
 
                 trace!("state: syn-ack-sent -> established");
-                self.timers.remote_inactivity_timer = None;
+                self.restart_remote_inactivity_timer();
                 self.state = Established;
             }
             (SynAckSent { .. }, ST_FIN) => {
@@ -1069,7 +1099,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             (FinWait1 { our_fin }, ST_DATA | ST_STATE) if hdr.ack_nr == our_fin => {
                 trace!("state: fin-wait-1 -> fin-wait-2");
-                self.timers.remote_inactivity_timer = None;
+                self.restart_remote_inactivity_timer();
                 self.state = FinWait2;
                 if hdr.htype == ST_STATE && hdr.seq_nr - self.last_consumed_remote_seq_nr == 1 {
                     // some clients sends back FIN + ACK as STATE with seq_nr + 1. This is proably one of them.
@@ -1080,14 +1110,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (FinWait1 { .. }, ST_DATA | ST_STATE) => {}
             (FinWait2, ST_FIN) => {
                 trace!("state: fin-wait-2 -> closed");
-                self.timers.remote_inactivity_timer = None;
+                self.restart_remote_inactivity_timer();
                 self.state = Closed;
             }
             (FinWait2, ST_DATA | ST_STATE) => {}
 
             (LastAck { our_fin, .. }, _) if hdr.ack_nr == our_fin => {
                 trace!("state: last-ack -> closed");
-                self.timers.remote_inactivity_timer = None;
+                self.restart_remote_inactivity_timer();
                 self.state = Closed;
             }
 
@@ -1238,7 +1268,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     } else {
                         ACK_DELAY
                     };
-                    self.arm_ack_delay_timer(delay);
+                    self.timers.ack_delay_timer.arm(
+                        self.this_poll.now,
+                        delay,
+                        false,
+                        "delayed ACK",
+                    );
                 }
             }
             ST_STATE => {}
@@ -1303,39 +1338,31 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn delayed_ack_expired(&self) -> bool {
         match self.timers.ack_delay_timer {
             // This means we need to ack the packet immediately.
-            AckDelayTimer::Idle => true,
-            AckDelayTimer::Waiting(t) => t <= self.this_poll.now,
+            // TODO: this is weird
+            Timer::Idle => true,
+            Timer::Armed { expires_at } => expires_at <= self.this_poll.now,
         }
     }
 
-    fn arm_ack_delay_timer(&mut self, delay: Duration) {
-        let new_expires = self.this_poll.now + delay;
-        self.timers.ack_delay_timer = match self.timers.ack_delay_timer {
-            AckDelayTimer::Idle => AckDelayTimer::Waiting(new_expires),
-            AckDelayTimer::Waiting(expires) if expires < new_expires => {
-                AckDelayTimer::Waiting(new_expires)
-            }
-            AckDelayTimer::Waiting(expires) => AckDelayTimer::Waiting(expires),
-        };
+    fn restart_remote_inactivity_timer(&mut self) {
+        self.timers.remote_inactivity_timer.arm(
+            self.this_poll.now,
+            self.socket_opts.remote_inactivity_timeout,
+            true,
+            "remote advanced",
+        );
     }
 
     // When do we need to send smth timer-based next time.
     fn next_poll_send_to_at(&mut self) -> PollAt {
         let want_ack = self.ack_to_transmit();
 
-        let delayed_ack_poll_at = match (want_ack, self.timers.ack_delay_timer) {
-            (false, _) => PollAt::Ingress,
-            (true, AckDelayTimer::Idle) => PollAt::Ingress,
-            (true, AckDelayTimer::Waiting(t)) => {
-                trace!(expires_in=?t - self.this_poll.now, "delayed ACK timer");
-                PollAt::Time(t)
-            }
+        let delayed_ack_poll_at = if !want_ack {
+            PollAt::Ingress
+        } else {
+            self.timers.ack_delay_timer.poll_at()
         };
-
-        let inactivity_poll = self
-            .timers
-            .remote_inactivity_timer
-            .map_or(PollAt::Ingress, PollAt::Time);
+        let inactivity_poll = self.timers.remote_inactivity_timer.poll_at();
 
         let pipe_expiry_timer = self
             .timers
@@ -1346,7 +1373,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         // We wait for the earliest of our timers to fire.
         self.timers
             .retransmit
-            .poll_at(self.this_poll.now)
+            .poll_at()
             .min(delayed_ack_poll_at)
             .min(inactivity_poll)
             .min(pipe_expiry_timer)
@@ -1446,7 +1473,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if self
                 .timers
                 .remote_inactivity_timer
-                .is_some_and(|expires| expires <= self.this_poll.now)
+                .expired(self.this_poll.now)
             {
                 METRICS.inactivity_timeouts.increment(1);
                 let err =
@@ -1468,7 +1495,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             // (Re)send a pending FIN if needed.
-            pending_if_cannot_send!(self.maybe_send_fin(cx));
+            pending_if_cannot_send!(self.maybe_send_fin(cx).map(|_| ()));
 
             // Send an ACK if nothing sent yet and sending an ACK is necessary.
             pending_if_cannot_send!(self.maybe_send_ack(cx).map(|_| ()));
@@ -1482,25 +1509,24 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // If we are done and there's nothing outstanding to send, give the remote last chance to
             // send a meaningful update (their FIN) or die.
             if self.state.is_local_fin_or_later() && self.user_tx_segments.is_empty() {
-                let next_exp = self.this_poll.now + Duration::from_secs(1);
-                match self.timers.remote_inactivity_timer {
-                    Some(time) if time < next_exp => {}
-                    _ => {
-                        trace!("both halves are dead, arming inactivity timer in 1 second");
-                        self.timers.remote_inactivity_timer = Some(next_exp)
-                    }
-                }
+                const SHUTDOWN_FINAL_CHANCE_DELAY: Duration = Duration::from_secs(1);
+                self.timers.remote_inactivity_timer.arm(
+                    self.this_poll.now,
+                    SHUTDOWN_FINAL_CHANCE_DELAY,
+                    false,
+                    "both reader and writer are dead",
+                );
             }
 
             // If there's a timer-based next poll to run, arm the timer.
             match self.next_poll_send_to_at() {
                 PollAt::Time(instant) => {
                     let duration = instant - self.this_poll.now;
-                    trace!(sleep = ?duration, "arming timer");
+                    trace!(?duration, "will repoll in");
                     if self.timers.arm_in(cx, duration) {
                         return Poll::Pending;
                     } else {
-                        trace!(deadline = ?instant - self.this_poll.now, "failed arming timer, continuing poll loop");
+                        trace!(deadline = ?instant - self.this_poll.now, "failed arming poll timer, continuing poll loop");
                         self.this_poll.restart = true;
                         continue;
                     }
@@ -1671,14 +1697,21 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             remote,
             conn_id_send,
             timers: Timers {
-                retransmit: RetransmitTimer::new(),
+                retransmit: Timer::default(),
                 sleep: Box::pin(tokio::time::sleep(Duration::from_secs(0))),
-                ack_delay_timer: AckDelayTimer::Idle,
+                ack_delay_timer: Timer::default(),
                 recovery_pipe_expiry: None,
-                remote_inactivity_timer: if rtt.is_some() {
-                    None
-                } else {
-                    Some(now + socket.opts().remote_inactivity_timeout)
+                remote_inactivity_timer: {
+                    let mut timer = Timer::default();
+                    if rtt.is_none() {
+                        timer.arm(
+                            now,
+                            socket.opts().remote_inactivity_timeout,
+                            true,
+                            "initial",
+                        );
+                    }
+                    timer
                 },
             },
             last_remote_timestamp,
@@ -1741,75 +1774,90 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum AckDelayTimer {
+const TIMER_RETRANSMIT: u8 = 0;
+const TIMER_INACTIVITY: u8 = 1;
+const TIMER_ACK_DELAY: u8 = 2;
+
+#[derive(Default, Debug, Clone, Copy, PartialEq)]
+enum Timer<const NAME: u8> {
+    #[default]
     Idle,
-    Waiting(Instant),
+    Armed {
+        expires_at: Instant,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum RetransmitTimer {
-    Idle,
-    Retransmit {
-        expires_at: Instant,
-        delay: Duration,
-    },
+impl<const NAME: u8> Timer<NAME> {
+    const fn name(&self) -> &'static str {
+        match NAME {
+            TIMER_RETRANSMIT => "retransmit",
+            TIMER_INACTIVITY => "inactivity",
+            TIMER_ACK_DELAY => "ack delay",
+            _ => "unknown",
+        }
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        match self {
+            Timer::Idle => false,
+            Timer::Armed { expires_at } => *expires_at <= now,
+        }
+    }
+
+    fn poll_at(&self) -> PollAt {
+        match *self {
+            Timer::Idle => PollAt::Ingress,
+            Timer::Armed { expires_at, .. } => PollAt::Time(expires_at),
+        }
+    }
+
+    fn turn_off(&mut self, reason: &'static str) {
+        if !matches!(self, Timer::Idle) {
+            trace!(reason, "turning off {} timer", self.name())
+        }
+        *self = Timer::Idle
+    }
+
+    fn arm(&mut self, now: Instant, delay: Duration, restart: bool, reason: &'static str) {
+        *self = match *self {
+            Timer::Idle => {
+                trace!(?delay, reason, "arming {} timer", self.name());
+                Timer::Armed {
+                    expires_at: now + delay,
+                }
+            }
+            Timer::Armed { .. } if restart => {
+                trace!(?delay, reason, "arming {} timer", self.name());
+                Timer::Armed {
+                    expires_at: now + delay,
+                }
+            }
+            Timer::Armed { expires_at, .. } => {
+                let new_expires = now + delay;
+                if new_expires < expires_at {
+                    trace!(
+                        reason,
+                        "rearming {} timer, expires in {:?}",
+                        self.name(),
+                        new_expires - now
+                    );
+                }
+                Timer::Armed {
+                    expires_at: expires_at.min(new_expires),
+                }
+            }
+        };
+    }
 }
 
 struct Timers {
     sleep: Pin<Box<Sleep>>,
-    remote_inactivity_timer: Option<Instant>,
+    remote_inactivity_timer: Timer<TIMER_INACTIVITY>,
+
+    // TODO: change to Timer
     recovery_pipe_expiry: Option<Instant>,
-    retransmit: RetransmitTimer,
-    ack_delay_timer: AckDelayTimer,
-}
-
-impl RetransmitTimer {
-    fn new() -> RetransmitTimer {
-        RetransmitTimer::Idle
-    }
-
-    fn expired(&self, now: Instant) -> bool {
-        match *self {
-            RetransmitTimer::Retransmit { expires_at, .. } if now >= expires_at => {
-                trace!("should retransmit, timer expired");
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn poll_at(&self, now: Instant) -> PollAt {
-        match *self {
-            RetransmitTimer::Idle => PollAt::Ingress,
-            RetransmitTimer::Retransmit { expires_at, .. } => {
-                trace!(expires=?expires_at - now, "retransmit timer");
-                PollAt::Time(expires_at)
-            }
-        }
-    }
-
-    fn turn_off(&mut self) {
-        trace!("turning off retransmit timer");
-        *self = RetransmitTimer::Idle
-    }
-
-    fn arm(&mut self, now: Instant, delay: Duration, restart: bool) {
-        *self = match *self {
-            RetransmitTimer::Idle => RetransmitTimer::Retransmit {
-                expires_at: now + delay,
-                delay,
-            },
-            RetransmitTimer::Retransmit { .. } if restart => RetransmitTimer::Retransmit {
-                expires_at: now + delay,
-                delay,
-            },
-            RetransmitTimer::Retransmit { expires_at, .. } => RetransmitTimer::Retransmit {
-                expires_at: (now + delay).min(expires_at),
-                delay,
-            },
-        };
-    }
+    retransmit: Timer<TIMER_RETRANSMIT>,
+    ack_delay_timer: Timer<TIMER_ACK_DELAY>,
 }
 
 impl Timers {
@@ -1821,16 +1869,6 @@ impl Timers {
         let mut sl = self.sleep.as_mut();
         sl.as_mut().reset(deadline);
         sl.as_mut().poll(cx) == Poll::Pending
-    }
-
-    fn reset_delayed_ack_timer(&mut self) {
-        match self.ack_delay_timer {
-            AckDelayTimer::Idle => {}
-            AckDelayTimer::Waiting(_) => {
-                trace!("stop delayed ack timer")
-            }
-        }
-        self.ack_delay_timer = AckDelayTimer::Idle;
     }
 }
 

@@ -10,7 +10,7 @@ use crate::{
     seq_nr::SeqNr,
     stream_dispatch::{
         tests::{calc_mtu_for_mss, make_test_vsock},
-        RetransmitTimer,
+        Timer,
     },
     test_util::setup_test_logging,
     SocketOpts,
@@ -25,7 +25,7 @@ async fn retransmit_timer_started() {
     let mut t = make_test_vsock(Default::default(), false);
     let (_r, mut w) = t.stream.take().unwrap().split();
 
-    assert!(matches!(t.vsock.timers.retransmit, RetransmitTimer::Idle));
+    assert!(matches!(t.vsock.timers.retransmit, Timer::Idle));
 
     w.write_all(b"test").await.unwrap();
 
@@ -35,10 +35,7 @@ async fn retransmit_timer_started() {
         vec![cmphead!(ST_DATA, seq_nr = 101, payload = "test")]
     );
 
-    assert!(matches!(
-        t.vsock.timers.retransmit,
-        RetransmitTimer::Retransmit { .. }
-    ));
+    assert!(matches!(t.vsock.timers.retransmit, Timer::Armed { .. }));
 }
 
 // (5.2) When all outstanding data has been acknowledged, turn off the
@@ -74,7 +71,7 @@ async fn retransmit_timer_idle_when_all_data_acked() {
 
     let timer_0 = t.vsock.timers.retransmit;
 
-    assert!(matches!(timer_0, RetransmitTimer::Retransmit { .. }));
+    assert!(matches!(timer_0, Timer::Armed { .. }));
 
     t.env.increment_now(Duration::from_millis(100));
     // Only 1 packet ACKed. Retransmit timer should reset.
@@ -93,10 +90,7 @@ async fn retransmit_timer_idle_when_all_data_acked() {
 
     let timer_1 = t.vsock.timers.retransmit;
     match (timer_0, timer_1) {
-        (
-            RetransmitTimer::Retransmit { expires_at: e0, .. },
-            RetransmitTimer::Retransmit { expires_at: e1, .. },
-        ) if e1 > e0 => {}
+        (Timer::Armed { expires_at: e0, .. }, Timer::Armed { expires_at: e1, .. }) if e1 > e0 => {}
         _ => {
             panic!("expected retransmit timer to update: timer_0={timer_0:?}, timer_1={timer_1:?}")
         }
@@ -135,7 +129,7 @@ async fn retransmit_timer_idle_when_all_data_acked() {
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
 
-    assert_eq!(t.vsock.timers.retransmit, RetransmitTimer::Idle);
+    assert_eq!(t.vsock.timers.retransmit, Timer::Idle);
 }
 
 #[tokio::test]
@@ -161,7 +155,7 @@ async fn retransmit_timer_not_restarted_on_newly_sent_packets() {
     );
 
     let timer_0 = t.vsock.timers.retransmit;
-    assert!(matches!(timer_0, RetransmitTimer::Retransmit { .. }));
+    assert!(matches!(timer_0, Timer::Armed { .. }));
 
     t.env.increment_now(Duration::from_millis(100));
     w.write_all(b"st").await.unwrap();
@@ -173,7 +167,7 @@ async fn retransmit_timer_not_restarted_on_newly_sent_packets() {
     );
 
     let timer_1 = t.vsock.timers.retransmit;
-    assert!(matches!(timer_0, RetransmitTimer::Retransmit { .. }));
+    assert!(matches!(timer_0, Timer::Armed { .. }));
     assert_eq!(timer_0, timer_1);
 }
 
@@ -748,4 +742,46 @@ async fn test_selective_ack_retransmission() {
     t.env.increment_now(FORCED_RETRANSMISSION_TIME);
     t.poll_once_assert_pending().await;
     t.assert_sent_empty_msg("Should not retransmit after both packets acknowledged");
+}
+
+#[tokio::test]
+async fn fin_retransmit() {
+    setup_test_logging();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            ..Default::default()
+        },
+        false,
+    );
+    let (r, w) = t.stream.take().unwrap().split();
+    drop(r);
+    drop(w);
+
+    // Force small RTO so that it wins VS hard-coded 1 second inactivity timer.
+    const SMALL_RTT: Duration = Duration::from_millis(10);
+    for _ in 0..100 {
+        t.vsock.rtte.sample(SMALL_RTT);
+    }
+
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent(), vec![cmphead!(ST_FIN, seq_nr = 101)]);
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+
+    // Trigger RTO. Ensure it gets resent only once.
+    let rto_0 = t.vsock.rtte.retransmission_timeout();
+    t.env.increment_now(rto_0);
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent(), vec![cmphead!(ST_FIN, seq_nr = 101)]);
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+
+    // Trigger RTO again. Ensure it gets resent only once.
+    let rto_1 = t.vsock.rtte.retransmission_timeout();
+    assert!(rto_1 > rto_0);
+    t.env.increment_now(rto_1);
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent(), vec![cmphead!(ST_FIN, seq_nr = 101)]);
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
 }

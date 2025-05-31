@@ -10,7 +10,7 @@ use crate::{
 };
 
 #[tokio::test]
-async fn test_inactivity_timeout() {
+async fn test_inactivity_timeout_0() {
     setup_test_logging();
 
     // Set up socket with a short inactivity timeout
