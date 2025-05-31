@@ -16,3 +16,7 @@ With dontfrag:
 - [x] error sending to UDP socket addr=45.142.177.18:5001, len=1356: Message too long (os error 40)
 - [x] retransmit: looks like we are resetting the timer too often. We must not reset it if no new data is acked.
       newly set packets should arm, but NOT rearm the timer
+
+
+Real world:
+- [ ] Spammy message, seems to occur in a loop mostly: RTO expired, rewinding to retransmit FIN
