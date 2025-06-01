@@ -2,6 +2,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::trace;
 
 use crate::{
+    constants::ACK_DELAY,
     raw::{Type::*, UtpHeader},
     stream_dispatch::{
         tests::{make_test_vsock, make_test_vsock_args},
@@ -223,9 +224,10 @@ async fn test_sequence_numbers_incoming() {
         t.take_sent(),
         vec![cmphead!(ST_STATE, seq_nr = 31420, ack_nr = 15089)]
     );
-    // allow sending by setting the remote window
     t.send_data(15090, 31419, "hello");
-    t.vsock.force_immediate_ack();
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+    t.env.increment_now(ACK_DELAY);
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
@@ -304,8 +306,9 @@ async fn test_sequence_numbers_outgoing() {
     );
     t.send_data(31420, 15090, "hello");
     t.send_data(31421, 15090, "world");
-
-    t.vsock.force_immediate_ack();
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+    t.env.increment_now(ACK_DELAY);
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),

@@ -648,6 +648,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             METRICS.immediate_acks.increment(1);
             return self.send_ack(cx);
         }
+        if self.should_send_window_update() {
+            return self.send_ack(cx);
+        }
         if self.delayed_ack_expired() {
             if self.ack_to_transmit() {
                 METRICS.delayed_acks.increment(1);
@@ -921,7 +924,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             };
             result.update(&self.process_incoming_message(cx, msg)?);
             counter += 1;
-            if self.state_is_closed() {
+            if self.state_is_closed() || self.this_poll.transport_pending {
                 break;
             }
         }
@@ -1199,7 +1202,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         %self.last_consumed_remote_seq_nr,
                         "ignoring message, we already processed it. There might be packet loss, resending ACK."
                     );
-                    self.force_immediate_ack();
+                    self.force_immediate_ack("duplicate ST_DATA");
                     METRICS.incoming_already_acked_data_packets.increment(1);
                     return Ok(result);
                 }
@@ -1263,7 +1266,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         immediate_ack_to_transmit = self.immediate_ack_to_transmit(),
                         "forcing immediate ACK"
                     );
-                    self.force_immediate_ack();
+
+                    self.force_immediate_ack("out of order or filled gap");
+
+                    // Send right away so that we send an ACK per segment. This is necessary so that
+                    // the reciever gets duplicate ACKs as soon as possible to repair loss.
+                    self.send_ack(cx)?;
                 }
 
                 if !self.immediate_ack_to_transmit() && self.consumed_but_unacked_bytes > 0 {
@@ -1289,7 +1297,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     debug!("remote closed with {close_reason:?}");
                 }
 
-                self.force_immediate_ack();
+                self.force_immediate_ack("ST_FIN received");
 
                 // TODO: if offset < 0, there's something very weird going on, do whatever.
                 if !previously_seen_remote_fin && offset >= 0 {
@@ -1328,12 +1336,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     /// Return whether to send ACK immediately due to the amount of unacknowledged data.
     /// https://datatracker.ietf.org/doc/html/rfc9293#section-3.8.6.3
     fn immediate_ack_to_transmit(&self) -> bool {
-        self.should_send_window_update()
-            || self.consumed_but_unacked_bytes
-                >= HARD_IMMEDIATE_ACK_EVERY_RMSS * self.segment_sizes.mss() as usize
+        self.consumed_but_unacked_bytes
+            >= HARD_IMMEDIATE_ACK_EVERY_RMSS * self.segment_sizes.mss() as usize
     }
 
-    fn force_immediate_ack(&mut self) {
+    fn force_immediate_ack(&mut self, reason: &'static str) {
+        trace!(reason, "forcing immedaite ACK");
         self.consumed_but_unacked_bytes = usize::MAX;
     }
 
@@ -1479,6 +1487,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             // If this is an incoming connection, send back an ACK.
             pending_if_cannot_send!(self.maybe_send_syn_ack(cx));
+
+            // We must send an immediate ACK per out-of-order segment. If the loop stopped last
+            // time on transport pending this will try again without consuming the RX queue.
+            if self.immediate_ack_to_transmit() {
+                pending_if_cannot_send!(self.maybe_send_ack(cx).map(|_| ()));
+            }
 
             // Read incoming stream.
             pending_if_cannot_send!(self.process_all_incoming_messages(cx));

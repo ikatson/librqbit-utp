@@ -159,6 +159,7 @@ async fn test_inactivity_timeout_initial_synack() {
 
 #[tokio::test]
 async fn test_inactivity_timeout_our_fin_acked() {
+    setup_test_logging();
     let opts = SocketOpts {
         remote_inactivity_timeout: Some(Duration::from_secs(1)),
         ..Default::default()
