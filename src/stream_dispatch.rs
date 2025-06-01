@@ -385,7 +385,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                     // Restart the timer.
                     self.timers.retransmit.arm(
-                        self.env.now(),
+                        self.this_poll.now,
                         self.rtte.retransmission_timeout(),
                         true,
                         "rfc6298 5.6",
@@ -415,7 +415,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                             self.rtte.on_rto_timeout();
                             self.recovery.on_rto_timeout(self.last_sent_seq_nr);
                             self.timers.retransmit.arm(
-                                self.env.now(),
+                                self.this_poll.now,
                                 self.rtte.retransmission_timeout(),
                                 true,
                                 "rfc6298 5.6",
@@ -1368,7 +1368,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         } else {
             self.timers.ack_delay_timer.poll_at()
         };
-        // We wait for the earliest of our timers to fire.
+
+        // No reason to repoll if we can't send anything. We'll get polled when the socket is cleared.
+        if self.this_poll.transport_pending {
+            return self.timers.remote_inactivity_timer.poll_at();
+        }
+
+        // Wait for the earliest of our timers to fire.
         self.timers
             .retransmit
             .poll_at()
@@ -1500,7 +1506,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if ((self.user_rx.is_reader_dropped() && self.user_tx.is_writer_dropped())
                 || self.user_tx.is_writer_shutdown())
                 && !self.unsent_data_exists()
+                && !self.state.is_local_fin_or_later()
             {
+                debug!("consumer closed and no data to send, shutting down");
                 self.transition_to_fin_wait_1();
             }
 
