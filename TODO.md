@@ -19,4 +19,7 @@ With dontfrag:
 
 
 Real world:
-- [ ] Spammy message, seems to occur in a loop mostly: RTO expired, rewinding to retransmit FIN
+- [x] Spammy message, seems to occur in a loop mostly: RTO expired, rewinding to retransmit FIN
+
+Code:
+- [ ] maybe_send_syn_ack() - timer handling is a bit custom, need to use RTO and timers framework

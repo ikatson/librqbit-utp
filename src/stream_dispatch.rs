@@ -45,7 +45,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum VirtualSocketState {
     SynReceived,
-    SynAckSent { expires_at: Instant, count: usize },
+    SynAckSent { count: usize },
 
     Established,
 
@@ -84,7 +84,7 @@ impl VirtualSocketState {
         }
     }
 
-    fn transition_to_fin_sent(&mut self, our_fin: SeqNr) -> bool {
+    fn transition_to_fin_wait_1(&mut self, our_fin: SeqNr) -> bool {
         match *self {
             VirtualSocketState::Established
             | VirtualSocketState::SynReceived
@@ -278,37 +278,39 @@ macro_rules! send_data {
                 &$self.this_poll.tmp_buf[..len],
                 $self.remote,
             )?;
-            if !$self.this_poll.transport_pending {
-                // This time better be as precise as possible as we are using it to
-                // calculate recovery pipe (estimate of how many packets are in transit).
-                // see rfc6675.
-                $segment_iter_item.on_sent($self.env.now());
-                on_packet_sent!($self, $header);
-
-                #[cfg(feature = "per-connection-metrics")]
-                $self.metrics.sent_bytes.increment(len as u64);
-
-                if $segment_iter_item.seq_nr() > $self.last_sent_seq_nr {
-                    $self.last_sent_seq_nr = $segment_iter_item.seq_nr();
-                    $self.seq_nr = $segment_iter_item.seq_nr() + 1;
-                }
-
-                // rfc6298 5.1
-                $self.timers.retransmit.arm(
-                    $self.this_poll.now,
-                    $self.rtte.retransmission_timeout(),
-                    false,
-                    "rfc6298 5.1",
-                );
-
-                $self.timers.remote_inactivity_timer.arm(
-                    $self.this_poll.now,
-                    $self.socket_opts.remote_inactivity_timeout,
-                    false,
-                    "expecting reply on ST_DATA",
-                );
+            if $self.this_poll.transport_pending {
+                return Ok(false);
             }
-            Ok(!$self.this_poll.transport_pending)
+
+            // This time better be as precise as possible as we are using it to
+            // calculate recovery pipe (estimate of how many packets are in transit).
+            // see rfc6675.
+            $segment_iter_item.on_sent($self.env.now());
+            on_packet_sent!($self, $header);
+
+            #[cfg(feature = "per-connection-metrics")]
+            $self.metrics.sent_bytes.increment(len as u64);
+
+            if $segment_iter_item.seq_nr() > $self.last_sent_seq_nr {
+                $self.last_sent_seq_nr = $segment_iter_item.seq_nr();
+                $self.seq_nr = $segment_iter_item.seq_nr() + 1;
+            }
+
+            // rfc6298 5.1
+            $self.timers.retransmit.arm(
+                $self.this_poll.now,
+                $self.rtte.retransmission_timeout(),
+                false,
+                "rfc6298 5.1",
+            );
+
+            $self.timers.remote_inactivity_timer.arm(
+                $self.this_poll.now,
+                $self.socket_opts.remote_inactivity_timeout,
+                false,
+                "expecting reply on ST_DATA",
+            );
+            Ok(true)
         };
         tmp_closure()
     }};
@@ -910,7 +912,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     // receive any messages!
 
                     debug!("can't receive messages anymore. Transitioning to Closed");
-                    self.transition_to_fin_sent();
+                    self.transition_to_fin_wait_1();
                     self.maybe_send_fin(cx)?;
                     log_if_changed!(Level::DEBUG, "state", self, |s| s.state, |s| s.state =
                         VirtualSocketState::Closed);
@@ -1366,50 +1368,58 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         } else {
             self.timers.ack_delay_timer.poll_at()
         };
-        let inactivity_poll = self.timers.remote_inactivity_timer.poll_at();
-
-        let pipe_expiry_timer = self.timers.recovery_pipe_expiry.take().poll_at();
-
         // We wait for the earliest of our timers to fire.
         self.timers
             .retransmit
             .poll_at()
             .min(delayed_ack_poll_at)
-            .min(inactivity_poll)
-            .min(pipe_expiry_timer)
+            .min(self.timers.remote_inactivity_timer.poll_at())
+            .min(self.timers.recovery_pipe_expiry.take().poll_at())
+            .min(self.timers.syn_ack_resend.poll_at())
     }
 
     /// If this is an incoming connection, send back an ACK.
     fn maybe_send_syn_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
         let sent_count = match self.state {
             VirtualSocketState::SynReceived => 0,
-            VirtualSocketState::SynAckSent { expires_at, count }
-                if expires_at < self.this_poll.now =>
+            VirtualSocketState::SynAckSent { count }
+                if self.timers.syn_ack_resend.expired(self.this_poll.now) =>
             {
                 count
             }
-            _ => return Ok(()),
+            VirtualSocketState::SynAckSent { .. } => {
+                // Timer hasn't expired yet.
+                return Ok(());
+            }
+            _ => {
+                self.timers.syn_ack_resend.turn_off("past SYN-ACK");
+                return Ok(());
+            }
         };
         if sent_count == self.socket_opts.max_segment_retransmissions.get() {
             bail!("too many syn-acks sent")
         }
         if self.send_ack(cx)? {
             self.state = VirtualSocketState::SynAckSent {
-                expires_at: self.this_poll.now + SYNACK_RESEND_INTERNAL,
                 count: sent_count + 1,
             };
 
             if sent_count > 0 {
                 METRICS.synack_retransmissions.increment(1);
             }
-            self.timers.arm_in(cx, SYNACK_RESEND_INTERNAL);
+            self.timers.syn_ack_resend.arm(
+                self.this_poll.now,
+                SYNACK_RESEND_INTERNAL,
+                true,
+                "retransmitted SYN-ACK",
+            );
         }
         Ok(())
     }
 
-    fn transition_to_fin_sent(&mut self) {
+    fn transition_to_fin_wait_1(&mut self) {
         log_if_changed!(Level::DEBUG, "state", self, |s| s.state, |s| {
-            if s.state.transition_to_fin_sent(s.seq_nr) {
+            if s.state.transition_to_fin_wait_1(s.seq_nr) {
                 s.seq_nr += 1;
             }
         });
@@ -1491,7 +1501,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 || self.user_tx.is_writer_shutdown())
                 && !self.unsent_data_exists()
             {
-                self.transition_to_fin_sent();
+                self.transition_to_fin_wait_1();
             }
 
             // (Re)send a pending FIN if needed.
@@ -1508,7 +1518,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             // If we are done and there's nothing outstanding to send, give the remote last chance to
             // send a meaningful update (their FIN) or die.
-            if self.state.is_local_fin_or_later() && self.user_tx_segments.is_empty() {
+            if self.state.is_local_fin_or_later() {
                 const SHUTDOWN_FINAL_CHANCE_DELAY: Duration = Duration::from_secs(1);
                 self.timers.remote_inactivity_timer.arm(
                     self.this_poll.now,
@@ -1701,6 +1711,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 sleep: Box::pin(tokio::time::sleep(Duration::from_secs(0))),
                 ack_delay_timer: Timer::default(),
                 recovery_pipe_expiry: Timer::default(),
+                syn_ack_resend: Timer::default(),
                 remote_inactivity_timer: {
                     let mut timer = Timer::default();
                     if rtt.is_none() {
@@ -1778,6 +1789,7 @@ const TIMER_RETRANSMIT: u8 = 0;
 const TIMER_INACTIVITY: u8 = 1;
 const TIMER_ACK_DELAY: u8 = 2;
 const TIMER_RECOVERY_PIPE: u8 = 3;
+const TIMER_SYN_ACK_RESEND: u8 = 4;
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
 enum Timer<const NAME: u8> {
@@ -1795,6 +1807,7 @@ impl<const NAME: u8> Timer<NAME> {
             TIMER_INACTIVITY => "inactivity",
             TIMER_ACK_DELAY => "ack delay",
             TIMER_RECOVERY_PIPE => "recovery pipe",
+            TIMER_SYN_ACK_RESEND => "syn ack resend",
             _ => "unknown",
         }
     }
@@ -1868,6 +1881,7 @@ struct Timers {
     recovery_pipe_expiry: Timer<TIMER_RECOVERY_PIPE>,
     retransmit: Timer<TIMER_RETRANSMIT>,
     ack_delay_timer: Timer<TIMER_ACK_DELAY>,
+    syn_ack_resend: Timer<TIMER_SYN_ACK_RESEND>,
 }
 
 impl Timers {
