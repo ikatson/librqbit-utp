@@ -3,7 +3,7 @@ pub mod selective_ack;
 
 use anyhow::{bail, Context};
 
-use tracing::{debug, trace};
+use tracing::trace;
 
 use crate::{constants::UTP_HEADER, seq_nr::SeqNr};
 
@@ -196,9 +196,11 @@ impl UtpHeader {
                         ));
                 }
                 _ => {
-                    debug!(
+                    trace!(
                         ext,
-                        next_ext, ext_len, "unsupported extension for serializing, skipping"
+                        next_ext,
+                        ext_len,
+                        "unsupported extension for deserializing, skipping"
                     );
                 }
             }

@@ -360,13 +360,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         // Retransmit timer expired, rewind state backwards.
         if self.timers.retransmit.expired(self.this_poll.now) {
-            debug!("retransmit timer expired");
+            trace!("retransmit timer expired");
             METRICS.rto_timeouts_count.increment(1);
 
             let seg = self.user_tx_segments.iter_mut_for_sending(None).next();
             if let Some(mut seg) = seg {
                 if send_data!(self, cx, header, seg)? {
-                    debug!(
+                    trace!(
                         %header.seq_nr,
                         %header.ack_nr,
                         payload_size = seg.payload_size(),
@@ -407,7 +407,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 // There's no data to send. Maybe we need to resend FIN? Check.
                 match self.state.our_fin_if_unacked() {
                     Some(our_fin_seq_nr) if self.last_sent_seq_nr == our_fin_seq_nr => {
-                        debug!("RTO: rewinding self.last_sent_seq_nr to retransmit FIN");
+                        trace!("RTO: rewinding self.last_sent_seq_nr to retransmit FIN");
                         self.last_sent_seq_nr -= 1;
                         if self.maybe_send_fin(cx)? {
                             self.congestion_controller
@@ -423,7 +423,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         }
                     }
                     _ => {
-                        debug!("retransmit timer expired, but nothing to send");
+                        trace!("retransmit timer expired, but nothing to send");
                         self.timers
                             .retransmit
                             .turn_off("RTO expired, but nothing to send");
@@ -761,7 +761,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         if self.state.is_remote_fin_or_later() {
-            debug!(?self.state, "there is still unsent data, but the remote closed, so not segmenting further");
+            trace!(?self.state, "there is still unsent data, but the remote closed, so not segmenting further");
             return Ok(());
         }
 
@@ -841,7 +841,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             trace!(bytes = payload_size, "segmented");
 
             if is_mtu_probe {
-                debug!(payload_size, "MTU probing, not segmenting more data");
+                trace!(payload_size, "MTU probing, not segmenting more data");
                 break;
             }
         }
@@ -888,7 +888,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             fin.seq_nr = self.seq_nr;
             self.seq_nr += 1;
             if let Err(e) = self.send_control_packet(cx, fin) {
-                debug!("error sending FIN: {e:#}")
+                trace!("error sending FIN: {e:#}")
             }
         }
     }
@@ -914,7 +914,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     // We need to send FIN in this case, but we can't wait for its ACK to arrive back, cause we can't
                     // receive any messages!
 
-                    debug!("can't receive messages anymore. Transitioning to Closed");
+                    trace!("can't receive messages anymore. Transitioning to Closed");
                     self.transition_to_fin_wait_1();
                     self.maybe_send_fin(cx)?;
                     log_if_changed!(Level::DEBUG, "state", self, |s| s.state, |s| s.state =
@@ -1076,7 +1076,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (Established | FinWait1 { .. } | FinWait2, ST_FIN)
                 if hdr.seq_nr != self.last_consumed_remote_seq_nr + 1 =>
             {
-                debug!(
+                trace!(
                     hdr=%hdr.short_repr(),
                     "dropping FIN, expected seq_nr to be {}",
                     self.last_consumed_remote_seq_nr + 1
@@ -1132,11 +1132,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             (LastAck { remote_fin, .. }, _) if hdr.seq_nr > remote_fin => {
                 if hdr.htype == ST_DATA {
-                    debug!(hdr=%hdr.short_repr(), ?remote_fin, "received higher seq nr than remote FIN, dropping packet");
+                    trace!(hdr=%hdr.short_repr(), ?remote_fin, "received higher seq nr than remote FIN, dropping packet");
                     return Ok(Default::default());
                 } else {
                     // We COULD drop this packet, but turns out it happens very often in the wild.
-                    debug!(hdr=%hdr.short_repr(), ?remote_fin, "received higher seq nr than remote FIN, ignoring this");
+                    trace!(hdr=%hdr.short_repr(), ?remote_fin, "received higher seq nr than remote FIN, ignoring this");
                 }
             }
 
@@ -1307,7 +1307,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
             ST_SYN => {
-                debug!("ignoring unexpected ST_SYN packet: {:?}", msg.header);
+                trace!("ignoring unexpected ST_SYN packet: {:?}", msg.header);
             }
         }
         Ok(result)

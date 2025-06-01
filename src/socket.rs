@@ -360,7 +360,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 let message = match UtpMessage::deserialize(&read_buf[..len]) {
                     Some(msg) => msg,
                     None => {
-                        debug!(len, ?addr, "error deserializing and validating UTP message");
+                        trace!(len, ?addr, "error deserializing and validating UTP message");
                         return Ok(())
                     }
                 };
@@ -474,7 +474,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 };
             }
             ControlRequest::Shutdown(key) => {
-                debug!(?key, "removing stream");
+                trace!(?key, "removing stream");
                 self.streams.remove(&key);
             }
         }
@@ -487,7 +487,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     #[tracing::instrument(level = "trace", skip_all, fields(addr, seq_nr=?msg.header.seq_nr, ack_nr=?msg.header.ack_nr))]
     fn on_maybe_connect_ack(&mut self, addr: SocketAddr, msg: UtpMessage) -> anyhow::Result<()> {
         if self.streams_full() {
-            debug!(
+            trace!(
                 active_streams = self.streams.len(),
                 ?msg,
                 "dropping potential SYN-ACK packet, too many active streams"

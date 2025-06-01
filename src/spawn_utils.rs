@@ -18,7 +18,7 @@ pub fn spawn(
     fut: impl std::future::Future<Output = anyhow::Result<()>> + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
     let fut = async move {
-        debug!("started");
+        trace!("started");
         tokio::pin!(fut);
         let mut trace_interval = tokio::time::interval(std::time::Duration::from_secs(5));
 
@@ -34,7 +34,7 @@ pub fn spawn(
                         }
                         Err(e) => {
                             if e.is::<CancelledError>() {
-                                debug!("task cancelled")
+                                trace!("task cancelled")
                             } else {
                                 debug!("finished with error: {:#}", e)
                             }

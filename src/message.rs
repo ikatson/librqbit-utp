@@ -1,4 +1,4 @@
-use tracing::debug;
+use tracing::trace;
 
 use crate::{
     raw::{Type, UtpHeader},
@@ -44,13 +44,13 @@ impl UtpMessage {
         match header.get_type() {
             Type::ST_DATA => {
                 if payload_size == 0 {
-                    debug!("ST_DATA packet with 0 payload, ignoring");
+                    trace!("ST_DATA packet with 0 payload, ignoring");
                     return None;
                 }
             }
             other => {
                 if payload_size > 0 {
-                    debug!("{other:?} packet with payload, ignoring");
+                    trace!("{other:?} packet with payload, ignoring");
                     return None;
                 }
             }
