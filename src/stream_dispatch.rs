@@ -1367,29 +1367,31 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         );
     }
 
-    // When do we need to send smth timer-based next time.
-    fn next_poll_send_to_at(&mut self) -> PollAt {
+    // When do we need to poll next time based on timers expiring
+    fn next_poll_send_to_at(&mut self) -> Option<Instant> {
         // No reason to repoll if we can't send anything. We'll get polled when the socket is cleared.
         if self.this_poll.transport_pending {
             return self.timers.remote_inactivity_timer.poll_at();
         }
 
         let want_ack = self.ack_to_transmit();
-
         let delayed_ack_poll_at = if !want_ack {
-            PollAt::Ingress
+            None
         } else {
             self.timers.ack_delay_timer.poll_at()
         };
 
         // Wait for the earliest of our timers to fire.
-        self.timers
-            .retransmit
-            .poll_at()
-            .min(delayed_ack_poll_at)
-            .min(self.timers.remote_inactivity_timer.poll_at())
-            .min(self.timers.recovery_pipe_expiry.take().poll_at())
-            .min(self.timers.syn_ack_resend.poll_at())
+        [
+            delayed_ack_poll_at,
+            self.timers.retransmit.poll_at(),
+            self.timers.remote_inactivity_timer.poll_at(),
+            self.timers.recovery_pipe_expiry.take().poll_at(), // take() disarms it on every call
+            self.timers.syn_ack_resend.poll_at(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// If this is an incoming connection, send back an ACK.
@@ -1552,7 +1554,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             // If there's a timer-based next poll to run, arm the timer.
             match self.next_poll_send_to_at() {
-                PollAt::Time(instant) => {
+                Some(instant) => {
                     let duration = instant - self.this_poll.now;
                     trace!(?duration, "will repoll in");
                     if self.timers.arm_in(cx, duration) {
@@ -1563,7 +1565,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         continue;
                     }
                 }
-                PollAt::Ingress => return Poll::Pending,
+                None => return Poll::Pending,
             }
         }
 
@@ -1847,10 +1849,10 @@ impl<const NAME: u8> Timer<NAME> {
         v
     }
 
-    fn poll_at(&self) -> PollAt {
+    fn poll_at(&self) -> Option<Instant> {
         match *self {
-            Timer::Idle => PollAt::Ingress,
-            Timer::Armed { expires_at, .. } => PollAt::Time(expires_at),
+            Timer::Idle => None,
+            Timer::Armed { expires_at, .. } => Some(expires_at),
         }
     }
 
@@ -1925,13 +1927,4 @@ impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T,
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         self.get_mut().poll(cx)
     }
-}
-
-/// Gives an indication on the next time the socket should be polled.
-#[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum PollAt {
-    /// The socket needs to be polled at given [Instant][struct.Instant].
-    Time(Instant),
-    /// The socket does not need to be polled unless there are external changes.
-    Ingress,
 }
