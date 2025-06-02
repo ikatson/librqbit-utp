@@ -10,7 +10,13 @@ readme = "README.md"
 
 [features]
 default = []
+
+# Turn on to export metrics to the metrics crate, which can be exported e.g. using
+# prometheus exporter.
 export-metrics = ["metrics"]
+
+# This will export metrics per connection. Use this for debugging mostly, as running this in prod
+# may be costly - produces too many metrics and they aren't GC'ed by the metrics crate.
 per-connection-metrics = ["metrics"]
 
 [dependencies]

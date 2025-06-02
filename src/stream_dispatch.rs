@@ -1369,6 +1369,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
     // When do we need to send smth timer-based next time.
     fn next_poll_send_to_at(&mut self) -> PollAt {
+        // No reason to repoll if we can't send anything. We'll get polled when the socket is cleared.
+        if self.this_poll.transport_pending {
+            return self.timers.remote_inactivity_timer.poll_at();
+        }
+
         let want_ack = self.ack_to_transmit();
 
         let delayed_ack_poll_at = if !want_ack {
@@ -1376,11 +1381,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         } else {
             self.timers.ack_delay_timer.poll_at()
         };
-
-        // No reason to repoll if we can't send anything. We'll get polled when the socket is cleared.
-        if self.this_poll.transport_pending {
-            return self.timers.remote_inactivity_timer.poll_at();
-        }
 
         // Wait for the earliest of our timers to fire.
         self.timers
