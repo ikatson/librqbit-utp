@@ -1523,23 +1523,19 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             // If there's a timer-based next poll to run, arm the timer.
-            match self.next_timer_to_poll() {
-                Some(instant) => {
-                    let duration = instant - self.this_poll.now;
-                    trace!(?duration, "will repoll in");
-                    if self.timers.arm_in(cx, duration) {
-                        return Poll::Pending;
-                    } else {
-                        trace!(deadline = ?instant - self.this_poll.now, "failed arming poll timer, continuing poll loop");
-                        self.this_poll.restart = true;
-                        continue;
-                    }
+            if let Some(instant) = self.next_timer_to_poll() {
+                let duration = instant - self.this_poll.now;
+                trace!(?duration, "will repoll in");
+                if !self.timers.arm_in(cx, duration) {
+                    trace!(deadline = ?duration, "failed arming poll timer, waking to repoll");
+                    cx.waker().wake_by_ref();
                 }
-                None => return Poll::Pending,
             }
+
+            return Poll::Pending;
         }
 
-        Poll::Pending
+        Poll::Ready(Err(anyhow::anyhow!("unreachable")))
     }
 }
 
