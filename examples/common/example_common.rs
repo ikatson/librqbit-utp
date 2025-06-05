@@ -22,11 +22,9 @@ pub const TIMEOUT: Duration = Duration::from_secs(5);
 const BUFFER_SIZE: usize = 16384;
 
 pub async fn bench_receiver(mut stream: impl AsyncRead + Unpin) -> anyhow::Result<()> {
-    // Create static/global counters for all connections
     static LAST_PRINT: AtomicU64 = AtomicU64::new(0);
     static TOTAL_BYTES: AtomicU64 = AtomicU64::new(0);
 
-    // Initialize start time only once
     let mut buffer = vec![0u8; BUFFER_SIZE];
     let m_read_len = histogram!("utp_bench_read_len");
 
@@ -38,7 +36,8 @@ pub async fn bench_receiver(mut stream: impl AsyncRead + Unpin) -> anyhow::Resul
 
                 let now = UNIX_EPOCH.elapsed().unwrap().as_millis() as u64;
                 let prev = LAST_PRINT.load(Ordering::Relaxed);
-                if now - prev > 1000
+                let diff = now.saturating_sub(prev);
+                if diff > 1000
                     && LAST_PRINT
                         .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
                         .is_ok()
@@ -47,7 +46,7 @@ pub async fn bench_receiver(mut stream: impl AsyncRead + Unpin) -> anyhow::Resul
                     let total = TOTAL_BYTES
                         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |_| Some(0))
                         .unwrap();
-                    let elapsed = (now - prev) as f64 / 1000.;
+                    let elapsed = diff as f64 / 1000.;
                     let speed = (total as f64) / (1024.0 * 1024.0) / elapsed;
                     info!("Total receiving speed: {:.2} MB/s", speed);
                 }
@@ -83,9 +82,6 @@ pub async fn echo(
     writer: impl AsyncWrite + Unpin,
 ) -> anyhow::Result<()> {
     let mut reader = reader;
-
-    // const MAX_COUNTER: u64 = 1_000_000;
-    // const PRINT_EVERY: u64 = 100_000;
 
     const MAX_COUNTER: u64 = 1000;
     const PRINT_EVERY: u64 = 100;
