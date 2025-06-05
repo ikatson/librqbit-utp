@@ -10,7 +10,7 @@ macro_rules! log_every_ms {
             let last = LAST_RUN.load(::std::sync::atomic::Ordering::Relaxed);
             let now = now.as_millis() as u64;
 
-            if (now - last) > $dur {
+            if now.saturating_sub(last) > $dur {
                 if let Ok(_) = LAST_RUN.compare_exchange_weak(
                     last,
                     now,
