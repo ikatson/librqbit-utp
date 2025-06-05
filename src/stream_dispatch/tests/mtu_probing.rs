@@ -31,6 +31,7 @@ async fn test_mtu_probing() {
         SocketOpts {
             link_mtu: Some(1500),
             mtu_probe_max_retransmissions: Some(0),
+            vsock_tx_bufsize_bytes: Some(1024 * 1024), // so that we can write the initial large payload without blocking
             disable_nagle: true,
             ..Default::default()
         },

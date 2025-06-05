@@ -16,7 +16,7 @@ pub const UTP_HEADER: u16 = 20;
 // many bytes are unread in user's stream reader.
 pub const DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK: usize = 1024 * 1024;
 // By default, this is how many unACKed bytes the socket can store without blocking writer.
-pub const DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK: usize = 1024 * 1024;
+pub const DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK: usize = 64 * 1024;
 // Outgoing MTU is autodetected using this IP. It's used to calculate the maximum uTP
 // segment size we can send.
 
