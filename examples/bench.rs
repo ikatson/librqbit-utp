@@ -266,7 +266,6 @@ impl BenchArgs {
                 tracing: self.librqbit_utp_congestion_tracing,
                 ..Default::default()
             },
-            udp_socket_rx_bufsize_bytes: self.udp_rcvbuf_kb.map(|v| v * 1024),
             ..Default::default()
         }
     }

@@ -73,10 +73,6 @@ impl CongestionConfig {
 pub struct SocketOpts {
     pub link_mtu: Option<usize>,
 
-    /// If set will try to send SO_RCVBUF option on the socket.
-    /// If not set, will use OS default.
-    pub udp_socket_rx_bufsize_bytes: Option<usize>,
-
     /// For flow control, if the user isn't reading, when to start dropping packets.
     pub vsock_rx_bufsize_bytes: Option<usize>,
     /// How many bytes to allocate for each virtual socket's TX.
@@ -671,26 +667,30 @@ impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
 
 pub type UtpSocketUdp = UtpSocket<tokio::net::UdpSocket, DefaultUtpEnvironment>;
 
-fn set_udp_rcvbuf(
-    sock: tokio::net::UdpSocket,
-    bufsize: usize,
-) -> anyhow::Result<tokio::net::UdpSocket> {
-    let sock = sock.into_std()?;
-    let sock = socket2::Socket::from(sock);
-    let previous = sock.recv_buffer_size();
-    if let Err(e) = sock.set_recv_buffer_size(bufsize) {
-        tracing::warn!("error setting UDP socket rcv buf size: {e:#}");
-    } else {
-        let current = sock.recv_buffer_size();
-        tracing::info!(
-            expected = bufsize,
-            ?previous,
-            ?current,
-            "set UDP rcv buf size"
-        )
+fn try_set_udp_rcvbuf(sock: &tokio::net::UdpSocket, bufsize: usize) {
+    let sock = socket2::SockRef::from(&sock);
+    let prev = sock.recv_buffer_size();
+    match sock.set_recv_buffer_size(bufsize) {
+        Ok(()) => match sock.recv_buffer_size() {
+            Ok(value) if value == bufsize => {
+                tracing::info!(?prev, current = value, "successfully set UDP rcv buf size");
+            }
+            Ok(value) => {
+                tracing::warn!(
+                    ?prev,
+                    current = value,
+                    expected = bufsize,
+                    "couldn't set UDP rcv buf size to requested value. There might be packet loss, try increasing rmem_max or equivalent."
+                );
+            }
+            Err(e) => {
+                tracing::warn!(?prev, expected=?bufsize, "updated UDP rcv buf size, but got error reading the value: {e:#}.")
+            }
+        },
+        Err(e) => {
+            tracing::warn!(current=?prev, "error setting UDP socket rcv buf size: {e:#}");
+        }
     }
-    let sock: std::net::UdpSocket = sock.into();
-    Ok(tokio::net::UdpSocket::from_std(sock)?)
 }
 
 impl UtpSocketUdp {
@@ -702,7 +702,7 @@ impl UtpSocketUdp {
         bind_addr: SocketAddr,
         opts: SocketOpts,
     ) -> anyhow::Result<Arc<Self>> {
-        let mut sock = tokio::net::UdpSocket::bind(bind_addr)
+        let sock = tokio::net::UdpSocket::bind(bind_addr)
             .await
             .context("error binding")?;
 
@@ -714,9 +714,21 @@ impl UtpSocketUdp {
             debug!("error setting IPV6_DONTFRAG: {e:#}");
         }
 
-        if let Some(so_recvbuf) = opts.udp_socket_rx_bufsize_bytes {
-            sock = set_udp_rcvbuf(sock, so_recvbuf)?;
-        }
+        // Try to set RCVBUF as high as possible to fit all of RX window into
+        // the UDP socket buffer in case librqbit-utp isn't consuming from the socket fast enough.
+        // This can happen on slower devices.
+        let so_recvbuf = {
+            let max_vsocks = opts
+                .max_live_vsocks
+                .unwrap_or(DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET);
+            let rx_bufsize = opts
+                .vsock_rx_bufsize_bytes
+                .unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK)
+                * 10
+                / 8; // add some heuristic overhead for uTP and ACK packets.
+            max_vsocks * rx_bufsize
+        };
+        try_set_udp_rcvbuf(&sock, so_recvbuf);
 
         Self::new_with_opts(sock, Default::default(), opts)
     }
