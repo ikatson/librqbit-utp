@@ -653,20 +653,22 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if self.should_send_window_update() {
             return self.send_ack(cx);
         }
-        if self.delayed_ack_expired() {
+        if self.timers.ack_delay_timer.expired(self.this_poll.now) {
             if self.ack_to_transmit() {
                 METRICS.delayed_acks.increment(1);
                 trace!("delayed ack expired, sending ACK");
-                self.send_ack(cx)
+                return self.send_ack(cx);
             } else {
                 self.timers
                     .ack_delay_timer
                     .turn_off("delayed ACK expired but nothing to send");
-                Ok(false)
             }
-        } else {
-            Ok(false)
+        } else if self.consumed_but_unacked_bytes > 0 {
+            self.timers
+                .ack_delay_timer
+                .arm(self.this_poll.now, ACK_DELAY, false, "delayed ACK");
         }
+        Ok(false)
     }
 
     fn on_packet_sent(&mut self, header: &UtpHeader) {
@@ -1273,15 +1275,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     // the reciever gets duplicate ACKs as soon as possible to repair loss.
                     self.send_ack(cx)?;
                 }
-
-                if !self.immediate_ack_to_transmit() && self.consumed_but_unacked_bytes > 0 {
-                    self.timers.ack_delay_timer.arm(
-                        self.this_poll.now,
-                        ACK_DELAY,
-                        false,
-                        "delayed ACK",
-                    );
-                }
             }
             ST_STATE => {}
             ST_RESET => bail!("ST_RESET received"),
@@ -1342,15 +1335,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.last_consumed_remote_seq_nr > self.last_sent_ack_nr
     }
 
-    fn delayed_ack_expired(&self) -> bool {
-        match self.timers.ack_delay_timer {
-            // This means we need to ack the packet immediately.
-            // TODO: this is weird
-            Timer::Idle => true,
-            Timer::Armed { expires_at } => expires_at <= self.this_poll.now,
-        }
-    }
-
     fn restart_remote_inactivity_timer(&mut self) {
         self.timers.remote_inactivity_timer.arm(
             self.this_poll.now,
@@ -1361,22 +1345,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     // When do we need to poll next time based on timers expiring
-    fn next_poll_send_to_at(&mut self) -> Option<Instant> {
+    fn next_timer_to_poll(&mut self) -> Option<Instant> {
         // No reason to repoll if we can't send anything. We'll get polled when the socket is cleared.
         if self.this_poll.transport_pending {
             return self.timers.remote_inactivity_timer.poll_at();
         }
 
-        let want_ack = self.ack_to_transmit();
-        let delayed_ack_poll_at = if !want_ack {
-            None
-        } else {
-            self.timers.ack_delay_timer.poll_at()
-        };
-
         // Wait for the earliest of our timers to fire.
         [
-            delayed_ack_poll_at,
+            self.timers.ack_delay_timer.poll_at(),
             self.timers.retransmit.poll_at(),
             self.timers.remote_inactivity_timer.poll_at(),
             self.timers.recovery_pipe_expiry.take().poll_at(), // take() disarms it on every call
@@ -1486,7 +1463,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // We must send an immediate ACK per out-of-order segment. If the loop stopped last
             // time on transport pending this will try again without consuming the RX queue.
             if self.immediate_ack_to_transmit() {
-                pending_if_cannot_send!(self.maybe_send_ack(cx).map(|_| ()));
+                pending_if_cannot_send!(self.send_ack(cx).map(|_| ()));
             }
 
             // Read incoming stream.
@@ -1546,7 +1523,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             // If there's a timer-based next poll to run, arm the timer.
-            match self.next_poll_send_to_at() {
+            match self.next_timer_to_poll() {
                 Some(instant) => {
                     let duration = instant - self.this_poll.now;
                     trace!(?duration, "will repoll in");
