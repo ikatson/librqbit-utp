@@ -20,9 +20,8 @@ use crate::{
     UtpSocket,
     congestion::CongestionController,
     constants::{
-        ACK_DELAY, HARD_IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL,
-        RTTE_TRACING_LOG_LEVEL, SOFT_IMMEDIATE_ACK_EVERY_RMSS, SYNACK_RESEND_INTERNAL, UTP_HEADER,
-        calc_pipe_expiry,
+        ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL,
+        SYNACK_RESEND_INTERNAL, UTP_HEADER, calc_pipe_expiry,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -1276,16 +1275,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
 
                 if !self.immediate_ack_to_transmit() && self.consumed_but_unacked_bytes > 0 {
-                    let delay = if self.consumed_but_unacked_bytes
-                        >= SOFT_IMMEDIATE_ACK_EVERY_RMSS * self.segment_sizes.mss() as usize
-                    {
-                        Duration::from_millis(1)
-                    } else {
-                        ACK_DELAY
-                    };
                     self.timers.ack_delay_timer.arm(
                         self.this_poll.now,
-                        delay,
+                        ACK_DELAY,
                         false,
                         "delayed ACK",
                     );
@@ -1338,7 +1330,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     /// https://datatracker.ietf.org/doc/html/rfc9293#section-3.8.6.3
     fn immediate_ack_to_transmit(&self) -> bool {
         self.consumed_but_unacked_bytes
-            >= HARD_IMMEDIATE_ACK_EVERY_RMSS * self.segment_sizes.mss() as usize
+            >= IMMEDIATE_ACK_EVERY_RMSS * self.segment_sizes.mss() as usize
     }
 
     fn force_immediate_ack(&mut self, reason: &'static str) {
