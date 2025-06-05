@@ -1,10 +1,10 @@
 use std::{
-    collections::{hash_map::Entry, VecDeque},
+    collections::{VecDeque, hash_map::Entry},
     net::SocketAddr,
     num::NonZeroUsize,
     sync::{
-        atomic::{AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicU64, Ordering},
     },
     task::Poll,
     time::{Duration, Instant},
@@ -14,6 +14,7 @@ use dontfrag::UdpSocketExt;
 use rustc_hash::FxHashMap as HashMap;
 use tokio_util::sync::CancellationToken;
 
+use crate::{UtpStream, spawn_utils::spawn_with_cancel};
 use crate::{
     congestion::CongestionController,
     constants::{
@@ -29,10 +30,9 @@ use crate::{
     traits::{DefaultUtpEnvironment, Transport, UtpEnvironment},
     utils::{DropGuardSendBeforeDeath, FnDropGuard},
 };
-use crate::{spawn_utils::spawn_with_cancel, UtpStream};
 use anyhow::Context;
 use tokio::sync::{
-    mpsc::{self, unbounded_channel, UnboundedReceiver, UnboundedSender},
+    mpsc::{self, UnboundedReceiver, UnboundedSender, unbounded_channel},
     oneshot,
 };
 use tracing::{debug, error_span, trace, warn};
@@ -136,7 +136,9 @@ impl SocketOpts {
         let link_mtu: u16 = link_mtu.try_into().context("link mtu exceeds u16")?;
         let min_mtu = IPV4_HEADER + UDP_HEADER + UTP_HEADER + 1;
         if link_mtu < min_mtu {
-            anyhow::bail!("provided link_mtu ({link_mtu}) too low, not enough for even 1-byte IPv4 packets (min {min_mtu})");
+            anyhow::bail!(
+                "provided link_mtu ({link_mtu}) too low, not enough for even 1-byte IPv4 packets (min {min_mtu})"
+            );
         }
 
         Ok(ValidatedSocketOpts {
@@ -887,14 +889,14 @@ mod tests {
         time::Duration,
     };
 
-    use anyhow::{bail, Context};
+    use anyhow::{Context, bail};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         try_join,
     };
-    use tracing::{error_span, info, Instrument};
+    use tracing::{Instrument, error_span, info};
 
-    use crate::test_util::{setup_test_logging, transport::MockInterface, MockUtpStream};
+    use crate::test_util::{MockUtpStream, setup_test_logging, transport::MockInterface};
 
     #[tokio::test]
     async fn test_echo() -> anyhow::Result<()> {

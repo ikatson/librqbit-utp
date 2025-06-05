@@ -182,8 +182,8 @@ mod tests {
 
     use crate::{
         congestion::{
-            cubic::{calc_k, w_cubic, BETA_CUBIC},
             CongestionController,
+            cubic::{BETA_CUBIC, calc_k, w_cubic},
         },
         rtte::RttEstimator,
         test_util::setup_test_logging,

@@ -14,17 +14,17 @@ mod stream_api;
 use std::{sync::Arc, task::Poll, time::Duration};
 
 use futures::FutureExt;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::{
+    SocketOpts, UtpSocket, UtpStream,
     constants::{UDP_HEADER, UTP_HEADER},
     message::UtpMessage,
     raw::{Type::*, UtpHeader},
     seq_nr::SeqNr,
     stream_dispatch::{StreamArgs, UtpStreamStarter, VirtualSocket},
-    test_util::{env::MockUtpEnvironment, transport::RememberingTransport, ADDR_1, ADDR_2},
+    test_util::{ADDR_1, ADDR_2, env::MockUtpEnvironment, transport::RememberingTransport},
     traits::UtpEnvironment,
-    SocketOpts, UtpSocket, UtpStream,
 };
 
 fn make_msg(header: UtpHeader, payload: &str) -> UtpMessage {

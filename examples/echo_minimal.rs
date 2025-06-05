@@ -4,7 +4,7 @@ pub use librqbit_utp::UtpSocket;
 
 use librqbit_utp::UtpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{error_span, info, Instrument};
+use tracing::{Instrument, error_span, info};
 
 const MAX_COUNTER: u64 = 1_000_000;
 const PRINT_EVERY: u64 = 100_000;

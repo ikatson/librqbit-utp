@@ -1,8 +1,8 @@
 use tracing::trace;
 
 use crate::{
-    raw::{Type, UtpHeader},
     Payload,
+    raw::{Type, UtpHeader},
 };
 
 #[derive(Default, Clone, PartialEq, Eq)]

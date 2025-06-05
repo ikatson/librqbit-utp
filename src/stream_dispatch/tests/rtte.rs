@@ -4,9 +4,9 @@ use crate::raw::{Type::*, UtpHeader};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
+    SocketOpts,
     stream_dispatch::tests::{calc_mtu_for_mss, make_test_vsock},
     test_util::setup_test_logging,
-    SocketOpts,
 };
 
 #[tokio::test]

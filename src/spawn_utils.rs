@@ -1,6 +1,6 @@
 use anyhow::bail;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace, Instrument};
+use tracing::{Instrument, debug, trace};
 
 #[derive(Debug)]
 struct CancelledError {}

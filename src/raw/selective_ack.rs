@@ -1,4 +1,4 @@
-use bitvec::{order::Lsb0, slice::BitSlice, BitArr};
+use bitvec::{BitArr, order::Lsb0, slice::BitSlice};
 
 use crate::constants::SACK_DEPTH;
 
@@ -80,7 +80,7 @@ mod tests {
 
     use crate::{
         message::UtpMessage,
-        raw::{selective_ack::SelectiveAck, Type::ST_DATA},
+        raw::{Type::ST_DATA, selective_ack::SelectiveAck},
         stream_rx::OutOfOrderQueue,
     };
 

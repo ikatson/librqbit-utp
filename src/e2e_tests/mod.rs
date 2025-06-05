@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use libutp_rs2::UtpUdpContext;
 use lossy_socket::LossyUtpUdpSocket;
 use tokio::{
@@ -14,9 +14,9 @@ use tokio::{
     time::timeout,
     try_join,
 };
-use tracing::{error_span, info, Instrument};
+use tracing::{Instrument, error_span, info};
 
-use crate::{test_util::setup_test_logging, SocketOpts, UtpSocketUdp};
+use crate::{SocketOpts, UtpSocketUdp, test_util::setup_test_logging};
 
 trait AcceptConnect {
     async fn bind(addr: SocketAddr) -> Self;

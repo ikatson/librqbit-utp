@@ -3,10 +3,10 @@ use std::{task::Poll, time::Duration};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
-    raw::{Type::*, UtpHeader},
-    stream_dispatch::{tests::make_test_vsock, VirtualSocketState},
-    test_util::setup_test_logging,
     SocketOpts,
+    raw::{Type::*, UtpHeader},
+    stream_dispatch::{VirtualSocketState, tests::make_test_vsock},
+    test_util::setup_test_logging,
 };
 
 #[tokio::test]

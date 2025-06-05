@@ -3,11 +3,11 @@
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
+    SocketOpts,
     message::UtpMessage,
     raw::{Type::*, UtpHeader},
     stream_dispatch::tests::{calc_mtu_for_mss, make_test_vsock},
     test_util::setup_test_logging,
-    SocketOpts,
 };
 
 #[tokio::test]

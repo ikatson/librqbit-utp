@@ -1,7 +1,7 @@
 pub mod ext_close_reason;
 pub mod selective_ack;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 
 use tracing::trace;
 
@@ -198,9 +198,7 @@ impl UtpHeader {
                 _ => {
                     trace!(
                         ext,
-                        next_ext,
-                        ext_len,
-                        "unsupported extension for deserializing, skipping"
+                        next_ext, ext_len, "unsupported extension for deserializing, skipping"
                     );
                 }
             }

@@ -11,16 +11,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use tokio::{sync::mpsc::UnboundedReceiver, time::Sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error_span, event, trace, trace_span, Level};
+use tracing::{Level, debug, error_span, event, trace, trace_span};
 
 use crate::{
+    UtpSocket,
     congestion::CongestionController,
     constants::{
-        calc_pipe_expiry, ACK_DELAY, HARD_IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL,
+        ACK_DELAY, HARD_IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL,
         RTTE_TRACING_LOG_LEVEL, SOFT_IMMEDIATE_ACK_EVERY_RMSS, SYNACK_RESEND_INTERNAL, UTP_HEADER,
+        calc_pipe_expiry,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -36,8 +38,7 @@ use crate::{
     stream_tx::{UserTx, UtpStreamWriteHalf},
     stream_tx_segments::{OnAckResult, PopExpiredProbe, Segments},
     traits::{Transport, UtpEnvironment},
-    utils::{update_optional_waker, DropGuardSendBeforeDeath},
-    UtpSocket,
+    utils::{DropGuardSendBeforeDeath, update_optional_waker},
 };
 
 // TODO: as FIN works differently from TCP, we need to refactor states to simplify them.
@@ -620,7 +621,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.segment_sizes.disarm_cooldown();
                 self.this_poll.restart = true;
             } else {
-                bail!("got EMSGSIZE error, but the last message was not a matching MTU probe that we could pop.");
+                bail!(
+                    "got EMSGSIZE error, but the last message was not a matching MTU probe that we could pop."
+                );
             }
         }
 
@@ -1053,7 +1056,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 bail!("bug: received a packet in Closed state, we shouldn't have reached here");
             }
             (SynReceived, _) => {
-                bail!("bug: unexpected packet in SynReceived state. We should have sent the SYN-ACK first.")
+                bail!(
+                    "bug: unexpected packet in SynReceived state. We should have sent the SYN-ACK first."
+                )
             }
             (SynAckSent { .. }, ST_DATA | ST_STATE) => {
                 if hdr.ack_nr != self.seq_nr - 1 {

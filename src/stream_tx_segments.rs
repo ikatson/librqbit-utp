@@ -578,7 +578,7 @@ impl Segments {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use crate::raw::{selective_ack::SelectiveAck, UtpHeader};
+    use crate::raw::{UtpHeader, selective_ack::SelectiveAck};
 
     use super::Segments;
 

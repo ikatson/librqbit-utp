@@ -5,8 +5,8 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use anyhow::bail;
 use anyhow::Context;
+use anyhow::bail;
 use metrics::histogram;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use rand::Rng;
@@ -60,7 +60,7 @@ pub async fn bench_receiver(mut stream: impl AsyncRead + Unpin) -> anyhow::Resul
 
 pub async fn bench_sender(mut stream: impl AsyncWrite + Unpin) -> anyhow::Result<()> {
     let mut buffer = vec![0u8; BUFFER_SIZE];
-    rand::thread_rng().fill(buffer.as_mut_slice());
+    rand::rng().fill(buffer.as_mut_slice());
 
     let m_send_len = histogram!("utp_bench_send_len");
     let m_send_time = histogram!("utp_bench_send_time_us");

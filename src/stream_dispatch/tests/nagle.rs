@@ -2,10 +2,10 @@ use tokio::io::AsyncWriteExt;
 use tracing::trace;
 
 use crate::{
+    SocketOpts,
     raw::{Type::*, UtpHeader},
     stream_dispatch::tests::{calc_mtu_for_mss, make_test_vsock},
     test_util::setup_test_logging,
-    SocketOpts,
 };
 
 #[tokio::test]

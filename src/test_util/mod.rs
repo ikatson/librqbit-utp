@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use env::MockUtpEnvironment;
 use transport::MockUtpTransport;
 
-use crate::{socket::Dispatcher, UtpSocket, UtpStream};
+use crate::{UtpSocket, UtpStream, socket::Dispatcher};
 
 pub mod cmphead;
 pub mod env;
@@ -15,7 +15,7 @@ pub type MockDispatcher = Dispatcher<MockUtpTransport, MockUtpEnvironment>;
 
 pub fn setup_test_logging() {
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "trace");
+        unsafe { std::env::set_var("RUST_LOG", "trace") };
     }
     let _ = tracing_subscriber::fmt::try_init();
 }

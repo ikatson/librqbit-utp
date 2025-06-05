@@ -1,18 +1,18 @@
 use std::{
     collections::HashMap,
-    future::{poll_fn, Future},
+    future::{Future, poll_fn},
     net::SocketAddr,
     sync::Arc,
     task::Poll,
 };
 
 use parking_lot::Mutex;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tracing::{error_span, Instrument};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tracing::{Instrument, error_span};
 
-use crate::{message::UtpMessage, SocketOpts, Transport};
+use crate::{SocketOpts, Transport, message::UtpMessage};
 
-use super::{env::MockUtpEnvironment, MockDispatcher, MockUtpSocket};
+use super::{MockDispatcher, MockUtpSocket, env::MockUtpEnvironment};
 
 type Msg = (SocketAddr, Vec<u8>);
 

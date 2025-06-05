@@ -6,7 +6,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use example_common::{bench_receiver, bench_sender, echo, TIMEOUT};
+use example_common::{TIMEOUT, bench_receiver, bench_sender, echo};
 use librqbit_utp::UtpSocketUdp;
 use libutp_rs2::UtpUdpContext;
 use tokio::{
@@ -403,7 +403,7 @@ impl BenchArgs {
 
 fn main() -> anyhow::Result<()> {
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
+        unsafe { std::env::set_var("RUST_LOG", "info") };
     }
     tracing_subscriber::fmt::init();
 

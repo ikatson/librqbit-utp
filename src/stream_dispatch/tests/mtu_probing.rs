@@ -3,11 +3,11 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 use crate::{
+    SocketOpts,
     constants::{IPV4_HEADER, UDP_HEADER, UTP_HEADER},
     raw::{Type::*, UtpHeader},
     stream_dispatch::tests::make_test_vsock,
     test_util::{cmphead::CmpUtpHeader, setup_test_logging},
-    SocketOpts,
 };
 
 fn make_payload(len: usize) -> String {

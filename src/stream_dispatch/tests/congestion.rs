@@ -124,9 +124,9 @@ async fn test_congestion_control_basics() {
     let window_after_loss = t.vsock.congestion_controller.window();
     trace!(window_after_loss);
     assert!(
-            window_after_loss < intermediate_window,
-            "Window should decrease after loss: intermediate_window={intermediate_window} window_after_loss={window_after_loss}"
-        );
+        window_after_loss < intermediate_window,
+        "Window should decrease after loss: intermediate_window={intermediate_window} window_after_loss={window_after_loss}"
+    );
 
     // Simulate timeout by advancing time
     t.env.increment_now(Duration::from_secs(10));

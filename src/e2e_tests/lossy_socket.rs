@@ -2,8 +2,8 @@ use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::Duration,
@@ -16,7 +16,7 @@ use tokio::{
     net::UdpSocket,
 };
 
-use crate::{traits::DefaultUtpEnvironment, SocketOpts, Transport, UtpSocket};
+use crate::{SocketOpts, Transport, UtpSocket, traits::DefaultUtpEnvironment};
 
 use super::AcceptConnect;
 
@@ -46,7 +46,7 @@ impl<const LOSS_PCT: usize> LossyUdpSocket<LOSS_PCT> {
         {
             return false;
         }
-        let loss = rand::thread_rng().gen_bool(LOSS_PCT as f64 / 100.);
+        let loss = rand::rng().random_bool(LOSS_PCT as f64 / 100.);
         if loss {
             self.lost.fetch_add(1, Ordering::Relaxed);
         } else {

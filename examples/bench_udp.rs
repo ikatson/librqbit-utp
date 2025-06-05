@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use rand::Rng;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -15,7 +15,7 @@ const BUFFER_SIZE: usize = 1452; // UTP payload with MTU 1500
 
 async fn sender(socket: UdpSocket, target_addr: SocketAddr) -> anyhow::Result<()> {
     let mut buffer = vec![0u8; BUFFER_SIZE];
-    rand::thread_rng().fill(buffer.as_mut_slice());
+    rand::rng().fill(buffer.as_mut_slice());
 
     loop {
         match timeout(TIMEOUT, socket.send_to(&buffer, target_addr)).await {
@@ -57,7 +57,7 @@ async fn receiver(socket: UdpSocket) -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
+        unsafe { std::env::set_var("RUST_LOG", "info") };
     }
     let _ = tracing_subscriber::fmt::try_init();
 

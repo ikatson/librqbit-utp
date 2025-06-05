@@ -9,14 +9,14 @@ use tokio::{
 use tracing::trace;
 
 use crate::{
+    SocketOpts,
     raw::{Type::*, UtpHeader},
     stream_dispatch::{
-        tests::{calc_mtu_for_mss, make_msg, make_test_vsock, make_test_vsock_args},
         StreamArgs, VirtualSocketState,
+        tests::{calc_mtu_for_mss, make_msg, make_test_vsock, make_test_vsock_args},
     },
     test_util::{env::MockUtpEnvironment, setup_test_logging},
     traits::UtpEnvironment,
-    SocketOpts,
 };
 
 #[tokio::test]
@@ -90,12 +90,13 @@ async fn test_no_writes_allowed_after_explicit_shutdown() {
 
     // 1 second later we should die and shutdown should complete.
     t.env.increment_now(Duration::from_secs(1));
-    assert!(t
-        .poll_once_assert_ready()
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("inactive"));
+    assert!(
+        t.poll_once_assert_ready()
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("inactive")
+    );
     timeout(Duration::from_secs(1), w.shutdown())
         .await
         .context("timeout waiting for shutdown")

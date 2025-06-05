@@ -6,14 +6,14 @@ use tokio::io::AsyncWriteExt;
 use tracing::trace;
 
 use crate::{
-    raw::{selective_ack::SelectiveAck, Type::*, UtpHeader},
+    SocketOpts,
+    raw::{Type::*, UtpHeader, selective_ack::SelectiveAck},
     seq_nr::SeqNr,
     stream_dispatch::{
-        tests::{calc_mtu_for_mss, make_test_vsock},
         Timer,
+        tests::{calc_mtu_for_mss, make_test_vsock},
     },
     test_util::setup_test_logging,
-    SocketOpts,
 };
 
 // (5.1) Every time a packet containing data is sent (including a

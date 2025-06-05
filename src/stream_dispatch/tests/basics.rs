@@ -2,15 +2,15 @@ use tokio::io::AsyncWriteExt;
 use tracing::trace;
 
 use crate::{
+    SocketOpts,
     constants::ACK_DELAY,
     raw::{Type::*, UtpHeader},
     stream_dispatch::{
-        tests::{make_test_vsock, make_test_vsock_args},
         StreamArgs,
+        tests::{make_test_vsock, make_test_vsock_args},
     },
     test_util::{env::MockUtpEnvironment, setup_test_logging},
     traits::UtpEnvironment,
-    SocketOpts,
 };
 
 #[tokio::test]

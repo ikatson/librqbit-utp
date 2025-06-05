@@ -15,7 +15,7 @@ use std::{
     task::{Poll, Waker},
 };
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use msgq::MsgQueue;
 use parking_lot::Mutex;
 use tokio::io::AsyncRead;
@@ -119,10 +119,10 @@ mod msgq {
 }
 
 use crate::{
-    message::UtpMessage,
-    raw::{selective_ack::SelectiveAck, Type},
-    utils::update_optional_waker,
     Payload,
+    message::UtpMessage,
+    raw::{Type, selective_ack::SelectiveAck},
+    utils::update_optional_waker,
 };
 
 pub struct UtpStreamReadHalf {
@@ -206,7 +206,7 @@ impl AsyncRead for UtpStreamReadHalf {
                         self.current = Some(BeingRead { payload, offset: 0 })
                     }
                     UserRxMessage::Error(msg) => {
-                        return Poll::Ready(Err(std::io::Error::other(msg)))
+                        return Poll::Ready(Err(std::io::Error::other(msg)));
                     }
                 }
             } else {
@@ -645,9 +645,7 @@ impl OutOfOrderQueue {
         if effective_offset >= self.data.len() {
             trace!(
                 offset,
-                self.filled_front,
-                effective_offset,
-                "message is past assembler's window"
+                self.filled_front, effective_offset, "message is past assembler's window"
             );
             return Ok(AssemblerAddRemoveResult::Unavailable(msg));
         }
