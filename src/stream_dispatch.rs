@@ -956,12 +956,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     "rfc6298 5.3",
                 );
 
-                self.timers.remote_inactivity_timer.arm(
-                    self.this_poll.now,
-                    self.socket_opts.remote_inactivity_timeout,
-                    true,
-                    "remote advanced",
-                );
+                self.restart_remote_inactivity_timer();
             }
         }
 
@@ -1246,6 +1241,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                             debug_every_ms!(500, header=%hdr.short_repr(), offset, ?self.last_consumed_remote_seq_nr, "out of order");
                         }
 
+                        self.restart_remote_inactivity_timer();
                         self.last_consumed_remote_seq_nr += sequence_numbers as u16;
                         self.consumed_but_unacked_bytes =
                             self.consumed_but_unacked_bytes.saturating_add(bytes);
