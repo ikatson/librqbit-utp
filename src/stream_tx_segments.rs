@@ -167,6 +167,7 @@ impl SegmentForSending<'_> {
             SentStatus::NotSent => {
                 METRICS.send_count.increment(1);
                 METRICS.sent_bytes.increment(ps);
+                METRICS.sent_payload_size.record(ps as f64);
                 SentStatus::SentTime(now)
             }
             SentStatus::SentTime(_) => {

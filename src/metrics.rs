@@ -93,6 +93,7 @@ create_metrics!(
     counter send_window_exhausted,
     counter max_retransmissions_reached,
     counter sent_bytes,
+    histogram sent_payload_size,
     counter sent_control_packets,
     counter unsent_control_packets,
     counter incoming_already_acked_data_packets,
