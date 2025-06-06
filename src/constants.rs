@@ -32,9 +32,9 @@ pub const RTTE_TRACING_LOG_LEVEL: Level = Level::TRACE;
 pub const RECOVERY_TRACING_LOG_LEVEL: Level = Level::TRACE;
 
 // How long to wait to kill the connection if the remote is non-responsive.
-pub const DEFAULT_REMOTE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_REMOTE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub const DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET: usize = 64;
+pub const DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET: usize = 128;
 
 pub const SACK_DUP_THRESH: u8 = 3;
 pub const SACK_DEPTH: usize = 64;

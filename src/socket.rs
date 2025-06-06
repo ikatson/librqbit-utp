@@ -305,12 +305,12 @@ impl<T, E> AcceptQueue<T, E> {
         self.rx.try_recv().ok()
     }
 
-    fn try_cache_syn(&mut self, syn: Syn) -> bool {
+    fn try_cache_syn(&mut self, syn: Syn) -> Option<Syn> {
         if self.syns.len() < ACCEPT_QUEUE_MAX_SYNS {
             self.syns.push_back(syn);
-            return true;
+            return None;
         }
-        false
+        Some(syn)
     }
 }
 
@@ -349,8 +349,6 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             }
             control_request = self.control_rx.recv() => {
                 let control = control_request.unwrap();
-                // If this blocks it should be short lived enough?;
-                // TODO: do smth about this
                 self.on_control(control).await;
             },
             recv = self.socket.transport.recv_from(read_buf) => {
@@ -362,7 +360,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                         return Ok(())
                     }
                 };
-                self.on_recv(addr, message)?;
+                self.on_recv(addr, message).await?;
             }
         }
 
@@ -371,6 +369,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
     // Get into a state where we can't match acceptors with cached SYNs anymore.
     fn cleanup_accept_queue(&mut self) -> anyhow::Result<()> {
+        if self.streams_full() {
+            return Ok(());
+        }
         while let Some(syn) = self.accept_queue.syns.pop_front() {
             let acceptor = match self.accept_queue.try_next_acceptor() {
                 Some(acc) => acc,
@@ -388,6 +389,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     self.accept_queue.syns.push_front(syn);
                 }
                 MatchSynWithAccept::Full(syn, acceptor) => {
+                    debug!(remote=?syn.remote, connection_id=?syn.header.connection_id, "cleanup_accept_queue: full");
                     self.accept_queue.syns.push_front(syn);
                     self.accept_queue.next_available_acceptor = Some(acceptor);
                     return Ok(());
@@ -544,7 +546,6 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         accept: Acceptor<T, E>,
     ) -> MatchSynWithAccept<T, E> {
         if self.streams_full() {
-            debug!("too many connections, can't match SYN with accept");
             return MatchSynWithAccept::Full(syn, accept);
         }
 
@@ -574,7 +575,23 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
 
-    fn on_syn(&mut self, remote: SocketAddr, msg: UtpMessage) -> anyhow::Result<()> {
+    async fn try_send_rst(&self, syn: Syn) {
+        let mut buf: [u8; UTP_HEADER as usize] = [0; UTP_HEADER as usize];
+        let packet = UtpHeader {
+            htype: Type::ST_RESET,
+            connection_id: syn.header.connection_id,
+            seq_nr: 0.into(),
+            ack_nr: syn.header.seq_nr,
+            ..Default::default()
+        };
+        if let Ok(len) = packet.serialize(&mut buf[..]) {
+            if let Err(e) = self.socket.transport.send_to(&buf[..len], syn.remote).await {
+                debug!(remote=?syn.remote, "error sending ST_RESET: {e:#}");
+            }
+        }
+    }
+
+    async fn on_syn(&mut self, remote: SocketAddr, msg: UtpMessage) -> anyhow::Result<()> {
         let mut syn = Syn {
             remote,
             header: msg.header,
@@ -590,13 +607,16 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 MatchSynWithAccept::Full(s, acceptor) => {
                     self.accept_queue.next_available_acceptor = Some(acceptor);
                     syn = s;
+                    break;
                 }
             }
         }
         match self.accept_queue.try_cache_syn(syn) {
-            true => Ok(()),
-            false => {
-                trace!("dropping SYN, no more space to cache them and no acceptors available");
+            None => Ok(()),
+            Some(syn) => {
+                debug!("dropping SYN, no more space to cache them and no acceptors available");
+                METRICS.cant_accept_syn.increment(1);
+                self.try_send_rst(syn).await;
                 Ok(())
             }
         }
@@ -610,7 +630,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         ack_nr=?message.header.ack_nr,
         payload=message.payload().len()
     ))]
-    fn on_recv(&mut self, addr: SocketAddr, message: UtpMessage) -> anyhow::Result<()> {
+    async fn on_recv(&mut self, addr: SocketAddr, message: UtpMessage) -> anyhow::Result<()> {
         let key = (addr, message.header.connection_id);
 
         if let Some(tx) = self.streams.get(&key) {
@@ -631,7 +651,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 self.on_maybe_connect_ack(addr, message)?;
             }
             Type::ST_SYN => {
-                self.on_syn(addr, message)?;
+                self.on_syn(addr, message).await?;
             }
             _ => {
                 trace!(?message, ?addr, "dropping packet");
