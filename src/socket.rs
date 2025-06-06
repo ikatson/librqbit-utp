@@ -669,26 +669,29 @@ pub type UtpSocketUdp = UtpSocket<tokio::net::UdpSocket, DefaultUtpEnvironment>;
 
 fn try_set_udp_rcvbuf(sock: &tokio::net::UdpSocket, bufsize: usize) {
     let sock = socket2::SockRef::from(&sock);
-    let prev = sock.recv_buffer_size();
+    let prev = sock.recv_buffer_size().map(|v| v as isize).unwrap_or(-1);
     match sock.set_recv_buffer_size(bufsize) {
         Ok(()) => match sock.recv_buffer_size() {
             Ok(value) if value == bufsize => {
-                tracing::info!(?prev, current = value, "successfully set UDP rcv buf size");
+                tracing::info!(prev, current = value, "successfully set UDP rcv buf size");
             }
             Ok(value) => {
                 tracing::warn!(
-                    ?prev,
+                    prev,
                     current = value,
                     expected = bufsize,
                     "couldn't set UDP rcv buf size to requested value. There might be packet loss, try increasing rmem_max or equivalent."
                 );
             }
             Err(e) => {
-                tracing::warn!(?prev, expected=?bufsize, "updated UDP rcv buf size, but got error reading the value: {e:#}.")
+                tracing::warn!(prev, expected=?bufsize, "updated UDP rcv buf size, but got error reading the current value: {e:#}.")
             }
         },
         Err(e) => {
-            tracing::warn!(current=?prev, "error setting UDP socket rcv buf size: {e:#}");
+            tracing::warn!(
+                current = prev,
+                "error setting UDP socket rcv buf size: {e:#}"
+            );
         }
     }
 }
@@ -716,7 +719,6 @@ impl UtpSocketUdp {
 
         // Try to set RCVBUF as high as possible to fit all of RX window into
         // the UDP socket buffer in case librqbit-utp isn't consuming from the socket fast enough.
-        // This can happen on slower devices.
         let so_recvbuf = {
             let max_vsocks = opts
                 .max_live_vsocks
