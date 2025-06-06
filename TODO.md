@@ -17,11 +17,10 @@ With dontfrag:
 - [x] retransmit: looks like we are resetting the timer too often. We must not reset it if no new data is acked.
       newly set packets should arm, but NOT rearm the timer
 
-
 Real world:
 - [x] Spammy message, seems to occur in a loop mostly: RTO expired, rewinding to retransmit FIN
-- [ ] inactivity timer in bench triggers, shouldn't
-- [ ] huge bench perf regression?
+- [x] inactivity timer in bench triggers, shouldn't
+- [x] huge bench perf regression?
 
 Code:
 - [x] maybe_send_syn_ack() - timer handling is a bit custom, need to use RTO and timers framework
