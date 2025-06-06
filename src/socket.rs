@@ -672,7 +672,7 @@ fn try_set_udp_rcvbuf(sock: &tokio::net::UdpSocket, bufsize: usize) {
     let prev = sock.recv_buffer_size().map(|v| v as isize).unwrap_or(-1);
     match sock.set_recv_buffer_size(bufsize) {
         Ok(()) => match sock.recv_buffer_size() {
-            Ok(value) if value == bufsize => {
+            Ok(value) if value >= bufsize => {
                 tracing::info!(prev, current = value, "successfully set UDP rcv buf size");
             }
             Ok(value) => {
