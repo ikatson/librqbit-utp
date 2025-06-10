@@ -369,7 +369,8 @@ impl BenchArgs {
                 ) -> std::io::Result<std::process::Child> {
                     let mut builder = std::process::Command::new(binary);
                     builder.args(args).arg(final_arg);
-                    if cfg!(unix) {
+                    #[cfg(unix)]
+                    {
                         use std::os::unix::process::CommandExt;
                         builder.arg0(arg0);
                     }
