@@ -127,4 +127,8 @@ impl<const LOSS_PCT: usize> AcceptConnect for LossyUtpUdpSocket<LOSS_PCT> {
         )
         .unwrap()
     }
+
+    fn bind_addr(&self) -> Option<SocketAddr> {
+        Some(self.transport.bind_addr())
+    }
 }

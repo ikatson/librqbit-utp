@@ -768,6 +768,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "librqbit-dualstack-sockets"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b4f7cfae6a4b17a1d2cedaf5dad3314caa2c2a386d8544ff92696dd78089261"
+dependencies = [
+ "anyhow",
+ "socket2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "librqbit-utp"
 version = "0.3.0"
 dependencies = [
@@ -779,6 +791,7 @@ dependencies = [
  "futures",
  "lazy_static",
  "libc",
+ "librqbit-dualstack-sockets",
  "libutp-rs2",
  "metrics",
  "metrics-exporter-prometheus",

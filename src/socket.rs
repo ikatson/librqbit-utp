@@ -11,6 +11,7 @@ use std::{
 };
 
 use dontfrag::UdpSocketExt;
+use librqbit_dualstack_sockets::UdpSocket;
 use rustc_hash::FxHashMap as HashMap;
 use tokio_util::sync::CancellationToken;
 
@@ -446,7 +447,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                         return;
                     }
                     Err(e) => {
-                        let _ = sender.tx.send(Err(e).context("error sending SYN"));
+                        let _ = sender
+                            .tx
+                            .send(Err(e).with_context(|| format!("error sending SYN to {addr}")));
                         return;
                     }
                 }
@@ -685,7 +688,7 @@ impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
     }
 }
 
-pub type UtpSocketUdp = UtpSocket<tokio::net::UdpSocket, DefaultUtpEnvironment>;
+pub type UtpSocketUdp = UtpSocket<UdpSocket, DefaultUtpEnvironment>;
 
 fn try_set_udp_rcvbuf(sock: &tokio::net::UdpSocket, bufsize: usize) {
     let sock = socket2::SockRef::from(&sock);
@@ -725,15 +728,13 @@ impl UtpSocketUdp {
         bind_addr: SocketAddr,
         opts: SocketOpts,
     ) -> anyhow::Result<Arc<Self>> {
-        let sock = tokio::net::UdpSocket::bind(bind_addr)
-            .await
-            .context("error binding")?;
+        let sock = UdpSocket::bind_udp(bind_addr, true).context("error binding")?;
 
         if bind_addr.is_ipv4() {
-            if let Err(e) = sock.set_dontfrag_v4(true) {
+            if let Err(e) = sock.socket().set_dontfrag_v4(true) {
                 warn!("error setting IPV4_DONTFRAG: {e:#}");
             }
-        } else if let Err(e) = sock.set_dontfrag_v6(true) {
+        } else if let Err(e) = sock.socket().set_dontfrag_v6(true) {
             debug!("error setting IPV6_DONTFRAG: {e:#}");
         }
 
@@ -750,7 +751,7 @@ impl UtpSocketUdp {
                 / 8; // add some heuristic overhead for uTP and ACK packets.
             max_vsocks * rx_bufsize
         };
-        try_set_udp_rcvbuf(&sock, so_recvbuf);
+        try_set_udp_rcvbuf(sock.socket(), so_recvbuf);
 
         Self::new_with_opts(sock, Default::default(), opts)
     }

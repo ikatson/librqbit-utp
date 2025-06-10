@@ -1,11 +1,11 @@
 use std::{
     future::Future,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::SocketAddr,
     task::{Context, Poll},
     time::Instant,
 };
 
-use tokio::net::UdpSocket;
+use librqbit_dualstack_sockets::UdpSocket;
 
 use crate::metrics::METRICS;
 
@@ -65,7 +65,7 @@ impl Transport for UdpSocket {
     }
 
     fn bind_addr(&self) -> SocketAddr {
-        UdpSocket::local_addr(self).unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+        UdpSocket::bind_addr(self)
     }
 }
 
