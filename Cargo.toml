@@ -50,7 +50,7 @@ metrics-exporter-prometheus = "0.17"
 metrics = "0.24.1"
 futures = "0.3"
 clap = { version = "4.5.29", features = ["derive"] }
-libutp-rs2 = { version = "0.1.0", path = "../libutp-rs-2/libutp-rs2" }
+libutp-rs2 = { version = "0.1.0" }
 approx = "0.5.1"
 
 [profile.release]

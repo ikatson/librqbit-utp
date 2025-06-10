@@ -131,7 +131,7 @@ version = "0.29.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61b1d86e7705efe1be1b569bab41d4fa1e14e220b60a160f78de2db687add079"
 dependencies = [
- "bindgen",
+ "bindgen 0.69.5",
  "cc",
  "cmake",
  "dunce",
@@ -180,6 +180,26 @@ dependencies = [
  "shlex",
  "syn",
  "which",
+]
+
+[[package]]
+name = "bindgen"
+version = "0.71.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
+dependencies = [
+ "bitflags",
+ "cexpr",
+ "clang-sys",
+ "itertools",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash 2.1.1",
+ "shlex",
+ "syn",
 ]
 
 [[package]]
@@ -809,6 +829,8 @@ dependencies = [
 [[package]]
 name = "libutp-rs2"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8face0b5e1db7e0637e24d5044b493d7b3103956c1e45d6c3f143e4ce8342f3"
 dependencies = [
  "anyhow",
  "bstr",
@@ -818,7 +840,6 @@ dependencies = [
  "os_socketaddr",
  "parking_lot",
  "ringbuf",
- "socket2",
  "tokio",
  "tracing",
 ]
@@ -826,7 +847,10 @@ dependencies = [
 [[package]]
 name = "libutp-rs2-sys"
 version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ebac6003b1d5b1ff087aa3b4aa255e102a174e36309199f4f8ec8468ac0ffc0"
 dependencies = [
+ "bindgen 0.71.1",
  "cc",
  "libc",
 ]
