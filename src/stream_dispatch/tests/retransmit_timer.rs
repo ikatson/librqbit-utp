@@ -618,6 +618,7 @@ async fn test_rto_single_packet_retransmission_smaller_than_mss() {
         SocketOpts {
             link_mtu: Some(calc_mtu_for_mss(5)),
             disable_nagle: true,
+            remote_inactivity_timeout: Some(Duration::from_secs(20)),
             ..Default::default()
         },
         false,

@@ -4,6 +4,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::trace;
 
 use crate::{
+    SocketOpts,
     raw::{Type::*, UtpHeader},
     stream_dispatch::tests::make_test_vsock,
     test_util::setup_test_logging,
@@ -14,7 +15,13 @@ use crate::{
 #[tokio::test]
 async fn test_congestion_control_basics() {
     setup_test_logging();
-    let mut t = make_test_vsock(Default::default(), false);
+    let mut t = make_test_vsock(
+        SocketOpts {
+            remote_inactivity_timeout: Some(Duration::from_secs(20)),
+            ..Default::default()
+        },
+        false,
+    );
 
     let remote_wnd = 64 * 1024;
 

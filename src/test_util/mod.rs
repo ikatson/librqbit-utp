@@ -14,6 +14,7 @@ pub type MockUtpStream = UtpStream;
 pub type MockDispatcher = Dispatcher<MockUtpTransport, MockUtpEnvironment>;
 
 pub fn setup_test_logging() {
+    unsafe { std::env::set_var("RUST_BACKTRACE", "1") };
     if std::env::var("RUST_LOG").is_err() {
         unsafe { std::env::set_var("RUST_LOG", "trace") };
     }
