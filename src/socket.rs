@@ -445,9 +445,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                         return;
                     }
                     Err(e) => {
-                        let _ = sender
-                            .tx
-                            .send(Err(Error::ErrorSendingSyn { addr, source: e }));
+                        let _ = sender.tx.send(Err(Error::ErrorSendingSyn(e)));
                         return;
                     }
                 }

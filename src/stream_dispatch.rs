@@ -272,10 +272,7 @@ macro_rules! send_data {
             $self.this_poll.transport_pending = $self
                 .socket
                 .try_poll_send_to($cx, &$self.this_poll.tmp_buf[..len], $self.remote)
-                .map_err(|source| Error::Send {
-                    addr: $self.remote,
-                    source,
-                })?;
+                .map_err(Error::Send)?;
             if $self.this_poll.transport_pending {
                 return Ok(false);
             }
@@ -593,9 +590,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     break;
                 }
                 // If we couldn't send due to message size, we need to tweak MTU if possible and then retry.
-                Err(Error::Send { source, .. })
-                    if source.raw_os_error() == Some(libc::EMSGSIZE) =>
-                {
+                Err(Error::Send(source)) if source.raw_os_error() == Some(libc::EMSGSIZE) => {
                     let seq_nr = item.seq_nr();
                     let size = item.payload_size();
                     debug!(
@@ -694,10 +689,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.this_poll.transport_pending = self
             .socket
             .try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.remote)
-            .map_err(|source| Error::Send {
-                addr: self.remote,
-                source,
-            })?;
+            .map_err(Error::Send)?;
 
         let sent = !self.this_poll.transport_pending;
 

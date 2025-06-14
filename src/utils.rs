@@ -43,7 +43,7 @@ pub fn fill_buffer_from_slices(
     second: &[u8],
 ) -> crate::Result<()> {
     if out_buf.len() < len {
-        return Err(Error::TooSmallBuffer {
+        return Err(Error::BugTooSmallBuffer {
             out_buf_len: out_buf.len(),
             len,
         });
