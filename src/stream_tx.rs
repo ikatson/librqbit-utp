@@ -6,7 +6,6 @@ use std::{
     task::{Poll, Waker},
 };
 
-use anyhow::bail;
 use parking_lot::Mutex;
 use ringbuf::{
     storage::Heap,
@@ -15,7 +14,10 @@ use ringbuf::{
 use tokio::io::AsyncWrite;
 use tracing::trace;
 
-use crate::utils::{fill_buffer_from_slices, update_optional_waker};
+use crate::{
+    Error,
+    utils::{fill_buffer_from_slices, update_optional_waker},
+};
 
 pub struct UserTxLocked {
     // Set when stream dies abruptly for writer to know about it.
@@ -34,10 +36,10 @@ pub struct UserTxLocked {
 }
 
 impl UserTxLocked {
-    pub fn truncate_front(&mut self, count: usize) -> anyhow::Result<()> {
+    pub fn truncate_front(&mut self, count: usize) -> crate::Result<()> {
         let skipped = self.buffer.skip(count);
         if skipped != count {
-            bail!("bug: truncate_front: skipped({skipped}) != count({count})")
+            return Err(Error::BugTruncateFront { skipped, count });
         }
         Ok(())
     }
@@ -47,7 +49,7 @@ impl UserTxLocked {
         out_buf: &mut [u8],
         offset: usize,
         len: usize,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         let (first, second) = self.buffer.as_slices();
         fill_buffer_from_slices(out_buf, offset, len, first, second)
     }

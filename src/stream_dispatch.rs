@@ -11,13 +11,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, bail};
 use tokio::{sync::mpsc::UnboundedReceiver, time::Sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, debug, error_span, event, trace, trace_span};
 
 use crate::{
-    UtpSocket,
+    Error, UtpSocket,
     congestion::CongestionController,
     constants::{
         ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL,
@@ -43,7 +42,7 @@ use crate::{
 // TODO: as FIN works differently from TCP, we need to refactor states to simplify them.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum VirtualSocketState {
+pub enum VirtualSocketState {
     SynReceived,
     SynAckSent { count: usize },
 
@@ -251,7 +250,7 @@ macro_rules! send_data {
                 == $self.socket_opts.max_segment_retransmissions.get()
             {
                 METRICS.max_retransmissions_reached.increment(1);
-                anyhow::bail!("max number of retransmissions reached");
+                bail!("max number of retransmissions reached");
             }
 
             $header.set_type(Type::ST_DATA);
@@ -262,22 +261,21 @@ macro_rules! send_data {
                 .timestamp_microseconds
                 .wrapping_sub($self.last_remote_timestamp);
 
-            let len = $header
-                .serialize_with_payload(&mut $self.this_poll.tmp_buf, |b| {
-                    let offset = $segment_iter_item.payload_offset();
-                    let len = $segment_iter_item.payload_size();
-                    let g = $self.user_tx.locked.lock();
-                    g.fill_buffer_from_ring_buffer(b, offset, len)
-                        .context("error filling output buffer from user_tx")?;
-                    Ok(len)
-                })
-                .context("bug: wasn't able to serialize the buffer")?;
+            let len = $header.serialize_with_payload(&mut $self.this_poll.tmp_buf, |b| {
+                let offset = $segment_iter_item.payload_offset();
+                let len = $segment_iter_item.payload_size();
+                let g = $self.user_tx.locked.lock();
+                g.fill_buffer_from_ring_buffer(b, offset, len)?;
+                Ok(len)
+            })?;
 
-            $self.this_poll.transport_pending = $self.socket.try_poll_send_to(
-                $cx,
-                &$self.this_poll.tmp_buf[..len],
-                $self.remote,
-            )?;
+            $self.this_poll.transport_pending = $self
+                .socket
+                .try_poll_send_to($cx, &$self.this_poll.tmp_buf[..len], $self.remote)
+                .map_err(|source| Error::Send {
+                    addr: $self.remote,
+                    source,
+                })?;
             if $self.this_poll.transport_pending {
                 return Ok(false);
             }
@@ -317,8 +315,8 @@ macro_rules! send_data {
 }
 
 impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
-    async fn run_forever(self) -> anyhow::Result<()> {
-        self.await.context("error running utp stream event loop")
+    async fn run_forever(self) -> crate::Result<()> {
+        self.await
     }
 
     fn timestamp_microseconds(&self) -> u32 {
@@ -350,7 +348,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         wnd - (wnd % rmss as u32)
     }
 
-    fn send_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
+    fn send_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<()> {
         // No reason to send anything, we'll get polled next time.
         if self.this_poll.transport_pending {
             return Ok(());
@@ -595,16 +593,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     break;
                 }
                 // If we couldn't send due to message size, we need to tweak MTU if possible and then retry.
-                Err(e)
-                    if e.downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.raw_os_error() == Some(libc::EMSGSIZE)) =>
+                Err(Error::Send { source, .. })
+                    if source.raw_os_error() == Some(libc::EMSGSIZE) =>
                 {
                     let seq_nr = item.seq_nr();
                     let size = item.payload_size();
                     debug!(
                         ?seq_nr,
                         payload_size = size,
-                        "got message too long (EMSGSIZE): {e:#}"
+                        "got message too long (EMSGSIZE): {source:#}"
                     );
                     message_too_long = Some((seq_nr, size));
                     break;
@@ -645,7 +642,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(())
     }
 
-    fn maybe_send_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+    fn maybe_send_ack(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
         if self.immediate_ack_to_transmit() {
             METRICS.immediate_acks.increment(1);
             return self.send_ack(cx);
@@ -679,7 +676,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         &mut self,
         cx: &mut std::task::Context<'_>,
         header: UtpHeader,
-    ) -> anyhow::Result<bool> {
+    ) -> crate::Result<bool> {
         if self.this_poll.transport_pending {
             return Ok(false);
         }
@@ -692,13 +689,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             "sending"
         );
 
-        let len = header
-            .serialize(&mut self.this_poll.tmp_buf)
-            .context("bug")?;
+        let len = header.serialize(&mut self.this_poll.tmp_buf)?;
 
-        self.this_poll.transport_pending =
-            self.socket
-                .try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.remote)?;
+        self.this_poll.transport_pending = self
+            .socket
+            .try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.remote)
+            .map_err(|source| Error::Send {
+                addr: self.remote,
+                source,
+            })?;
 
         let sent = !self.this_poll.transport_pending;
 
@@ -716,13 +715,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(sent)
     }
 
-    fn send_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+    fn send_ack(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
         let mut header = self.outgoing_header();
         header.extensions.selective_ack = self.user_rx.selective_ack();
         self.send_control_packet(cx, header)
     }
 
-    fn maybe_send_fin(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<bool> {
+    fn maybe_send_fin(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
         if self.this_poll.transport_pending {
             return Ok(false);
         }
@@ -756,7 +755,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn split_tx_queue_into_segments(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         let mut g = self.user_tx.locked.lock();
 
         if g.is_empty() {
@@ -799,11 +798,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let segmented_len = self.user_tx_segments.total_len_bytes();
 
         if g.len() < self.user_tx_segments.total_len_bytes() {
-            bail!(
-                "bug in buffer computations: user_tx_buflen={} segmented_len={}",
-                g.len(),
-                segmented_len
-            );
+            return Err(Error::BugInBufferComputations {
+                user_tx_buflen: g.len(),
+                segmented_len,
+            });
         }
 
         let mut remaining = g.len() - segmented_len;
@@ -865,11 +863,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     /// Before dying, ensure cleanup and notifications are done.
-    fn just_before_death(
-        &mut self,
-        cx: &mut std::task::Context<'_>,
-        error: Option<&anyhow::Error>,
-    ) {
+    fn just_before_death(&mut self, cx: &mut std::task::Context<'_>, error: Option<&crate::Error>) {
         if let Some(err) = error {
             trace!("just_before_death: {err:#}");
         } else {
@@ -904,7 +898,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn process_all_incoming_messages(
         &mut self,
         cx: &mut std::task::Context<'_>,
-    ) -> anyhow::Result<()> {
+    ) -> crate::Result<()> {
         let mut result = ProcessIncomingMessageResult::default();
 
         let mut counter = 0u32;
@@ -1015,7 +1009,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         &mut self,
         cx: &mut std::task::Context<'_>,
         msg: UtpMessage,
-    ) -> anyhow::Result<ProcessIncomingMessageResult> {
+    ) -> crate::Result<ProcessIncomingMessageResult> {
         // We are not using tracing::instrument here as it makes rust-analyzer work worse
         let span = trace_span!("msg",
             seq_nr=%msg.header.seq_nr,
@@ -1222,11 +1216,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.congestion_controller
                     .set_mss(self.segment_sizes.mss() as usize);
 
-                match self
-                    .user_rx
-                    .add_remove(cx, msg, offset as usize)
-                    .context("fatal error in user_rx")?
-                {
+                match self.user_rx.add_remove(cx, msg, offset as usize)? {
                     AssemblerAddRemoveResult::Consumed {
                         sequence_numbers,
                         bytes,
@@ -1365,7 +1355,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     /// If this is an incoming connection, send back an ACK.
-    fn maybe_send_syn_ack(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<()> {
+    fn maybe_send_syn_ack(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<()> {
         let sent_count = match self.state {
             VirtualSocketState::SynReceived => 0,
             VirtualSocketState::SynAckSent { count }
@@ -1420,7 +1410,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .any(|s| s.send_count() == 0)
     }
 
-    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> Poll<anyhow::Result<()>> {
+    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> Poll<crate::Result<()>> {
         macro_rules! bail_if_err {
             ($e:expr) => {
                 match $e {
@@ -1478,8 +1468,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .expired(self.this_poll.now)
             {
                 METRICS.inactivity_timeouts.increment(1);
-                let err =
-                    anyhow::anyhow!("remote was inactive for too long. state: {:?}", self.state);
+                let err = Error::RemoteInactiveForTooLong { state: self.state };
                 self.just_before_death(cx, Some(&err));
                 return Poll::Ready(Err(err));
             }
@@ -1535,7 +1524,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Poll::Pending;
         }
 
-        Poll::Ready(Err(anyhow::anyhow!("unreachable")))
+        Poll::Ready(Err(Error::Text("unreachable")))
     }
 }
 
@@ -1888,7 +1877,7 @@ impl Timers {
 
 // The main dispatch loop for the virtual socket is here.
 impl<T: Transport, Env: UtpEnvironment> std::future::Future for VirtualSocket<T, Env> {
-    type Output = anyhow::Result<()>;
+    type Output = crate::Result<()>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
         self.get_mut().poll(cx)

@@ -92,7 +92,7 @@ impl TestVsock {
         .await
     }
 
-    async fn poll_once(&mut self) -> Poll<anyhow::Result<()>> {
+    async fn poll_once(&mut self) -> Poll<crate::Result<()>> {
         std::future::poll_fn(|cx| {
             let res = self.vsock.poll_unpin(cx);
             Poll::Ready(res)
@@ -111,7 +111,7 @@ impl TestVsock {
         };
     }
 
-    async fn poll_once_assert_ready(&mut self) -> anyhow::Result<()> {
+    async fn poll_once_assert_ready(&mut self) -> crate::Result<()> {
         let res = self.poll_once().await;
         match res {
             Poll::Pending => {

@@ -86,6 +86,12 @@ macro_rules! cmphead {
     };
 }
 
+macro_rules! bail {
+    ($msg:expr) => {
+        return Err(crate::Error::Text($msg))
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

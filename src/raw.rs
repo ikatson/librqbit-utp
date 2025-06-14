@@ -1,11 +1,9 @@
 pub mod ext_close_reason;
 pub mod selective_ack;
 
-use anyhow::{Context, bail};
-
 use tracing::trace;
 
-use crate::{constants::UTP_HEADER, seq_nr::SeqNr};
+use crate::{Error, constants::UTP_HEADER, seq_nr::SeqNr};
 
 const NO_NEXT_EXT: u8 = 0;
 const EXT_SELECTIVE_ACK: u8 = 1;
@@ -92,7 +90,7 @@ impl UtpHeader {
         D(self)
     }
 
-    pub fn serialize(&self, buffer: &mut [u8]) -> anyhow::Result<usize> {
+    pub fn serialize(&self, buffer: &mut [u8]) -> crate::Result<usize> {
         if buffer.len() < UTP_HEADER as usize {
             bail!("too small buffer");
         }
@@ -142,11 +140,14 @@ impl UtpHeader {
     pub fn serialize_with_payload(
         &self,
         out_buf: &mut [u8],
-        payload_serialize: impl FnOnce(&mut [u8]) -> anyhow::Result<usize>,
-    ) -> anyhow::Result<usize> {
+        payload_serialize: impl FnOnce(&mut [u8]) -> crate::Result<usize>,
+    ) -> crate::Result<usize> {
         let sz = self.serialize(out_buf)?;
-        let payload_sz = payload_serialize(out_buf.get_mut(sz..).context("too small buffer")?)
-            .context("error serializing payload")?;
+        let payload_sz = payload_serialize(
+            out_buf
+                .get_mut(sz..)
+                .ok_or(Error::Text("serialize_with_payload: too small buffer"))?,
+        )?;
         Ok(sz + payload_sz)
     }
 

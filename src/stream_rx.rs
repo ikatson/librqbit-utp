@@ -15,7 +15,6 @@ use std::{
     task::{Poll, Waker},
 };
 
-use anyhow::{Context, bail};
 use msgq::MsgQueue;
 use parking_lot::Mutex;
 use tokio::io::AsyncRead;
@@ -119,7 +118,7 @@ mod msgq {
 }
 
 use crate::{
-    Payload,
+    Error, Payload,
     message::UtpMessage,
     raw::{Type, selective_ack::SelectiveAck},
     utils::update_optional_waker,
@@ -353,7 +352,7 @@ impl UserRx {
 
     /// Flush the outstanding messages to user read half.
     /// Returns the number of bytes flushed.
-    pub fn flush(&mut self, cx: &mut std::task::Context<'_>) -> anyhow::Result<usize> {
+    pub fn flush(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<usize> {
         let filled_front_bytes: usize = self.ooq.filled_front_bytes();
         let mut remaining_rx_window = {
             let mut g = self.shared.locked.lock();
@@ -448,7 +447,7 @@ impl UserRx {
         cx: &mut std::task::Context<'_>,
         msg: UtpMessage,
         offset: usize,
-    ) -> anyhow::Result<AssemblerAddRemoveResult> {
+    ) -> crate::Result<AssemblerAddRemoveResult> {
         match self.ooq.add_remove(msg, offset)? {
             res @ AssemblerAddRemoveResult::Consumed {
                 sequence_numbers, ..
@@ -465,7 +464,7 @@ impl UserRx {
         &mut self,
         msg: UtpMessage,
         offset: usize,
-    ) -> anyhow::Result<AssemblerAddRemoveResult> {
+    ) -> crate::Result<AssemblerAddRemoveResult> {
         let mut msg = Some(msg);
         let msg = &mut msg;
         std::future::poll_fn(move |cx| {
@@ -634,7 +633,7 @@ impl OutOfOrderQueue {
         &mut self,
         msg: UtpMessage,
         offset: usize,
-    ) -> anyhow::Result<AssemblerAddRemoveResult> {
+    ) -> crate::Result<AssemblerAddRemoveResult> {
         if self.is_full() {
             debug!(offset, "assembler buffer full");
             return Ok(AssemblerAddRemoveResult::Unavailable(msg));
@@ -660,7 +659,7 @@ impl OutOfOrderQueue {
         let slot = self
             .data
             .get_mut(effective_offset)
-            .context("bug: slot should be there")?;
+            .ok_or(Error::BugAssemblerMissingSlot(effective_offset))?;
         if !ooq_slot_is_default(slot) {
             return Ok(AssemblerAddRemoveResult::AlreadyPresent);
         }

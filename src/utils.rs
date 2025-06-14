@@ -1,7 +1,8 @@
 use std::{cmp::Ordering, task::Waker};
 
-use anyhow::bail;
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
+
+use crate::Error;
 
 pub fn update_optional_waker(waker: &mut Option<Waker>, cx: &std::task::Context<'_>) {
     match waker.as_mut() {
@@ -40,13 +41,12 @@ pub fn fill_buffer_from_slices(
     len: usize,
     first: &[u8],
     second: &[u8],
-) -> anyhow::Result<()> {
+) -> crate::Result<()> {
     if out_buf.len() < len {
-        bail!(
-            "too small buffer: out_buf.len() < len ({} < {})",
-            out_buf.len(),
-            len
-        )
+        return Err(Error::TooSmallBuffer {
+            out_buf_len: out_buf.len(),
+            len,
+        });
     }
 
     let [first, second] = prepare_2_ioslices(first, second, offset, len)?;
@@ -61,7 +61,7 @@ pub fn prepare_2_ioslices<'a>(
     second: &'a [u8],
     offset: usize,
     len: usize,
-) -> anyhow::Result<[&'a [u8]; 2]> {
+) -> crate::Result<[&'a [u8]; 2]> {
     if len == 0 {
         return Ok([&[], &[]]);
     }

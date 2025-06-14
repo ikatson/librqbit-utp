@@ -10,11 +10,11 @@
 
 #[macro_use]
 mod macros;
-
 mod congestion;
 mod constants;
 #[cfg(test)]
 mod e2e_tests;
+mod error;
 mod message;
 mod metrics;
 pub mod mtu;
@@ -34,6 +34,7 @@ mod test_util;
 mod traits;
 mod utils;
 
+pub use error::{Error, Result};
 pub use socket::{CongestionConfig, CongestionControllerKind, SocketOpts, UtpSocket, UtpSocketUdp};
 pub use stream::UtpStream;
 pub use traits::Transport;

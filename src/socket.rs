@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::{Error, error::OptionContext};
 use dontfrag::UdpSocketExt;
 use librqbit_dualstack_sockets::UdpSocket;
 use rustc_hash::FxHashMap as HashMap;
@@ -31,7 +32,6 @@ use crate::{
     traits::{DefaultUtpEnvironment, Transport, UtpEnvironment},
     utils::{DropGuardSendBeforeDeath, FnDropGuard},
 };
-use anyhow::Context;
 use tokio::sync::{
     mpsc::{self, UnboundedReceiver, UnboundedSender, unbounded_channel},
     oneshot,
@@ -115,7 +115,7 @@ pub struct SocketOpts {
 }
 
 impl SocketOpts {
-    fn validate(&self) -> anyhow::Result<ValidatedSocketOpts> {
+    fn validate(&self) -> crate::Result<ValidatedSocketOpts> {
         let max_user_rx_buffered_bytes = NonZeroUsize::new(
             self.vsock_rx_bufsize_bytes
                 .unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK),
@@ -130,12 +130,10 @@ impl SocketOpts {
 
         // 1500 is ethernet MTU.
         let link_mtu = self.link_mtu.unwrap_or(1500);
-        let link_mtu: u16 = link_mtu.try_into().context("link mtu exceeds u16")?;
+        let link_mtu: u16 = link_mtu.try_into().ok().context("link mtu exceeds u16")?;
         let min_mtu = IPV4_HEADER + UDP_HEADER + UTP_HEADER + 1;
         if link_mtu < min_mtu {
-            anyhow::bail!(
-                "provided link_mtu ({link_mtu}) too low, not enough for even 1-byte IPv4 packets (min {min_mtu})"
-            );
+            return Err(Error::LinkMtuTooLow { link_mtu, min_mtu });
         }
 
         Ok(ValidatedSocketOpts {
@@ -182,7 +180,7 @@ pub(crate) struct RequestWithSpan<V> {
     tx: oneshot::Sender<V>,
 }
 
-type ConnectRequest = RequestWithSpan<anyhow::Result<UtpStream>>;
+type ConnectRequest = RequestWithSpan<crate::Result<UtpStream>>;
 type Acceptor<T, E> = RequestWithSpan<UtpStreamStarter<T, E>>;
 
 impl<V> RequestWithSpan<V> {
@@ -329,7 +327,7 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
 }
 
 impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
-    pub(crate) async fn run_forever(mut self) -> anyhow::Result<()> {
+    pub(crate) async fn run_forever(mut self) -> crate::Result<()> {
         let mut read_buf = [0u8; 16384];
 
         loop {
@@ -340,7 +338,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
 
-    async fn run_once(&mut self, read_buf: &mut [u8]) -> anyhow::Result<()> {
+    async fn run_once(&mut self, read_buf: &mut [u8]) -> crate::Result<()> {
         self.cleanup_accept_queue()?;
 
         tokio::select! {
@@ -353,7 +351,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 self.on_control(control).await;
             },
             recv = self.socket.transport.recv_from(read_buf) => {
-                let (len, addr) = recv.context("error receiving")?;
+                let (len, addr) = recv.map_err(Error::Recv)?;
                 let message = match UtpMessage::deserialize(&read_buf[..len]) {
                     Some(msg) => msg,
                     None => {
@@ -369,7 +367,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     // Get into a state where we can't match acceptors with cached SYNs anymore.
-    fn cleanup_accept_queue(&mut self) -> anyhow::Result<()> {
+    fn cleanup_accept_queue(&mut self) -> crate::Result<()> {
         if self.streams_full() {
             return Ok(());
         }
@@ -417,7 +415,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     debug!(?addr, "too many connections, dropping connect request");
                     let _ = sender
                         .tx
-                        .send(Err(anyhow::anyhow!("too many active connections")));
+                        .send(Err(Error::Text("too many active connections")));
                     return;
                 }
                 let conn_id = self.get_next_free_conn_id(addr);
@@ -449,7 +447,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     Err(e) => {
                         let _ = sender
                             .tx
-                            .send(Err(e).with_context(|| format!("error sending SYN to {addr}")));
+                            .send(Err(Error::ErrorSendingSyn { addr, source: e }));
                         return;
                     }
                 }
@@ -488,7 +486,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     #[tracing::instrument(level = "trace", skip_all, fields(addr, seq_nr=?msg.header.seq_nr, ack_nr=?msg.header.ack_nr))]
-    fn on_maybe_connect_ack(&mut self, addr: SocketAddr, msg: UtpMessage) -> anyhow::Result<()> {
+    fn on_maybe_connect_ack(&mut self, addr: SocketAddr, msg: UtpMessage) -> crate::Result<()> {
         if self.streams_full() {
             trace!(
                 active_streams = self.streams.len(),
@@ -594,7 +592,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
 
-    async fn on_syn(&mut self, remote: SocketAddr, msg: UtpMessage) -> anyhow::Result<()> {
+    async fn on_syn(&mut self, remote: SocketAddr, msg: UtpMessage) -> crate::Result<()> {
         let mut syn = Syn {
             remote,
             header: msg.header,
@@ -633,7 +631,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         ack_nr=?message.header.ack_nr,
         payload=message.payload().len()
     ))]
-    async fn on_recv(&mut self, addr: SocketAddr, message: UtpMessage) -> anyhow::Result<()> {
+    async fn on_recv(&mut self, addr: SocketAddr, message: UtpMessage) -> crate::Result<()> {
         let key = (addr, message.header.connection_id);
 
         if let Some(tx) = self.streams.get(&key) {
@@ -720,15 +718,15 @@ fn try_set_udp_rcvbuf(sock: &tokio::net::UdpSocket, bufsize: usize) {
 }
 
 impl UtpSocketUdp {
-    pub async fn new_udp(bind_addr: SocketAddr) -> anyhow::Result<Arc<Self>> {
+    pub async fn new_udp(bind_addr: SocketAddr) -> crate::Result<Arc<Self>> {
         Self::new_udp_with_opts(bind_addr, Default::default()).await
     }
 
     pub async fn new_udp_with_opts(
         bind_addr: SocketAddr,
         opts: SocketOpts,
-    ) -> anyhow::Result<Arc<Self>> {
-        let sock = UdpSocket::bind_udp(bind_addr, true).context("error binding")?;
+    ) -> crate::Result<Arc<Self>> {
+        let sock = UdpSocket::bind_udp(bind_addr, true)?;
 
         if bind_addr.is_ipv4() {
             if let Err(e) = sock.socket().set_dontfrag_v4(true) {
@@ -758,7 +756,7 @@ impl UtpSocketUdp {
 }
 
 impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
-    pub fn new_with_opts(transport: T, env: Env, opts: SocketOpts) -> anyhow::Result<Arc<Self>> {
+    pub fn new_with_opts(transport: T, env: Env, opts: SocketOpts) -> crate::Result<Arc<Self>> {
         let parent_span = opts.parent_span.clone();
         let (sock, dispatcher) = Self::new_with_opts_and_dispatcher(transport, env, opts)?;
         let span = error_span!(parent: parent_span, "utp_socket", addr=?sock.transport.bind_addr());
@@ -774,8 +772,8 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         transport: T,
         env: Env,
         opts: SocketOpts,
-    ) -> anyhow::Result<(Arc<Self>, Dispatcher<T, Env>)> {
-        let validated_opts = opts.validate().context("error validating socket options")?;
+    ) -> crate::Result<(Arc<Self>, Dispatcher<T, Env>)> {
+        let validated_opts = opts.validate()?;
         let sock = transport;
         let local_addr = sock.bind_addr();
 
@@ -819,7 +817,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     }
 
     #[tracing::instrument(level = "debug", name="utp_socket:accept", skip(self), fields(local=?self.local_addr))]
-    pub async fn accept(self: &Arc<Self>) -> anyhow::Result<UtpStream> {
+    pub async fn accept(self: &Arc<Self>) -> crate::Result<UtpStream> {
         let (tx, rx) = oneshot::channel();
 
         METRICS.accepting.increment(1);
@@ -828,9 +826,10 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         self.accept_requests
             .send(RequestWithSpan::new(tx))
             .await
+            .ok()
             .context("dispatcher dead")?;
 
-        let stream = rx.await.context("dispatcher dead")?;
+        let stream = rx.await.ok().context("dispatcher dead")?;
 
         METRICS.accepts.increment(1);
 
@@ -840,7 +839,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     }
 
     #[tracing::instrument(level = "debug", name="utp_socket:connect", skip(self), fields(local=?self.local_addr))]
-    pub async fn connect(self: &Arc<Self>, remote: SocketAddr) -> anyhow::Result<UtpStream> {
+    pub async fn connect(self: &Arc<Self>, remote: SocketAddr) -> crate::Result<UtpStream> {
         let (tx, rx) = oneshot::channel();
         let token = NEXT_CONNECT_TOKEN.fetch_add(1, Ordering::Relaxed);
         METRICS.connection_attempts.increment(1);
@@ -860,6 +859,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
                 token,
                 RequestWithSpan::new(tx),
             ))
+            .ok()
             .context("dispatcher dead")?;
 
         let mut send_drop_guard = DropGuardSendBeforeDeath::new(
@@ -867,7 +867,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             &self.control_requests,
         );
 
-        let stream_or_err = rx.await.context("dispatcher dead")?;
+        let stream_or_err = rx.await.ok().context("dispatcher dead")?;
         send_drop_guard.disarm();
         if stream_or_err.is_ok() {
             fail_guard.disarm();
@@ -924,7 +924,7 @@ mod tests {
         time::Duration,
     };
 
-    use anyhow::{Context, bail};
+    use anyhow::Context;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         try_join,
@@ -950,7 +950,7 @@ mod tests {
 
             let read = r.read_u32().await.context("error reading u32")?;
             if read != 42 {
-                bail!("expected 42, got {}", read);
+                anyhow::bail!("expected 42, got {}", read);
             }
             info!("received 42, closing echo");
             Ok(())

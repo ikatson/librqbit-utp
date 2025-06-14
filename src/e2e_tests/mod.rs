@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use libutp_rs2::UtpUdpContext;
 use lossy_socket::LossyUtpUdpSocket;
 use tokio::{
@@ -93,7 +93,7 @@ async fn echo(
                 .context("timeout reading")?
                 .context("error reading")?;
             if current != expected {
-                bail!("expected {expected}, got {current}");
+                anyhow::bail!("expected {expected}, got {current}");
             }
 
             if current % PRINT_EVERY == 0 {
