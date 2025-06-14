@@ -44,8 +44,8 @@ pub fn fill_buffer_from_slices(
 ) -> crate::Result<()> {
     if out_buf.len() < len {
         return Err(Error::BugTooSmallBuffer {
-            out_buf_len: out_buf.len(),
-            len,
+            out_buf_len: try_shrink_or_neg!(out_buf.len()),
+            len: try_shrink_or_neg!(len),
         });
     }
 
@@ -68,10 +68,10 @@ pub fn prepare_2_ioslices<'a>(
 
     let total_len = first.len() + second.len();
     if offset >= total_len {
-        bail!("offset beyond buffer bounds");
+        return Err(Error::BugOffsetBeyondBufferBounds);
     }
     if offset + len > total_len {
-        bail!("requested length exceeds buffer bounds");
+        return Err(Error::BugRequestedLengthExceedsBufferBounds);
     }
 
     // Handle offset

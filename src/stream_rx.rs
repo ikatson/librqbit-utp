@@ -650,10 +650,10 @@ impl OutOfOrderQueue {
         }
 
         let msg = match msg.header.htype {
-            Type::ST_DATA if msg.payload().is_empty() => bail!("zero payload unsupported"),
+            Type::ST_DATA if msg.payload().is_empty() => return Err(Error::ZeroPayloadStData),
             Type::ST_DATA => OoqMessage::Payload(msg.data),
             Type::ST_FIN => OoqMessage::Eof,
-            _ => bail!("invalid message, expected ST_DATA or ST_FIN"),
+            _ => return Err(Error::BugInvalidMessageExpectedStDataOrFin),
         };
 
         let slot = self

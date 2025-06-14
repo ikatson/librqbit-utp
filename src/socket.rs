@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{Error, error::OptionContext};
+use crate::Error;
 use dontfrag::UdpSocketExt;
 use librqbit_dualstack_sockets::UdpSocket;
 use rustc_hash::FxHashMap as HashMap;
@@ -120,20 +120,23 @@ impl SocketOpts {
             self.vsock_rx_bufsize_bytes
                 .unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK),
         )
-        .context("max_user_rx_buffered_bytes = 0. Increase rx_bufsize")?;
+        .ok_or(Error::ValidateMaxUserRxBufferedBytes)?;
 
         let virtual_socket_tx_bytes = NonZeroUsize::new(
             self.vsock_tx_bufsize_bytes
                 .unwrap_or(DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK),
         )
-        .context("invalid configuration: virtual_socket_tx_bytes = 0")?;
+        .ok_or(Error::ValidateMaxTxBufSizePerVsock)?;
 
         // 1500 is ethernet MTU.
         let link_mtu = self.link_mtu.unwrap_or(1500);
-        let link_mtu: u16 = link_mtu.try_into().ok().context("link mtu exceeds u16")?;
+        let link_mtu: u16 = link_mtu
+            .try_into()
+            .ok()
+            .ok_or(Error::ValidateLinkMtuExceedsU16)?;
         let min_mtu = IPV4_HEADER + UDP_HEADER + UTP_HEADER + 1;
         if link_mtu < min_mtu {
-            return Err(Error::LinkMtuTooLow { link_mtu, min_mtu });
+            return Err(Error::ValidateMtuTooLow { link_mtu, min_mtu });
         }
 
         Ok(ValidatedSocketOpts {
@@ -413,9 +416,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             ControlRequest::ConnectRequest(addr, token, sender) => {
                 if self.streams_full() {
                     debug!(?addr, "too many connections, dropping connect request");
-                    let _ = sender
-                        .tx
-                        .send(Err(Error::Text("too many active connections")));
+                    let _ = sender.tx.send(Err(Error::TooManyActiveConnections));
                     return;
                 }
                 let conn_id = self.get_next_free_conn_id(addr);
@@ -724,7 +725,8 @@ impl UtpSocketUdp {
         bind_addr: SocketAddr,
         opts: SocketOpts,
     ) -> crate::Result<Arc<Self>> {
-        let sock = UdpSocket::bind_udp(bind_addr, true)?;
+        let sock =
+            UdpSocket::bind_udp(bind_addr, true).map_err(|e| Error::Dualstack(Box::new(e)))?;
 
         if bind_addr.is_ipv4() {
             if let Err(e) = sock.socket().set_dontfrag_v4(true) {
@@ -825,9 +827,9 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             .send(RequestWithSpan::new(tx))
             .await
             .ok()
-            .context("dispatcher dead")?;
+            .ok_or(Error::DispatcherDead)?;
 
-        let stream = rx.await.ok().context("dispatcher dead")?;
+        let stream = rx.await.ok().ok_or(Error::DispatcherDead)?;
 
         METRICS.accepts.increment(1);
 
@@ -858,14 +860,14 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
                 RequestWithSpan::new(tx),
             ))
             .ok()
-            .context("dispatcher dead")?;
+            .ok_or(Error::DispatcherDead)?;
 
         let mut send_drop_guard = DropGuardSendBeforeDeath::new(
             ControlRequest::ConnectDropped(remote, token),
             &self.control_requests,
         );
 
-        let stream_or_err = rx.await.ok().context("dispatcher dead")?;
+        let stream_or_err = rx.await.ok().ok_or(Error::DispatcherDead)?;
         send_drop_guard.disarm();
         if stream_or_err.is_ok() {
             fail_guard.disarm();

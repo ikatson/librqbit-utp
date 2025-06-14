@@ -250,7 +250,7 @@ macro_rules! send_data {
                 == $self.socket_opts.max_segment_retransmissions.get()
             {
                 METRICS.max_retransmissions_reached.increment(1);
-                bail!("max number of retransmissions reached");
+                return Err(Error::MaxRetransmissionsReached);
             }
 
             $header.set_type(Type::ST_DATA);
@@ -612,9 +612,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.segment_sizes.disarm_cooldown();
                 self.this_poll.restart = true;
             } else {
-                bail!(
-                    "got EMSGSIZE error, but the last message was not a matching MTU probe that we could pop."
-                );
+                return Err(Error::BugEmsgSizeNoProbe);
             }
         }
 
@@ -791,8 +789,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         if g.len() < self.user_tx_segments.total_len_bytes() {
             return Err(Error::BugInBufferComputations {
-                user_tx_buflen: g.len(),
-                segmented_len,
+                user_tx_buflen: try_shrink_or_neg!(g.len()),
+                segmented_len: try_shrink_or_neg!(segmented_len),
             });
         }
 
@@ -828,7 +826,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             let is_mtu_probe = payload_size > min_ss as usize;
 
             if !self.user_tx_segments.enqueue(payload_size, is_mtu_probe) {
-                bail!("bug, can't enqueue next segment")
+                return Err(Error::BugCantEnqueue);
             }
             remaining -= payload_size;
             remote_window_remaining -= payload_size;
@@ -1028,20 +1026,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
             (_, ST_RESET) => {
                 self.state = Closed;
-                bail!("ST_RESET received")
+                return Err(Error::StResetReceived);
             }
             (_, ST_SYN) => {
                 trace!("unexpected ST_SYN, ignoring");
                 return Ok(Default::default());
             }
             (Closed, _) => {
-                bail!("bug: received a packet in Closed state, we shouldn't have reached here");
+                return Err(Error::BugRecvInClosed);
             }
-            (SynReceived, _) => {
-                bail!(
-                    "bug: unexpected packet in SynReceived state. We should have sent the SYN-ACK first."
-                )
-            }
+            (SynReceived, _) => return Err(Error::BugUnexpectedPacketInSynReceived),
             (SynAckSent { .. }, ST_DATA | ST_STATE) => {
                 if hdr.ack_nr != self.seq_nr - 1 {
                     trace!("dropping packet, we expected a different ack_nr");
@@ -1259,7 +1253,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
             ST_STATE => {}
-            ST_RESET => bail!("ST_RESET received"),
+            ST_RESET => return Err(Error::StResetReceived),
             ST_FIN => {
                 if let Some(close_reason) = msg.header.extensions.close_reason {
                     debug!("remote closed with {close_reason:?}");
@@ -1365,7 +1359,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         };
         if sent_count == self.socket_opts.max_segment_retransmissions.get() {
-            bail!("too many syn-acks sent")
+            return Err(Error::MaxSynAckRetransmissionsReached);
         }
         if self.send_ack(cx)? {
             self.state = VirtualSocketState::SynAckSent {
@@ -1460,7 +1454,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .expired(self.this_poll.now)
             {
                 METRICS.inactivity_timeouts.increment(1);
-                let err = Error::RemoteInactiveForTooLong { state: self.state };
+                let err = Error::RemoteInactiveForTooLong;
+                trace!(state=?self.state, "remote was inactive for too long");
                 self.just_before_death(cx, Some(&err));
                 return Poll::Ready(Err(err));
             }
@@ -1516,7 +1511,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Poll::Pending;
         }
 
-        Poll::Ready(Err(Error::Text("unreachable")))
+        Poll::Ready(Err(Error::BugUnreachable))
     }
 }
 

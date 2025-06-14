@@ -39,7 +39,10 @@ impl UserTxLocked {
     pub fn truncate_front(&mut self, count: usize) -> crate::Result<()> {
         let skipped = self.buffer.skip(count);
         if skipped != count {
-            return Err(Error::BugTruncateFront { skipped, count });
+            return Err(Error::BugTruncateFront {
+                skipped: try_shrink_or_neg!(skipped),
+                count: try_shrink_or_neg!(count),
+            });
         }
         Ok(())
     }

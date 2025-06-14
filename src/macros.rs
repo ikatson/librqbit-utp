@@ -86,9 +86,9 @@ macro_rules! cmphead {
     };
 }
 
-macro_rules! bail {
-    ($msg:expr) => {
-        return Err(crate::Error::Text($msg))
+macro_rules! try_shrink_or_neg {
+    ($v:expr) => {
+        $v.try_into().unwrap_or(-1)
     };
 }
 

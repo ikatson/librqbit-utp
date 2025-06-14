@@ -92,7 +92,7 @@ impl UtpHeader {
 
     pub fn serialize(&self, buffer: &mut [u8]) -> crate::Result<usize> {
         if buffer.len() < UTP_HEADER as usize {
-            bail!("too small buffer");
+            return Err(Error::SerializeTooSmallBuffer);
         }
         const VERSION: u8 = 1;
         const NEXT_EXT_IDX: usize = 1;
@@ -146,7 +146,7 @@ impl UtpHeader {
         let payload_sz = payload_serialize(
             out_buf
                 .get_mut(sz..)
-                .ok_or(Error::Text("serialize_with_payload: too small buffer"))?,
+                .ok_or(Error::SerializeTooSmallBuffer)?,
         )?;
         Ok(sz + payload_sz)
     }
