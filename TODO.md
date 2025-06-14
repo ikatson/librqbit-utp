@@ -21,6 +21,9 @@ Real world:
 - [x] Spammy message, seems to occur in a loop mostly: RTO expired, rewinding to retransmit FIN
 - [x] inactivity timer in bench triggers, shouldn't
 - [x] huge bench perf regression?
+- [ ] seems to send ACK twice for some reason, logs:
+  did not send anything remaining_cwnd=8307
+  2x "sending seq_nr=15372 ack_nr=56711 wnd_size=980343 type=ST_STATE"
 
 Code:
 - [x] maybe_send_syn_ack() - timer handling is a bit custom, need to use RTO and timers framework
