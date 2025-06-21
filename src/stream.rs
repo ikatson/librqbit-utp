@@ -27,12 +27,7 @@ impl UtpStream {
         self.remote_addr
     }
 
-    pub fn split(
-        self,
-    ) -> (
-        impl AsyncRead + Send + Sync + 'static,
-        impl AsyncWrite + Send + Sync + 'static,
-    ) {
+    pub fn split(self) -> (UtpStreamReadHalf, UtpStreamWriteHalf) {
         (self.reader, self.writer)
     }
 

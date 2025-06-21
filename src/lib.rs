@@ -37,6 +37,8 @@ mod utils;
 pub use error::{Error, Result};
 pub use socket::{CongestionConfig, CongestionControllerKind, SocketOpts, UtpSocket, UtpSocketUdp};
 pub use stream::UtpStream;
+pub use stream_rx::UtpStreamReadHalf;
+pub use stream_tx::UtpStreamWriteHalf;
 pub use traits::Transport;
 
 type Payload = Vec<u8>;
