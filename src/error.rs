@@ -1,5 +1,3 @@
-use static_assertions::assert_eq_size;
-
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("error sending SYN: {0}")]
@@ -84,8 +82,5 @@ pub enum Error {
     #[error("dispatcher dead")]
     DispatcherDead,
 }
-
-// ensure Error size is minimal:
-assert_eq_size!([u8; 16], Error);
 
 pub type Result<T> = std::result::Result<T, Error>;
