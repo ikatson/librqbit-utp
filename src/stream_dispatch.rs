@@ -13,7 +13,7 @@ use std::{
 
 use tokio::{sync::mpsc::UnboundedReceiver, time::Sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{Level, debug, error_span, event, trace, trace_span};
+use tracing::{Level, debug, debug_span, event, trace, trace_span};
 
 use crate::{
     Error, UtpSocket,
@@ -1613,7 +1613,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
         } = self;
 
         let parent = vsock.parent_span.as_ref().and_then(|s| s.id());
-        let span = error_span!(parent: parent, "utp_stream", remote=?vsock.remote);
+        let span = debug_span!(parent: parent, "utp_stream", remote=?vsock.remote);
         spawn_with_cancel(span, cancellation_token, vsock.run_forever());
         stream
     }

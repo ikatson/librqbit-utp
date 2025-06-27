@@ -36,7 +36,7 @@ use tokio::sync::{
     mpsc::{self, UnboundedReceiver, UnboundedSender, unbounded_channel},
     oneshot,
 };
-use tracing::{debug, error_span, trace, warn};
+use tracing::{debug, debug_span, trace, warn};
 
 type ConnectionId = SeqNr;
 
@@ -759,7 +759,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     pub fn new_with_opts(transport: T, env: Env, opts: SocketOpts) -> crate::Result<Arc<Self>> {
         let parent_span = opts.parent_span.clone();
         let (sock, dispatcher) = Self::new_with_opts_and_dispatcher(transport, env, opts)?;
-        let span = error_span!(parent: parent_span, "utp_socket", addr=?sock.transport.bind_addr());
+        let span = debug_span!(parent: parent_span, "utp_socket", addr=?sock.transport.bind_addr());
         spawn_with_cancel(
             span,
             sock.cancellation_token.clone(),
@@ -929,7 +929,7 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         try_join,
     };
-    use tracing::{Instrument, error_span, info};
+    use tracing::{Instrument, debug_span, info};
 
     use crate::test_util::{MockUtpStream, setup_test_logging, transport::MockInterface};
 
@@ -966,13 +966,13 @@ mod tests {
             .await
             .context("error running echo connect")
         }
-        .instrument(error_span!("connect"));
+        .instrument(debug_span!("connect"));
         let accept = async {
             echo(server.accept().await.context("error accepting")?)
                 .await
                 .context("error running echo accept")
         }
-        .instrument(error_span!("accept"));
+        .instrument(debug_span!("accept"));
 
         tokio::time::timeout(
             Duration::from_secs(1),
