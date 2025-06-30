@@ -61,9 +61,9 @@ struct BenchArgs {
     #[arg(long, default_value = "127.0.0.1:5001")]
     client_connect_addr: SocketAddr,
 
-    #[arg(long, default_value = "127.0.0.1:9001")]
+    #[arg(long, default_value = "0.0.0.0:9001")]
     client_prometheus_listen_addr: SocketAddr,
-    #[arg(long, default_value = "127.0.0.1:9002")]
+    #[arg(long, default_value = "0.0.0.0:9002")]
     server_prometheus_listen_addr: SocketAddr,
 
     #[arg(long, default_value = "librqbit-utp")]
