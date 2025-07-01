@@ -796,7 +796,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         let mut remaining = g.len() - segmented_len;
 
-        // TODO: need to refactor this to play nicely with recovery etc
         let mut remote_window_remaining = self.last_remote_window as usize;
 
         trace!(
