@@ -77,6 +77,14 @@ impl UserTxLocked {
         self.buffer.is_full()
     }
 
+    pub fn full_ratio(&self) -> f64 {
+        self.len() as f64 / (self.capacity() as f64)
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.buffer.capacity().get()
+    }
+
     fn mark_vsock_closed(&mut self) {
         self.vsock_closed = true;
         if let Some(waker) = self.writer_waker.take() {

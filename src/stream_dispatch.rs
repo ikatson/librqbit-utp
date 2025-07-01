@@ -837,15 +837,22 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         }
 
-        let grow_limit = self
-            .congestion_controller
-            .window()
-            .min(self.last_remote_window as usize);
-        if g.is_full() && g.len() < grow_limit {
-            let grow_res = g.grow(self.socket.opts().vsock_tx_bufsize_bytes_max);
-            tracing::warn!(grow_res, glen = g.len(), grow_limit);
-            if let Some(w) = g.writer_waker.take() {
-                w.wake();
+        // Grow the send buffer if it's approaching limits.
+        // The 0.9 value found empirically.
+        {
+            let grow_limit = self
+                .congestion_controller
+                .window()
+                .min(self.last_remote_window as usize)
+                .min(self.socket.opts().vsock_tx_bufsize_bytes_max.get());
+            if g.capacity() < grow_limit && g.full_ratio() > 0.9 {
+                let new_cap = g.grow(self.socket.opts().vsock_tx_bufsize_bytes_max);
+                if let Some(new_cap) = new_cap {
+                    tracing::debug!(new_cap, glen = g.len(), grow_limit, "grew send buffer");
+                    if let Some(w) = g.writer_waker.take() {
+                        w.wake();
+                    }
+                }
             }
         }
 
