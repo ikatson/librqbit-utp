@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "librqbit-utp"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "anyhow",
  "approx",

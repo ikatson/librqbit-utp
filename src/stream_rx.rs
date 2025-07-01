@@ -9,6 +9,7 @@
 /// became ready for in-order delivery, they'll get put into UtpStreamReadHalf.
 use std::{
     collections::VecDeque,
+    io::IoSliceMut,
     num::NonZeroUsize,
     pin::Pin,
     sync::Arc,
@@ -131,43 +132,19 @@ pub struct UtpStreamReadHalf {
 }
 
 impl UtpStreamReadHalf {
-    #[cfg(test)]
-    pub async fn read_all_available(&mut self) -> std::io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; 2 * 1024 * 1024];
-        let mut offset = 0;
-        let mut g = self.shared.locked.lock();
-        while let Some(m) = g.queue.pop_front() {
-            match m {
-                UserRxMessage::Payload(payload) => {
-                    buf[offset..offset + payload.len()].copy_from_slice(&payload);
-                    offset += payload.len();
-                }
-                UserRxMessage::Eof => {
-                    break;
-                }
-                UserRxMessage::Error(e) => return Err(std::io::Error::other(e)),
-            }
-        }
-        buf.truncate(offset);
-        Ok(buf)
-    }
-}
-
-// Dispatcher owns mut UserRx {shared, out_of_order_queue, tx}
-// Client owns UtpStreamReadHalf {shared, rx}
-//
-// TODO: implement flow control
-
-impl AsyncRead for UtpStreamReadHalf {
-    fn poll_read(
+    pub fn poll_read_vectored(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
+        mut bufs: &mut [IoSliceMut<'_>],
+    ) -> Poll<std::io::Result<usize>> {
         let mut written = 0usize;
         let mut dispatcher_dead = false;
 
-        while buf.remaining() > 0 {
+        while let Some(current_buf) = bufs.first_mut() {
+            if current_buf.is_empty() {
+                bufs = &mut bufs[1..];
+                continue;
+            }
             // If there was a previous message we haven't read till the end, do it.
             if let Some(current) = self.current.as_mut() {
                 let payload = &current.payload[current.offset..];
@@ -177,9 +154,10 @@ impl AsyncRead for UtpStreamReadHalf {
                     )));
                 }
 
-                let len = buf.remaining().min(payload.len());
+                let len = current_buf.len().min(payload.len());
+                current_buf[..len].copy_from_slice(&payload[..len]);
+                current_buf.advance(len);
 
-                buf.put_slice(&payload[..len]);
                 written += len;
                 current.offset += len;
                 if current.offset == current.payload.len() {
@@ -225,11 +203,11 @@ impl AsyncRead for UtpStreamReadHalf {
             if let Some(waker) = waker {
                 waker.wake();
             }
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(written));
         }
 
         if self.is_eof {
-            return Poll::Ready(Ok(()));
+            return Poll::Ready(Ok(0));
         }
 
         if dispatcher_dead {
@@ -237,6 +215,40 @@ impl AsyncRead for UtpStreamReadHalf {
         }
 
         Poll::Pending
+    }
+
+    #[cfg(test)]
+    pub async fn read_all_available(&mut self) -> std::io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; 2 * 1024 * 1024];
+        let mut offset = 0;
+        let mut g = self.shared.locked.lock();
+        while let Some(m) = g.queue.pop_front() {
+            match m {
+                UserRxMessage::Payload(payload) => {
+                    buf[offset..offset + payload.len()].copy_from_slice(&payload);
+                    offset += payload.len();
+                }
+                UserRxMessage::Eof => {
+                    break;
+                }
+                UserRxMessage::Error(e) => return Err(std::io::Error::other(e)),
+            }
+        }
+        buf.truncate(offset);
+        Ok(buf)
+    }
+}
+
+impl AsyncRead for UtpStreamReadHalf {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let mut iovecs = [IoSliceMut::new(buf.initialize_unfilled())];
+        let len = std::task::ready!(self.poll_read_vectored(cx, &mut iovecs)?);
+        buf.advance(len);
+        Poll::Ready(Ok(()))
     }
 }
 

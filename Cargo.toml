@@ -1,6 +1,6 @@
 [package]
 name = "librqbit-utp"
-version = "0.5.5"
+version = "0.5.6"
 edition = "2024"
 description = "uTP (uTorrent Transport Protocol) library, implements BEP 29"
 license = "Apache-2.0"
