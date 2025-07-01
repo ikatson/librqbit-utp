@@ -1,6 +1,7 @@
 /// The user-facing writer side for uTP stream (UtpStreamWriteHalf).
 /// The user calls AsyncWrite on it to write the data to the stream.
 use std::{
+    io::IoSlice,
     num::NonZeroUsize,
     sync::Arc,
     task::{Poll, Waker},
@@ -16,7 +17,8 @@ use tracing::trace;
 
 use crate::{
     Error,
-    utils::{fill_buffer_from_slices, grow_rb, update_optional_waker},
+    double_buf::DoubleBufHelper,
+    utils::{grow_rb, update_optional_waker},
 };
 
 pub struct UserTxLocked {
@@ -47,14 +49,11 @@ impl UserTxLocked {
         Ok(())
     }
 
-    pub fn fill_buffer_from_ring_buffer(
-        &self,
-        out_buf: &mut [u8],
-        offset: usize,
-        len: usize,
-    ) -> crate::Result<()> {
+    pub fn get_data(&self, offset: usize, len: usize) -> [IoSlice<'_>; 2] {
         let (first, second) = self.buffer.as_slices();
-        fill_buffer_from_slices(out_buf, offset, len, first, second)
+        let mut buf = DoubleBufHelper::new(first, second);
+        buf.advance(offset);
+        buf.as_ioslices(len)
     }
 
     pub fn grow(&mut self, max_size: NonZeroUsize) -> Option<usize> {

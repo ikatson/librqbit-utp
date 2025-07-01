@@ -3,6 +3,7 @@ mod tests;
 
 use std::{
     future::Future,
+    io::IoSlice,
     net::SocketAddr,
     num::NonZeroUsize,
     pin::Pin,
@@ -261,18 +262,24 @@ macro_rules! send_data {
                 .timestamp_microseconds
                 .wrapping_sub($self.last_remote_timestamp);
 
-            let len = $header.serialize_with_payload(&mut $self.this_poll.tmp_buf, |b| {
+            let hlen = $header.serialize(&mut $self.this_poll.tmp_buf)?;
+
+            {
+                let g = $self.user_tx.locked.lock();
                 let offset = $segment_iter_item.payload_offset();
                 let len = $segment_iter_item.payload_size();
-                let g = $self.user_tx.locked.lock();
-                g.fill_buffer_from_ring_buffer(b, offset, len)?;
-                Ok(len)
-            })?;
+                let data = g.get_data(offset, len);
+                let bufs = [
+                    IoSlice::new(&$self.this_poll.tmp_buf[..hlen]),
+                    data[0],
+                    data[1],
+                ];
+                $self.this_poll.transport_pending = $self
+                    .socket
+                    .try_poll_send_to_vectored($cx, &bufs, $self.remote)
+                    .map_err(Error::Send)?;
+            }
 
-            $self.this_poll.transport_pending = $self
-                .socket
-                .try_poll_send_to($cx, &$self.this_poll.tmp_buf[..len], $self.remote)
-                .map_err(Error::Send)?;
             if $self.this_poll.transport_pending {
                 return Ok(false);
             }

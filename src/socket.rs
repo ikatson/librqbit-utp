@@ -1,5 +1,6 @@
 use std::{
     collections::{VecDeque, hash_map::Entry},
+    io::IoSlice,
     net::SocketAddr,
     num::NonZeroUsize,
     sync::{
@@ -917,6 +918,41 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
                     "error sending to UDP socket addr={}, len={}: {e:#}",
                     addr,
                     buf.len()
+                );
+                return Err(e);
+            }
+            Poll::Pending => {
+                METRICS.send_poll_pending.increment(1);
+                debug_every_ms!(5000, "UDP socket full, could not send packet");
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) fn try_poll_send_to_vectored(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[IoSlice<'_>],
+        addr: SocketAddr,
+    ) -> std::io::Result<bool> {
+        let total: usize = bufs.iter().map(|b| b.len()).sum();
+        match self.transport.poll_send_to_vectored(cx, bufs, addr) {
+            Poll::Ready(Ok(sz)) => {
+                let total: usize = bufs.iter().map(|b| b.len()).sum();
+                if sz != total {
+                    warn!(
+                        actual_len = sz,
+                        expected_len = total,
+                        "sent a broken packet"
+                    );
+                }
+            }
+            Poll::Ready(Err(e)) => {
+                METRICS.send_errors.increment(1);
+                debug!(
+                    "error sending to UDP socket addr={}, len={}: {e:#}",
+                    addr, total
                 );
                 return Err(e);
             }

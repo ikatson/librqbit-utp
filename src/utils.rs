@@ -7,8 +7,6 @@ use ringbuf::{
 };
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
 
-use crate::Error;
-
 pub fn update_optional_waker(waker: &mut Option<Waker>, cx: &std::task::Context<'_>) {
     match waker.as_mut() {
         Some(w) => {
@@ -37,67 +35,6 @@ pub fn seq_nr_offset(new: u16, old: u16, wrap_tolerance: u16) -> isize {
             }
             (new - old) as isize
         }
-    }
-}
-
-pub fn fill_buffer_from_slices(
-    out_buf: &mut [u8],
-    offset: usize,
-    len: usize,
-    first: &[u8],
-    second: &[u8],
-) -> crate::Result<()> {
-    if out_buf.len() < len {
-        return Err(Error::BugTooSmallBuffer {
-            out_buf_len: try_shrink_or_neg!(out_buf.len()),
-            len: try_shrink_or_neg!(len),
-        });
-    }
-
-    let [first, second] = prepare_2_ioslices(first, second, offset, len)?;
-    out_buf[..first.len()].copy_from_slice(first);
-    out_buf[first.len()..first.len() + second.len()].copy_from_slice(second);
-
-    Ok(())
-}
-
-pub fn prepare_2_ioslices<'a>(
-    first: &'a [u8],
-    second: &'a [u8],
-    offset: usize,
-    len: usize,
-) -> crate::Result<[&'a [u8]; 2]> {
-    if len == 0 {
-        return Ok([&[], &[]]);
-    }
-
-    let total_len = first.len() + second.len();
-    if offset >= total_len {
-        return Err(Error::BugOffsetBeyondBufferBounds);
-    }
-    if offset + len > total_len {
-        return Err(Error::BugRequestedLengthExceedsBufferBounds);
-    }
-
-    // Handle offset
-    let (first_slice, second_slice) = if offset >= first.len() {
-        // Offset points into second slice
-        let second_offset = offset - first.len();
-        (&[][..], &second[second_offset..])
-    } else {
-        // Offset points into first slice
-        (&first[offset..], second)
-    };
-
-    // Handle length
-    let remaining_in_first = first_slice.len();
-    if len <= remaining_in_first {
-        // All data can be taken from first slice
-        Ok([&first_slice[..len], &[]])
-    } else {
-        // Need to take data from both slices
-        let needed_from_second = len - remaining_in_first;
-        Ok([first_slice, &second_slice[..needed_from_second]])
     }
 }
 
@@ -191,9 +128,6 @@ pub fn grow_rb(rb: &mut LocalRb<Heap<u8>>, max_size: NonZeroUsize) -> Option<usi
 
 #[cfg(test)]
 mod tests {
-    use crate::utils::prepare_2_ioslices;
-
-    use super::fill_buffer_from_slices;
 
     #[test]
     fn test_seq_nr_offset() {
@@ -223,106 +157,5 @@ mod tests {
             seq_nr_offset(u16::MAX, 1024, 1024),
             u16::MAX as isize - 1024
         );
-    }
-
-    #[test]
-    fn test_fill_buffer_from_rb() {
-        const E: u8 = 255u8;
-        let mut buf = [E; 10];
-
-        fill_buffer_from_slices(&mut buf, 0, 0, &[], &[]).unwrap();
-        assert_eq!(buf, [E; 10]);
-
-        assert!(fill_buffer_from_slices(&mut buf, 0, 1, &[], &[]).is_err());
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 0, 1, &[1, 2, 3], &[4, 5, 6]).is_ok());
-        assert_eq!(buf, [1, E, E, E, E, E, E, E, E, E]);
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 0, 3, &[1, 2, 3], &[4, 5, 6]).is_ok());
-        assert_eq!(buf, [1, 2, 3, E, E, E, E, E, E, E]);
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 0, 4, &[1, 2, 3], &[4, 5, 6]).is_ok());
-        assert_eq!(buf, [1, 2, 3, 4, E, E, E, E, E, E]);
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 0, 4, &[1, 2, 3], &[4, 5, 6]).is_ok());
-        assert_eq!(buf, [1, 2, 3, 4, E, E, E, E, E, E]);
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 1, 3, &[1, 2, 3], &[4, 5, 6]).is_ok());
-        assert_eq!(buf, [2, 3, 4, E, E, E, E, E, E, E]);
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 1, 4, &[1, 2, 3], &[4, 5, 6]).is_ok());
-        assert_eq!(buf, [2, 3, 4, 5, E, E, E, E, E, E]);
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 1, 5, &[1, 2, 3], &[4, 5, 6]).is_ok());
-        assert_eq!(buf, [2, 3, 4, 5, 6, E, E, E, E, E]);
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 1, 6, &[1, 2, 3], &[4, 5, 6]).is_err());
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 3, 0, &[1, 2, 3], &[4, 5, 6]).is_ok());
-        assert_eq!(buf, [E, E, E, E, E, E, E, E, E, E]);
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 3, 1, &[1, 2, 3], &[4, 5, 6]).is_ok());
-        assert_eq!(buf, [4, E, E, E, E, E, E, E, E, E]);
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 3, 3, &[1, 2, 3], &[4, 5, 6]).is_ok());
-        assert_eq!(buf, [4, 5, 6, E, E, E, E, E, E, E]);
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 5, 1, &[1, 2, 3], &[4, 5, 6]).is_ok());
-        assert_eq!(buf, [6, E, E, E, E, E, E, E, E, E]);
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 5, 2, &[1, 2, 3], &[4, 5, 6]).is_err());
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 5, 2, &[1, 2, 3], &[4, 5, 6]).is_err());
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 6, 0, &[1, 2, 3], &[4, 5, 6]).is_ok());
-        assert_eq!(buf, [E, E, E, E, E, E, E, E, E, E]);
-
-        buf = [E; 10];
-        assert!(fill_buffer_from_slices(&mut buf, 6, 1, &[1, 2, 3], &[4, 5, 6]).is_err());
-    }
-
-    #[test]
-    fn test_prepare_2_ioslices() {
-        // Test empty request
-        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 0, 0).unwrap();
-        assert_eq!(result, [&[][..], &[][..]]);
-
-        // Test single slice scenarios
-        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 0, 2).unwrap();
-        assert_eq!(result, [&[1, 2][..], &[][..]]);
-
-        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 1, 2).unwrap();
-        assert_eq!(result, [&[2, 3][..], &[][..]]);
-
-        // Test cross-slice scenarios
-        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 2, 2).unwrap();
-        assert_eq!(result, [&[3][..], &[4][..]]);
-
-        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 3, 2).unwrap();
-        assert_eq!(result, [&[][..], &[4, 5][..]]);
-
-        // Test full length
-        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 0, 6).unwrap();
-        assert_eq!(result, [&[1, 2, 3][..], &[4, 5, 6][..]]);
-
-        // Test error cases
-        assert!(prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 7, 1).is_err()); // offset too large
-        assert!(prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 0, 7).is_err()); // length too large
-        assert!(prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 5, 2).is_err()); // offset + length too large
     }
 }
