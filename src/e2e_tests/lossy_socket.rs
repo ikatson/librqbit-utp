@@ -16,7 +16,10 @@ use tokio::{
     net::UdpSocket,
 };
 
-use crate::{SocketOpts, Transport, UtpSocket, traits::DefaultUtpEnvironment};
+use crate::{
+    SocketOpts, Transport, UtpSocket,
+    traits::{DefaultUtpEnvironment, tokio_poll_send_to_vectored},
+};
 
 use super::AcceptConnect;
 
@@ -93,6 +96,18 @@ impl<const LOSS_PCT: usize> Transport for LossyUdpSocket<LOSS_PCT> {
     fn bind_addr(&self) -> SocketAddr {
         UdpSocket::local_addr(&self.socket)
             .unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
+    }
+
+    fn poll_send_to_vectored(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        if self.loss() {
+            return Poll::Ready(Ok(bufs.iter().map(|b| b.len()).sum()));
+        }
+        tokio_poll_send_to_vectored(&self.socket, cx, bufs, target)
     }
 }
 

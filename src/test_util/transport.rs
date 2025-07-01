@@ -130,6 +130,17 @@ impl Transport for MockUtpTransport {
     fn bind_addr(&self) -> SocketAddr {
         self.bind_addr
     }
+
+    fn poll_send_to_vectored(
+        &self,
+        _cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        let mut buf = Vec::new();
+        bufs.iter().for_each(|b| buf.extend_from_slice(b.as_ref()));
+        Poll::Ready(self.send(&buf, target))
+    }
 }
 
 #[derive(Default)]
@@ -204,5 +215,17 @@ impl Transport for RememberingTransport {
 
     fn bind_addr(&self) -> SocketAddr {
         self.bind_addr
+    }
+
+    fn poll_send_to_vectored(
+        &self,
+        _cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        let mut buf = Vec::new();
+        bufs.iter().for_each(|b| buf.extend_from_slice(b.as_ref()));
+        self.send(target, &buf)?;
+        Poll::Ready(Ok(buf.len()))
     }
 }

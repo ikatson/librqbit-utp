@@ -1,11 +1,13 @@
 use std::{
     future::Future,
+    io::IoSlice,
     net::SocketAddr,
     task::{Context, Poll},
     time::Instant,
 };
 
 use librqbit_dualstack_sockets::UdpSocket;
+use socket2::SockRef;
 
 use crate::metrics::METRICS;
 
@@ -28,6 +30,13 @@ pub trait Transport: Send + Sync + Unpin + 'static {
         &self,
         cx: &mut Context<'_>,
         buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>>;
+
+    fn poll_send_to_vectored(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
         target: SocketAddr,
     ) -> Poll<std::io::Result<usize>>;
 
@@ -66,6 +75,34 @@ impl Transport for UdpSocket {
 
     fn bind_addr(&self) -> SocketAddr {
         UdpSocket::bind_addr(self)
+    }
+
+    fn poll_send_to_vectored(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        tokio_poll_send_to_vectored(self.socket(), cx, bufs, target)
+    }
+}
+
+// TODO: move to dualstack sockets
+pub fn tokio_poll_send_to_vectored(
+    sock: &tokio::net::UdpSocket,
+    cx: &mut Context<'_>,
+    bufs: &[std::io::IoSlice<'_>],
+    target: SocketAddr,
+) -> Poll<std::io::Result<usize>> {
+    loop {
+        let sref = SockRef::from(sock);
+        match sref.send_to_vectored(bufs, &target.into()) {
+            Ok(sz) => return Poll::Ready(Ok(sz)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::task::ready!(sock.poll_send_ready(cx))?;
+            }
+            Err(e) => return Poll::Ready(Err(e)),
+        }
     }
 }
 
