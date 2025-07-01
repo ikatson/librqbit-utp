@@ -668,7 +668,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn send_control_packet(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        header: UtpHeader,
+        header: &UtpHeader,
     ) -> crate::Result<bool> {
         if self.this_poll.transport_pending {
             return Ok(false);
@@ -697,7 +697,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             {
                 self.metrics.sent_bytes.increment(len as u64);
             }
-            self.on_packet_sent(&header);
+            self.on_packet_sent(header);
         } else {
             METRICS.unsent_control_packets.increment(1);
         }
@@ -708,7 +708,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn send_ack(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
         let mut header = self.outgoing_header();
         header.extensions.selective_ack = self.user_rx.selective_ack();
-        self.send_control_packet(cx, header)
+        self.send_control_packet(cx, &header)
     }
 
     fn maybe_send_fin(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
@@ -729,7 +729,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let mut fin = self.outgoing_header();
         fin.set_type(Type::ST_FIN);
         fin.seq_nr = seq_nr;
-        if self.send_control_packet(cx, fin)? {
+        if self.send_control_packet(cx, &fin)? {
             self.timers.retransmit.arm(
                 self.this_poll.now,
                 self.rtte.retransmission_timeout(),
@@ -893,7 +893,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             fin.set_type(Type::ST_FIN);
             fin.seq_nr = self.seq_nr;
             self.seq_nr += 1;
-            if let Err(e) = self.send_control_packet(cx, fin) {
+            if let Err(e) = self.send_control_packet(cx, &fin) {
                 trace!("error sending FIN: {e:#}")
             }
         }
