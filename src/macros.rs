@@ -27,6 +27,17 @@ macro_rules! log_every_ms {
     };
 }
 
+macro_rules! non_zero_const {
+    ($v:expr) => {
+        const {
+            match std::num::NonZero::new($v) {
+                Some(v) => v,
+                None => unreachable!(),
+            }
+        }
+    };
+}
+
 #[allow(unused)]
 macro_rules! trace_dbg {
     ($e:expr) => {{

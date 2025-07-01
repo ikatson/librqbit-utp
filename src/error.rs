@@ -60,10 +60,6 @@ pub enum Error {
     #[error("serialize: too small buffer")]
     SerializeTooSmallBuffer,
 
-    #[error("max_user_rx_buffered_bytes = 0. Increase rx_bufsize")]
-    ValidateMaxUserRxBufferedBytes,
-    #[error("invalid configuration: virtual_socket_tx_bytes = 0")]
-    ValidateMaxTxBufSizePerVsock,
     #[error("link mtu exceeds u16")]
     ValidateLinkMtuExceedsU16,
     #[error(

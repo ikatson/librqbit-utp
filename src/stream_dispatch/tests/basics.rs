@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use tokio::io::AsyncWriteExt;
 use tracing::trace;
 
@@ -142,7 +144,7 @@ async fn test_out_of_order_delivery() {
 async fn test_data_integrity_manual_packets() {
     setup_test_logging();
 
-    const DATA_SIZE: usize = 1024 * 1024;
+    const DATA_SIZE: NonZeroUsize = non_zero_const!(1024 * 1024);
     const CHUNK_SIZE: usize = 1024;
 
     let mut t = make_test_vsock(
@@ -153,9 +155,12 @@ async fn test_data_integrity_manual_packets() {
         false,
     );
 
-    let mut test_data = Vec::with_capacity(DATA_SIZE);
+    let mut test_data = Vec::with_capacity(DATA_SIZE.get());
 
-    for char in std::iter::repeat(b'a'..=b'z').flatten().take(DATA_SIZE) {
+    for char in std::iter::repeat(b'a'..=b'z')
+        .flatten()
+        .take(DATA_SIZE.get())
+    {
         test_data.push(char);
     }
 
@@ -185,7 +190,7 @@ async fn test_data_integrity_manual_packets() {
     // Verify data integrity
     assert_eq!(
         received_data.len(),
-        DATA_SIZE,
+        DATA_SIZE.get(),
         "Received data size mismatch: got {} bytes, expected {}",
         received_data.len(),
         DATA_SIZE

@@ -29,9 +29,9 @@ async fn test_mtu_probing() {
     // Let's pretend the actual MTU is 1280. By probing through binary search, ensure it gets found quickly.
     let mut t = make_test_vsock(
         SocketOpts {
-            link_mtu: Some(1500),
+            link_mtu: Some(non_zero_const!(1500)),
             mtu_probe_max_retransmissions: Some(0),
-            vsock_tx_bufsize_bytes: Some(1024 * 1024), // so that we can write the initial large payload without blocking
+            vsock_tx_bufsize_bytes_initial: Some(non_zero_const!(1024 * 1024)), // so that we can write the initial large payload without blocking
             disable_nagle: true,
             ..Default::default()
         },

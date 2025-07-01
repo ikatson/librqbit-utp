@@ -18,6 +18,7 @@ async fn test_congestion_control_basics() {
     let mut t = make_test_vsock(
         SocketOpts {
             remote_inactivity_timeout: Some(Duration::from_secs(20)),
+            vsock_tx_bufsize_bytes_initial: Some(non_zero_const!(64 * 1024)),
             ..Default::default()
         },
         false,

@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, task::Waker};
+use std::{cmp::Ordering, num::NonZeroUsize, task::Waker};
 
 use ringbuf::{
     LocalRb,
@@ -173,13 +173,13 @@ impl<F: FnOnce()> Drop for FnDropGuard<F> {
 }
 
 /// Grow a ring buffer 2x up to max capacity.
-pub fn grow_rb(rb: &mut LocalRb<Heap<u8>>, max_size: usize) -> Option<usize> {
+pub fn grow_rb(rb: &mut LocalRb<Heap<u8>>, max_size: NonZeroUsize) -> Option<usize> {
     let cap = rb.capacity().get();
-    if cap >= max_size {
+    if cap >= max_size.get() {
         return None;
     }
 
-    let new_cap = (cap * 2).min(max_size);
+    let new_cap = (cap * 2).min(max_size.get());
     let mut heap = LocalRb::new(new_cap);
     let (first, second) = rb.as_slices();
     heap.push_slice(first);

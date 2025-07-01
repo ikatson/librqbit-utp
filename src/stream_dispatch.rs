@@ -838,6 +838,18 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         }
 
+        let grow_limit = self
+            .congestion_controller
+            .window()
+            .min(self.last_remote_window as usize);
+        if g.is_full() && g.len() < grow_limit {
+            let grow_res = g.grow(self.socket.opts().vsock_tx_bufsize_bytes_max);
+            tracing::warn!(grow_res, glen = g.len(), grow_limit);
+            if let Some(w) = g.writer_waker.take() {
+                w.wake();
+            }
+        }
+
         trace!(
             remaining,
             remote_window_remaining,
@@ -1646,11 +1658,11 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
         });
 
         let (user_rx, read_half) = UserRx::build(
-            socket.opts().max_user_rx_buffered_bytes,
+            socket.opts().vsock_rx_bufsize,
             NonZeroUsize::new(ss.mss() as usize).unwrap(),
         );
 
-        let user_tx = UserTx::new(socket.opts().virtual_socket_tx_bytes);
+        let user_tx = UserTx::new(socket.opts().vsock_tx_bufsize_bytes_initial);
         let write_half = UtpStreamWriteHalf::new(user_tx.clone());
 
         let env = socket.env.copy();
@@ -1725,7 +1737,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_sent_window: if matches!(state, VirtualSocketState::Established) {
                 // Pretend we sent the window so that it doesn't trigger a window update packet
                 // without any data sent.
-                socket.opts().max_user_rx_buffered_bytes.get() as u32
+                socket.opts().vsock_rx_bufsize.get() as u32
             } else {
                 0
             },

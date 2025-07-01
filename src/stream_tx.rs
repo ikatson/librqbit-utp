@@ -16,7 +16,7 @@ use tracing::trace;
 
 use crate::{
     Error,
-    utils::{fill_buffer_from_slices, update_optional_waker},
+    utils::{fill_buffer_from_slices, grow_rb, update_optional_waker},
 };
 
 pub struct UserTxLocked {
@@ -55,6 +55,10 @@ impl UserTxLocked {
     ) -> crate::Result<()> {
         let (first, second) = self.buffer.as_slices();
         fill_buffer_from_slices(out_buf, offset, len, first, second)
+    }
+
+    pub fn grow(&mut self, max_size: NonZeroUsize) -> Option<usize> {
+        grow_rb(&mut self.buffer, max_size)
     }
 
     pub fn enqueue_slice(&mut self, bytes: &[u8]) -> usize {
@@ -181,7 +185,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
         let count = g.enqueue_slice(buf);
         this.written_without_yield += count as u64;
         if count == 0 {
-            assert!(g.is_full());
+            debug_assert!(g.is_full());
             update_optional_waker(&mut g.writer_waker, cx);
             this.written_without_yield = 0;
             return Poll::Pending;

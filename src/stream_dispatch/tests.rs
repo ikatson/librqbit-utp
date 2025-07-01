@@ -11,7 +11,12 @@ mod rtte;
 mod shutdown;
 mod stream_api;
 
-use std::{sync::Arc, task::Poll, time::Duration};
+use std::{
+    num::{NonZero, NonZeroUsize},
+    sync::Arc,
+    task::Poll,
+    time::Duration,
+};
 
 use futures::FutureExt;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -31,9 +36,9 @@ fn make_msg(header: UtpHeader, payload: &str) -> UtpMessage {
     UtpMessage::new_test(header, payload.as_bytes())
 }
 
-const fn calc_mtu_for_mss(mss: usize) -> usize {
+const fn calc_mtu_for_mss(mss: usize) -> NonZeroUsize {
     const IP_HEADER: usize = 20;
-    mss + UTP_HEADER as usize + UDP_HEADER as usize + IP_HEADER
+    NonZero::new(mss + UTP_HEADER as usize + UDP_HEADER as usize + IP_HEADER).unwrap()
 }
 
 struct TestVsock {

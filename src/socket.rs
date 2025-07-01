@@ -10,7 +10,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::Error;
+use crate::{
+    Error,
+    constants::{TX_BUF_SIZE_PER_VSOCK_INITIAL_DEFAULT, TX_BUF_SIZE_PER_VSOCK_MAX_DEFAULT},
+};
 use dontfrag::UdpSocketExt;
 use librqbit_dualstack_sockets::UdpSocket;
 use rustc_hash::FxHashMap as HashMap;
@@ -20,9 +23,8 @@ use crate::{UtpStream, spawn_utils::spawn_with_cancel};
 use crate::{
     congestion::CongestionController,
     constants::{
-        DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET, DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK,
-        DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK, DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IPV4_HEADER,
-        UDP_HEADER, UTP_HEADER,
+        DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET, DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IPV4_HEADER,
+        RX_BUF_SIZE_PER_VSOCK_DEFAULT, UDP_HEADER, UTP_HEADER,
     },
     message::UtpMessage,
     metrics::METRICS,
@@ -72,12 +74,24 @@ impl CongestionConfig {
 
 #[derive(Debug, Default, Clone)]
 pub struct SocketOpts {
-    pub link_mtu: Option<usize>,
+    pub link_mtu: Option<NonZeroUsize>,
 
-    /// For flow control, if the user isn't reading, when to start dropping packets.
-    pub vsock_rx_bufsize_bytes: Option<usize>,
-    /// How many bytes to allocate for each virtual socket's TX.
-    pub vsock_tx_bufsize_bytes: Option<usize>,
+    /// Virtual socket read buffer. Serves several purposes:
+    /// - temporary storage before the data is read back to the user's application
+    /// - reassembling out of order packets
+    /// - advertising recv window to the other side (sender). The sender will not send more data than this and might thus stall.
+    ///   Ideal value for throughput should be BDP (bandwidth delay product).
+    pub vsock_rx_bufsize_bytes: Option<NonZeroUsize>,
+
+    /// Virtual socket write buffer. Serves several purposes:
+    /// - how many bytes can store without blocking writer.
+    /// - how many bytes can store without receiving an ACK.
+    ///
+    /// This should be governed by BDP (bandwidth delay product). If it's too low, the pipeline
+    /// would be stalling.
+    /// If it's too high, every VSock would take too much memory.
+    pub vsock_tx_bufsize_bytes_initial: Option<NonZeroUsize>,
+    pub vsock_tx_bufsize_bytes_max: Option<NonZeroUsize>,
 
     /// Disable Nagle's algorithm
     pub disable_nagle: bool,
@@ -102,7 +116,7 @@ pub struct SocketOpts {
 
     /// How many virtual sockets to have at the same time. Each vsock consumes
     /// resources (memory, tokio tasks).
-    pub max_live_vsocks: Option<usize>,
+    pub max_live_vsocks: Option<NonZeroUsize>,
 
     /// If true, will wait for ACK of FIN. By default we don't wait
     /// as it's not required for torrents.
@@ -116,21 +130,14 @@ pub struct SocketOpts {
 
 impl SocketOpts {
     fn validate(&self) -> crate::Result<ValidatedSocketOpts> {
-        let max_user_rx_buffered_bytes = NonZeroUsize::new(
-            self.vsock_rx_bufsize_bytes
-                .unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK),
-        )
-        .ok_or(Error::ValidateMaxUserRxBufferedBytes)?;
-
-        let virtual_socket_tx_bytes = NonZeroUsize::new(
-            self.vsock_tx_bufsize_bytes
-                .unwrap_or(DEFAULT_MAX_TX_BUF_SIZE_PER_VSOCK),
-        )
-        .ok_or(Error::ValidateMaxTxBufSizePerVsock)?;
+        let max_user_rx_buffered_bytes = self
+            .vsock_rx_bufsize_bytes
+            .unwrap_or(RX_BUF_SIZE_PER_VSOCK_DEFAULT);
 
         // 1500 is ethernet MTU.
-        let link_mtu = self.link_mtu.unwrap_or(1500);
+        let link_mtu = self.link_mtu.unwrap_or(non_zero_const!(1500));
         let link_mtu: u16 = link_mtu
+            .get()
             .try_into()
             .ok()
             .ok_or(Error::ValidateLinkMtuExceedsU16)?;
@@ -141,13 +148,18 @@ impl SocketOpts {
 
         Ok(ValidatedSocketOpts {
             link_mtu,
-            max_user_rx_buffered_bytes,
-            virtual_socket_tx_bytes,
+            vsock_rx_bufsize: max_user_rx_buffered_bytes,
             nagle: !self.disable_nagle,
             congestion: self.congestion,
             max_segment_retransmissions: self
                 .max_retransmissions
                 .unwrap_or(NonZeroUsize::new(5).unwrap()),
+            vsock_tx_bufsize_bytes_initial: self
+                .vsock_tx_bufsize_bytes_initial
+                .unwrap_or(TX_BUF_SIZE_PER_VSOCK_INITIAL_DEFAULT),
+            vsock_tx_bufsize_bytes_max: self
+                .vsock_tx_bufsize_bytes_max
+                .unwrap_or(TX_BUF_SIZE_PER_VSOCK_MAX_DEFAULT),
             remote_inactivity_timeout: self
                 .remote_inactivity_timeout
                 .unwrap_or(DEFAULT_REMOTE_INACTIVITY_TIMEOUT),
@@ -163,15 +175,15 @@ impl SocketOpts {
 #[derive(Clone)]
 pub(crate) struct ValidatedSocketOpts {
     pub link_mtu: u16,
-    pub max_user_rx_buffered_bytes: NonZeroUsize,
-
-    pub virtual_socket_tx_bytes: NonZeroUsize,
+    pub vsock_rx_bufsize: NonZeroUsize,
+    pub vsock_tx_bufsize_bytes_initial: NonZeroUsize,
+    pub vsock_tx_bufsize_bytes_max: NonZeroUsize,
     pub nagle: bool,
     pub congestion: CongestionConfig,
     pub max_segment_retransmissions: NonZeroUsize,
 
     pub remote_inactivity_timeout: Duration,
-    pub max_active_streams: usize,
+    pub max_active_streams: NonZeroUsize,
 
     pub wait_for_last_ack: bool,
 
@@ -481,7 +493,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     fn streams_full(&self) -> bool {
-        self.streams.len() >= self.socket.opts.max_active_streams
+        self.streams.len() >= self.socket.opts.max_active_streams.get()
     }
 
     #[tracing::instrument(level = "trace", skip_all, fields(addr, seq_nr=?msg.header.seq_nr, ack_nr=?msg.header.ack_nr))]
@@ -744,10 +756,11 @@ impl UtpSocketUdp {
                 .unwrap_or(DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET);
             let rx_bufsize = opts
                 .vsock_rx_bufsize_bytes
-                .unwrap_or(DEFAULT_MAX_RX_BUF_SIZE_PER_VSOCK)
+                .unwrap_or(RX_BUF_SIZE_PER_VSOCK_DEFAULT)
+                .get()
                 * 10
                 / 8; // add some heuristic overhead for uTP and ACK packets.
-            max_vsocks * rx_bufsize
+            max_vsocks.get() * rx_bufsize
         };
         try_set_udp_rcvbuf(sock.socket(), so_recvbuf);
 

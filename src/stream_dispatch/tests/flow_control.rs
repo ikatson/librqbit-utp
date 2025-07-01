@@ -17,7 +17,7 @@ async fn test_flow_control() {
     // Configure socket with small buffers to test flow control
     let opts = SocketOpts {
         link_mtu: Some(calc_mtu_for_mss(5)),
-        vsock_rx_bufsize_bytes: Some(25), // Small receive buffer (~5 packets of size 5)
+        vsock_rx_bufsize_bytes: Some(non_zero_const!(25)), // Small receive buffer (~5 packets of size 5)
         ..Default::default()
     };
 
@@ -238,10 +238,10 @@ async fn test_window_update_sent_when_window_less_than_mss() {
     setup_test_logging();
 
     // Configure socket with small but non-zero receive buffer
-    let mss = 5;
+    const MSS: usize = 5;
     let opts = SocketOpts {
-        vsock_rx_bufsize_bytes: Some(mss * 2),
-        link_mtu: Some(calc_mtu_for_mss(mss)),
+        vsock_rx_bufsize_bytes: Some(non_zero_const!(MSS * 2)),
+        link_mtu: Some(calc_mtu_for_mss(MSS)),
         ..Default::default()
     };
 
@@ -271,7 +271,7 @@ async fn test_window_update_sent_when_window_less_than_mss() {
     );
 
     // Read some data to free up more than MSS worth of buffer space
-    let mut buf = vec![0u8; mss];
+    let mut buf = vec![0u8; MSS];
     t.stream
         .as_mut()
         .unwrap()

@@ -851,10 +851,10 @@ async fn test_window_update_ack_after_read_with_waking() {
     setup_test_logging();
 
     // Configure socket with very small receive buffer to test flow control
-    let mss = 5;
+    const MSS: usize = 5;
     let opts = SocketOpts {
-        vsock_rx_bufsize_bytes: Some(mss * 2),
-        link_mtu: Some(calc_mtu_for_mss(5)),
+        vsock_rx_bufsize_bytes: Some(non_zero_const!(MSS * 2)),
+        link_mtu: Some(calc_mtu_for_mss(MSS)),
         ..Default::default()
     };
 
