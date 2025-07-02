@@ -6,6 +6,7 @@ use std::{
     task::Poll,
 };
 
+use librqbit_dualstack_sockets::PollSendToVectored;
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tracing::{Instrument, error_span};
@@ -130,7 +131,9 @@ impl Transport for MockUtpTransport {
     fn bind_addr(&self) -> SocketAddr {
         self.bind_addr
     }
+}
 
+impl PollSendToVectored for MockUtpTransport {
     fn poll_send_to_vectored(
         &self,
         _cx: &mut std::task::Context<'_>,
@@ -216,7 +219,9 @@ impl Transport for RememberingTransport {
     fn bind_addr(&self) -> SocketAddr {
         self.bind_addr
     }
+}
 
+impl PollSendToVectored for RememberingTransport {
     fn poll_send_to_vectored(
         &self,
         _cx: &mut std::task::Context<'_>,

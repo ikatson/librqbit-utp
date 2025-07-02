@@ -16,7 +16,7 @@ use crate::{
     constants::{TX_BUF_SIZE_PER_VSOCK_INITIAL_DEFAULT, TX_BUF_SIZE_PER_VSOCK_MAX_DEFAULT},
 };
 use dontfrag::UdpSocketExt;
-use librqbit_dualstack_sockets::UdpSocket;
+use librqbit_dualstack_sockets::{BindOpts, UdpSocket};
 use rustc_hash::FxHashMap as HashMap;
 use tokio_util::sync::CancellationToken;
 
@@ -738,8 +738,14 @@ impl UtpSocketUdp {
         bind_addr: SocketAddr,
         opts: SocketOpts,
     ) -> crate::Result<Arc<Self>> {
-        let sock =
-            UdpSocket::bind_udp(bind_addr, true).map_err(|e| Error::Dualstack(Box::new(e)))?;
+        let sock = UdpSocket::bind_udp(
+            bind_addr,
+            BindOpts {
+                request_dualstack: true,
+                reuseport: false,
+            },
+        )
+        .map_err(|e| Error::Dualstack(Box::new(e)))?;
 
         if bind_addr.is_ipv4() {
             if let Err(e) = sock.socket().set_dontfrag_v4(true) {

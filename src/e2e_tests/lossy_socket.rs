@@ -10,16 +10,14 @@ use std::{
 };
 
 use dontfrag::UdpSocketExt;
+use librqbit_dualstack_sockets::PollSendToVectored;
 use rand::Rng;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::UdpSocket,
 };
 
-use crate::{
-    SocketOpts, Transport, UtpSocket,
-    traits::{DefaultUtpEnvironment, tokio_poll_send_to_vectored},
-};
+use crate::{SocketOpts, Transport, UtpSocket, traits::DefaultUtpEnvironment};
 
 use super::AcceptConnect;
 
@@ -97,7 +95,9 @@ impl<const LOSS_PCT: usize> Transport for LossyUdpSocket<LOSS_PCT> {
         UdpSocket::local_addr(&self.socket)
             .unwrap_or(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
     }
+}
 
+impl<const LOSS_PCT: usize> PollSendToVectored for LossyUdpSocket<LOSS_PCT> {
     fn poll_send_to_vectored(
         &self,
         cx: &mut Context<'_>,
@@ -107,7 +107,7 @@ impl<const LOSS_PCT: usize> Transport for LossyUdpSocket<LOSS_PCT> {
         if self.loss() {
             return Poll::Ready(Ok(bufs.iter().map(|b| b.len()).sum()));
         }
-        tokio_poll_send_to_vectored(&self.socket, cx, bufs, target)
+        self.socket.poll_send_to_vectored(cx, bufs, target)
     }
 }
 
