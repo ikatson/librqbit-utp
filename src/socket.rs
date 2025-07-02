@@ -731,7 +731,7 @@ fn try_set_udp_rcvbuf(sock: &tokio::net::UdpSocket, bufsize: usize) {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UtpSocketUdpOpts<'a> {
-    bind_device: Option<&'a BindDevice>,
+    pub bind_device: Option<&'a BindDevice>,
 }
 
 impl UtpSocketUdp {
