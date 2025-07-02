@@ -300,6 +300,7 @@ impl BenchArgs {
                         librqbit_utp::UtpSocketUdp::new_udp_with_opts(
                             addr,
                             self.librqbut_utp_socket_opts(),
+                            Default::default(),
                         )
                         .await
                         .with_context(|| format!("error creating uTP socket at {addr}"))?,
@@ -331,6 +332,7 @@ impl BenchArgs {
                         librqbit_utp::UtpSocketUdp::new_udp_with_opts(
                             listen,
                             self.librqbut_utp_socket_opts(),
+                            Default::default(),
                         )
                         .await
                         .with_context(|| format!("error creating uTP socket at {listen}"))?,

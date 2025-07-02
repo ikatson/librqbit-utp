@@ -16,7 +16,7 @@ use crate::{
     constants::{TX_BUF_SIZE_PER_VSOCK_INITIAL_DEFAULT, TX_BUF_SIZE_PER_VSOCK_MAX_DEFAULT},
 };
 use dontfrag::UdpSocketExt;
-use librqbit_dualstack_sockets::{BindOpts, UdpSocket};
+use librqbit_dualstack_sockets::{BindDevice, BindOpts, UdpSocket};
 use rustc_hash::FxHashMap as HashMap;
 use tokio_util::sync::CancellationToken;
 
@@ -729,20 +729,27 @@ fn try_set_udp_rcvbuf(sock: &tokio::net::UdpSocket, bufsize: usize) {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct UtpSocketUdpOpts<'a> {
+    bind_device: Option<&'a BindDevice>,
+}
+
 impl UtpSocketUdp {
     pub async fn new_udp(bind_addr: SocketAddr) -> crate::Result<Arc<Self>> {
-        Self::new_udp_with_opts(bind_addr, Default::default()).await
+        Self::new_udp_with_opts(bind_addr, Default::default(), Default::default()).await
     }
 
     pub async fn new_udp_with_opts(
         bind_addr: SocketAddr,
         opts: SocketOpts,
+        udp_opts: UtpSocketUdpOpts<'_>,
     ) -> crate::Result<Arc<Self>> {
         let sock = UdpSocket::bind_udp(
             bind_addr,
             BindOpts {
                 request_dualstack: true,
                 reuseport: false,
+                device: udp_opts.bind_device,
             },
         )
         .map_err(|e| Error::Dualstack(Box::new(e)))?;

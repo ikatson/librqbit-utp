@@ -35,6 +35,7 @@ mod traits;
 mod utils;
 
 pub use error::{Error, Result};
+pub use librqbit_dualstack_sockets::BindDevice;
 pub use socket::{CongestionConfig, CongestionControllerKind, SocketOpts, UtpSocket, UtpSocketUdp};
 pub use stream::UtpStream;
 pub use stream_rx::UtpStreamReadHalf;

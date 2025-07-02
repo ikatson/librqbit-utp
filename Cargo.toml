@@ -1,6 +1,6 @@
 [package]
 name = "librqbit-utp"
-version = "0.5.7"
+version = "0.6.0"
 edition = "2024"
 description = "uTP (uTorrent Transport Protocol) library, implements BEP 29"
 license = "Apache-2.0"
@@ -40,7 +40,7 @@ lazy_static = "1.5.0"
 socket2 = "0.5.8"
 dontfrag = { version = "1.0.1", features = ["tokio"] }
 libc = "0.2.172"
-librqbit-dualstack-sockets = "0.6.6"
+librqbit-dualstack-sockets = "0.6.7"
 thiserror = "2.0.12"
 
 [dev-dependencies]
