@@ -204,7 +204,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
     ) -> Poll<Result<(), std::io::Error>> {
         let mut g = self.user_tx.locked.write();
 
-        if self.user_tx.consumer.lock().is_empty() {
+        if self.user_tx.producer.lock().is_empty() {
             return Poll::Ready(Ok(()));
         }
 
@@ -222,7 +222,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
         let mut g = self.user_tx.locked.write();
-        if !self.user_tx.consumer.lock().is_empty() {
+        if !self.user_tx.producer.lock().is_empty() {
             if g.vsock_closed {
                 return Poll::Ready(Err(std::io::Error::other("socket died")));
             }
