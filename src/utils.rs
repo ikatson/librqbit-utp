@@ -1,10 +1,5 @@
-use std::{cmp::Ordering, num::NonZeroUsize, task::Waker};
+use std::{cmp::Ordering, task::Waker};
 
-use ringbuf::{
-    LocalRb,
-    storage::Heap,
-    traits::{Consumer, Observer, Producer},
-};
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
 
 pub fn update_optional_waker(waker: &mut Option<Waker>, cx: &std::task::Context<'_>) {
@@ -107,23 +102,6 @@ impl<F: FnOnce()> Drop for FnDropGuard<F> {
             f();
         }
     }
-}
-
-/// Grow a ring buffer 2x up to max capacity.
-pub fn grow_rb(rb: &mut LocalRb<Heap<u8>>, max_size: NonZeroUsize) -> Option<usize> {
-    let cap = rb.capacity().get();
-    if cap >= max_size.get() {
-        return None;
-    }
-
-    let new_cap = (cap * 2).min(max_size.get());
-    let mut heap = LocalRb::new(new_cap);
-    let (first, second) = rb.as_slices();
-    heap.push_slice(first);
-    heap.push_slice(second);
-
-    *rb = heap;
-    Some(new_cap)
 }
 
 #[cfg(test)]

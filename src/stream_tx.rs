@@ -1,25 +1,21 @@
 /// The user-facing writer side for uTP stream (UtpStreamWriteHalf).
 /// The user calls AsyncWrite on it to write the data to the stream.
 use std::{
-    io::IoSlice,
     num::NonZeroUsize,
     sync::Arc,
     task::{Poll, Waker},
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use ringbuf::{
+    SharedRb,
     storage::Heap,
-    traits::{Consumer, Observer, Producer},
+    traits::{Consumer, Observer, Producer, Split},
 };
 use tokio::io::AsyncWrite;
 use tracing::trace;
 
-use crate::{
-    Error,
-    double_buf::DoubleBufHelper,
-    utils::{grow_rb, update_optional_waker},
-};
+use crate::{Error, utils::update_optional_waker};
 
 pub struct UserTxLocked {
     // Set when stream dies abruptly for writer to know about it.
@@ -30,60 +26,12 @@ pub struct UserTxLocked {
     // When the writer calls shutdown, this is set to true.
     writer_shutdown: bool,
 
-    buffer: ringbuf::LocalRb<Heap<u8>>,
-
     // Woken by by writer
     pub dispatcher_waker: Option<Waker>,
     pub writer_waker: Option<Waker>,
 }
 
 impl UserTxLocked {
-    pub fn truncate_front(&mut self, count: usize) -> crate::Result<()> {
-        let skipped = self.buffer.skip(count);
-        if skipped != count {
-            return Err(Error::BugTruncateFront {
-                skipped: try_shrink_or_neg!(skipped),
-                count: try_shrink_or_neg!(count),
-            });
-        }
-        Ok(())
-    }
-
-    pub fn get_data(&self, offset: usize, len: usize) -> [IoSlice<'_>; 2] {
-        let (first, second) = self.buffer.as_slices();
-        let mut buf = DoubleBufHelper::new(first, second);
-        buf.advance(offset);
-        buf.as_ioslices(len)
-    }
-
-    pub fn grow(&mut self, max_size: NonZeroUsize) -> Option<usize> {
-        grow_rb(&mut self.buffer, max_size)
-    }
-
-    pub fn enqueue_slice(&mut self, bytes: &[u8]) -> usize {
-        self.buffer.push_slice(bytes)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
-    }
-
-    pub fn len(&self) -> usize {
-        self.buffer.occupied_len()
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.buffer.is_full()
-    }
-
-    pub fn full_ratio(&self) -> f64 {
-        self.len() as f64 / (self.capacity() as f64)
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.buffer.capacity().get()
-    }
-
     fn mark_vsock_closed(&mut self) {
         self.vsock_closed = true;
         if let Some(waker) = self.writer_waker.take() {
@@ -107,35 +55,80 @@ impl UserTxLocked {
 
 /// The shared data between dispatcher and UtpStreamWriteHalf.
 pub struct UserTx {
-    pub locked: Mutex<UserTxLocked>,
+    pub locked: RwLock<UserTxLocked>,
+
+    // They are shared and locked so that we can grow the buffers. Otherwise
+    // producer would only go to the write half, and consumer to the vsock.
+    pub producer: Mutex<Prod>,
+    pub consumer: Mutex<Cons>,
 }
 
 impl UserTx {
     pub fn new(capacity: NonZeroUsize) -> Arc<Self> {
+        let (prod, cons) = RingBuf::new(capacity.get()).split();
         Arc::new(UserTx {
-            locked: Mutex::new(UserTxLocked {
-                buffer: ringbuf::LocalRb::new(capacity.get()),
+            locked: RwLock::new(UserTxLocked {
                 dispatcher_waker: None,
                 writer_waker: None,
                 vsock_closed: false,
                 writer_dropped: false,
                 writer_shutdown: false,
             }),
+            producer: Mutex::new(prod),
+            consumer: Mutex::new(cons),
         })
     }
 
+    pub fn truncate_front(&self, count: usize) -> crate::Result<()> {
+        let skipped = self.consumer.lock().skip(count);
+        if skipped != count {
+            return Err(Error::BugTruncateFront {
+                skipped: try_shrink_or_neg!(skipped),
+                count: try_shrink_or_neg!(count),
+            });
+        }
+        Ok(())
+    }
+
+    /// Grow a ring buffer 2x up to max capacity.
+    pub fn grow(&self, max_size: NonZeroUsize) -> Option<usize> {
+        let mut cons = self.consumer.lock();
+
+        let cap = cons.capacity().get();
+        if cap >= max_size.get() {
+            return None;
+        }
+
+        let mut prod = self.producer.lock();
+
+        let new_cap = (cap * 2).min(max_size.get());
+        let mut new_rb = RingBuf::new(new_cap);
+        let (first, second) = cons.as_slices();
+        new_rb.push_slice(first);
+        new_rb.push_slice(second);
+
+        let (new_prod, new_cons) = new_rb.split();
+        *prod = new_prod;
+        *cons = new_cons;
+        Some(new_cap)
+    }
+
     pub fn is_writer_dropped(&self) -> bool {
-        self.locked.lock().writer_dropped
+        self.locked.read().writer_dropped
     }
 
     pub fn is_writer_shutdown(&self) -> bool {
-        self.locked.lock().writer_shutdown
+        self.locked.read().writer_shutdown
     }
 
     pub fn mark_vsock_closed(&self) {
-        self.locked.lock().mark_vsock_closed();
+        self.locked.write().mark_vsock_closed();
     }
 }
+
+type RingBuf = SharedRb<Heap<u8>>;
+type Prod = <RingBuf as Split>::Prod;
+type Cons = <RingBuf as Split>::Cons;
 
 pub struct UtpStreamWriteHalf {
     user_tx: Arc<UserTx>,
@@ -153,7 +146,7 @@ impl UtpStreamWriteHalf {
 
 impl Drop for UtpStreamWriteHalf {
     fn drop(&mut self) {
-        self.user_tx.locked.lock().mark_writer_dropped();
+        self.user_tx.locked.write().mark_writer_dropped();
     }
 }
 
@@ -173,7 +166,7 @@ impl AsyncWrite for UtpStreamWriteHalf {
             return Poll::Pending;
         }
 
-        let mut g = this.user_tx.locked.lock();
+        let mut g = this.user_tx.locked.write();
 
         if g.vsock_closed {
             return Poll::Ready(Err(std::io::Error::other("socket closed")));
@@ -189,10 +182,9 @@ impl AsyncWrite for UtpStreamWriteHalf {
             )));
         }
 
-        let count = g.enqueue_slice(buf);
+        let count = this.user_tx.producer.lock().push_slice(buf);
         this.written_without_yield += count as u64;
         if count == 0 {
-            debug_assert!(g.is_full());
             update_optional_waker(&mut g.writer_waker, cx);
             this.written_without_yield = 0;
             return Poll::Pending;
@@ -210,9 +202,9 @@ impl AsyncWrite for UtpStreamWriteHalf {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        let mut g = self.user_tx.locked.lock();
+        let mut g = self.user_tx.locked.write();
 
-        if g.buffer.is_empty() {
+        if self.user_tx.consumer.lock().is_empty() {
             return Poll::Ready(Ok(()));
         }
 
@@ -229,8 +221,8 @@ impl AsyncWrite for UtpStreamWriteHalf {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> Poll<Result<(), std::io::Error>> {
-        let mut g = self.user_tx.locked.lock();
-        if !g.buffer.is_empty() {
+        let mut g = self.user_tx.locked.write();
+        if !self.user_tx.consumer.lock().is_empty() {
             if g.vsock_closed {
                 return Poll::Ready(Err(std::io::Error::other("socket died")));
             }

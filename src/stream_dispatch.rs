@@ -12,6 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use ringbuf::traits::{Consumer, Observer};
 use tokio::{sync::mpsc::UnboundedReceiver, time::Sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, debug, debug_span, event, trace, trace_span};
@@ -265,10 +266,14 @@ macro_rules! send_data {
             let hlen = $header.serialize(&mut $self.this_poll.tmp_buf)?;
 
             {
-                let g = $self.user_tx.locked.lock();
+                let g = $self.user_tx.consumer.lock();
                 let offset = $segment_iter_item.payload_offset();
                 let len = $segment_iter_item.payload_size();
-                let data = g.get_data(offset, len);
+                use ringbuf::consumer::Consumer;
+                let (first, second) = g.as_slices();
+                let mut d = crate::double_buf::DoubleBufHelper::new(first, second);
+                d.advance(offset);
+                let data = d.as_ioslices(len);
                 let bufs = [
                     IoSlice::new(&$self.this_poll.tmp_buf[..hlen]),
                     data[0],
@@ -753,12 +758,46 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> crate::Result<()> {
-        let mut g = self.user_tx.locked.lock();
+        let tx_len = {
+            let mut g = self.user_tx.locked.write();
+            let c = self.user_tx.consumer.lock();
+            let s = c.as_slices();
+            let tx_len = s.0.len() + s.1.len();
 
-        if g.is_empty() {
-            update_optional_waker(&mut g.dispatcher_waker, cx);
-            return Ok(());
-        }
+            // TODO: ensure this is synchronized
+            if tx_len == 0 {
+                update_optional_waker(&mut g.dispatcher_waker, cx);
+                return Ok(());
+            }
+
+            // Grow the send buffer if it's approaching limits.
+            // The 0.9 value found empirically.
+
+            let grow_limit = self
+                .congestion_controller
+                .window()
+                .min(self.last_remote_window as usize)
+                .min(self.socket.opts().vsock_tx_bufsize_bytes_max.get());
+            let cap = c.capacity().get();
+            let full_ratio = tx_len as f64 / cap as f64;
+            drop(g);
+            drop(c);
+
+            if cap < grow_limit && full_ratio > 0.9 {
+                let new_cap = self
+                    .user_tx
+                    .grow(self.socket.opts().vsock_tx_bufsize_bytes_max);
+                if let Some(new_cap) = new_cap {
+                    tracing::debug!(new_cap, tx_len, grow_limit, "grew send buffer");
+                    let w = self.user_tx.locked.write().writer_waker.take();
+                    if let Some(w) = w {
+                        w.wake();
+                    }
+                }
+            }
+
+            tx_len
+        };
 
         if self.state.is_remote_fin_or_later() {
             trace!(?self.state, "there is still unsent data, but the remote closed, so not segmenting further");
@@ -794,14 +833,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         let segmented_len = self.user_tx_segments.total_len_bytes();
 
-        if g.len() < self.user_tx_segments.total_len_bytes() {
+        if tx_len < segmented_len {
             return Err(Error::BugInBufferComputations {
-                user_tx_buflen: try_shrink_or_neg!(g.len()),
+                user_tx_buflen: try_shrink_or_neg!(tx_len),
                 segmented_len: try_shrink_or_neg!(segmented_len),
             });
         }
 
-        let mut remaining = g.len() - segmented_len;
+        let mut remaining = tx_len - segmented_len;
 
         let mut remote_window_remaining = self.last_remote_window as usize;
 
@@ -841,25 +880,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if is_mtu_probe {
                 trace!(payload_size, "MTU probing, not segmenting more data");
                 break;
-            }
-        }
-
-        // Grow the send buffer if it's approaching limits.
-        // The 0.9 value found empirically.
-        {
-            let grow_limit = self
-                .congestion_controller
-                .window()
-                .min(self.last_remote_window as usize)
-                .min(self.socket.opts().vsock_tx_bufsize_bytes_max.get());
-            if g.capacity() < grow_limit && g.full_ratio() > 0.9 {
-                let new_cap = g.grow(self.socket.opts().vsock_tx_bufsize_bytes_max);
-                if let Some(new_cap) = new_cap {
-                    tracing::debug!(new_cap, glen = g.len(), grow_limit, "grew send buffer");
-                    if let Some(w) = g.writer_waker.take() {
-                        w.wake();
-                    }
-                }
             }
         }
 
@@ -974,8 +994,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // Cleanup user side of TX queue, remove the ACKed bytes from the front of it,
             // and notify the writer.
             {
-                let mut g = self.user_tx.locked.lock();
-                g.truncate_front(result.on_ack_result.acked_bytes)?;
+                let mut g = self.user_tx.locked.write();
+                self.user_tx
+                    .truncate_front(result.on_ack_result.acked_bytes)?;
 
                 let waker = g.writer_waker.take();
 
