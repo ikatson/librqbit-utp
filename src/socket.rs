@@ -941,15 +941,14 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         cx: &mut std::task::Context<'_>,
         bufs: &[IoSlice<'_>],
         addr: SocketAddr,
+        total_len: usize,
     ) -> std::io::Result<bool> {
-        let total: usize = bufs.iter().map(|b| b.len()).sum();
         match self.transport.poll_send_to_vectored(cx, bufs, addr) {
             Poll::Ready(Ok(sz)) => {
-                let total: usize = bufs.iter().map(|b| b.len()).sum();
-                if sz != total {
+                if sz != total_len {
                     warn!(
                         actual_len = sz,
-                        expected_len = total,
+                        expected_len = total_len,
                         "sent a broken packet"
                     );
                 }
@@ -958,7 +957,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
                 METRICS.send_errors.increment(1);
                 debug!(
                     "error sending to UDP socket addr={}, len={}: {e:#}",
-                    addr, total
+                    addr, total_len
                 );
                 return Err(e);
             }

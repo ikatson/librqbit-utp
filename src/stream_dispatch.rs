@@ -266,13 +266,16 @@ macro_rules! send_data {
             let mut h = [0u8; UTP_HEADER as usize];
             let hlen = $header.serialize(&mut h)?;
 
+            // The key optimization here is that we only lock the consumer but nothing else.
+            // There's 0 chance consumer will be locked by anyone so there's no contention -
+            // the producer may keep writing data just fine.
             {
                 let g = $self.user_tx.consumer.lock();
                 let offset = $segment_iter_item.payload_offset();
-                let len = $segment_iter_item.payload_size();
-                use ringbuf::consumer::Consumer;
+                let plen = $segment_iter_item.payload_size();
                 let (first, second) = g.as_slices();
-                let [first, second] = crate::utils::prepare_2_ioslices(first, second, offset, len)?;
+                let [first, second] =
+                    crate::utils::prepare_2_ioslices(first, second, offset, plen)?;
                 let bufs = [
                     IoSlice::new(&h[..hlen]),
                     IoSlice::new(first),
@@ -280,7 +283,7 @@ macro_rules! send_data {
                 ];
                 $self.this_poll.transport_pending = $self
                     .socket
-                    .try_poll_send_to_vectored($cx, &bufs, $self.remote)
+                    .try_poll_send_to_vectored($cx, &bufs, $self.remote, hlen + plen)
                     .map_err(Error::Send)?;
             }
 
