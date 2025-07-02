@@ -12,7 +12,6 @@
 mod macros;
 mod congestion;
 mod constants;
-mod double_buf;
 #[cfg(test)]
 mod e2e_tests;
 mod error;

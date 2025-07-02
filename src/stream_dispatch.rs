@@ -272,10 +272,12 @@ macro_rules! send_data {
                 let len = $segment_iter_item.payload_size();
                 use ringbuf::consumer::Consumer;
                 let (first, second) = g.as_slices();
-                let mut d = crate::double_buf::DoubleBufHelper::new(first, second);
-                d.advance(offset);
-                let data = d.as_ioslices(len);
-                let bufs = [IoSlice::new(&h[..hlen]), data[0], data[1]];
+                let [first, second] = crate::utils::prepare_2_ioslices(first, second, offset, len)?;
+                let bufs = [
+                    IoSlice::new(&h[..hlen]),
+                    IoSlice::new(first),
+                    IoSlice::new(second),
+                ];
                 $self.this_poll.transport_pending = $self
                     .socket
                     .try_poll_send_to_vectored($cx, &bufs, $self.remote)

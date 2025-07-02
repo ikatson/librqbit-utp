@@ -2,6 +2,8 @@ use std::{cmp::Ordering, task::Waker};
 
 use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
 
+use crate::Error;
+
 pub fn update_optional_waker(waker: &mut Option<Waker>, cx: &std::task::Context<'_>) {
     match waker.as_mut() {
         Some(w) => {
@@ -31,6 +33,29 @@ pub fn seq_nr_offset(new: u16, old: u16, wrap_tolerance: u16) -> isize {
             (new - old) as isize
         }
     }
+}
+
+pub fn prepare_2_ioslices<'a>(
+    first: &'a [u8],
+    second: &'a [u8],
+    offset: usize,
+    len: usize,
+) -> crate::Result<[&'a [u8]; 2]> {
+    // offset
+    let first_offset = first.len().min(offset);
+    let first = &first[first_offset..];
+    let second_offset = offset - first_offset;
+    let second = second
+        .get(second_offset..)
+        .ok_or(Error::BugOffsetBeyondBufferBounds)?;
+    // len limit
+    let first_len = first.len().min(len);
+    let first = &first[..first_len];
+    let second_len = len - first_len;
+    let second = &second
+        .get(..second_len)
+        .ok_or(Error::BugRequestedLengthExceedsBufferBounds)?;
+    Ok([first, second])
 }
 
 pub(crate) struct DropGuardSendBeforeDeath<Msg> {
@@ -106,6 +131,7 @@ impl<F: FnOnce()> Drop for FnDropGuard<F> {
 
 #[cfg(test)]
 mod tests {
+    use crate::utils::prepare_2_ioslices;
 
     #[test]
     fn test_seq_nr_offset() {
@@ -135,5 +161,35 @@ mod tests {
             seq_nr_offset(u16::MAX, 1024, 1024),
             u16::MAX as isize - 1024
         );
+    }
+
+    #[test]
+    fn test_prepare_2_ioslices() {
+        // Test empty request
+        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 0, 0).unwrap();
+        assert_eq!(result, [&[][..], &[][..]]);
+
+        // Test single slice scenarios
+        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 0, 2).unwrap();
+        assert_eq!(result, [&[1, 2][..], &[][..]]);
+
+        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 1, 2).unwrap();
+        assert_eq!(result, [&[2, 3][..], &[][..]]);
+
+        // Test cross-slice scenarios
+        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 2, 2).unwrap();
+        assert_eq!(result, [&[3][..], &[4][..]]);
+
+        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 3, 2).unwrap();
+        assert_eq!(result, [&[][..], &[4, 5][..]]);
+
+        // Test full length
+        let result = prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 0, 6).unwrap();
+        assert_eq!(result, [&[1, 2, 3][..], &[4, 5, 6][..]]);
+
+        // Test error cases
+        assert!(prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 7, 1).is_err()); // offset too large
+        assert!(prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 0, 7).is_err()); // length too large
+        assert!(prepare_2_ioslices(&[1, 2, 3], &[4, 5, 6], 5, 2).is_err()); // offset + length too large
     }
 }
