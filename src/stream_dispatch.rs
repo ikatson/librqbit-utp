@@ -263,7 +263,8 @@ macro_rules! send_data {
                 .timestamp_microseconds
                 .wrapping_sub($self.last_remote_timestamp);
 
-            let hlen = $header.serialize(&mut $self.this_poll.tmp_buf)?;
+            let mut h = [0u8; UTP_HEADER as usize];
+            let hlen = $header.serialize(&mut h)?;
 
             {
                 let g = $self.user_tx.consumer.lock();
@@ -274,11 +275,7 @@ macro_rules! send_data {
                 let mut d = crate::double_buf::DoubleBufHelper::new(first, second);
                 d.advance(offset);
                 let data = d.as_ioslices(len);
-                let bufs = [
-                    IoSlice::new(&$self.this_poll.tmp_buf[..hlen]),
-                    data[0],
-                    data[1],
-                ];
+                let bufs = [IoSlice::new(&h[..hlen]), data[0], data[1]];
                 $self.this_poll.transport_pending = $self
                     .socket
                     .try_poll_send_to_vectored($cx, &bufs, $self.remote)
