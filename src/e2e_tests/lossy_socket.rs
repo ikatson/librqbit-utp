@@ -3,12 +3,13 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::Ordering,
     },
     task::{Context, Poll},
     time::Duration,
 };
 
+use portable_atomic::AtomicUsize;
 use dontfrag::UdpSocketExt;
 use librqbit_dualstack_sockets::PollSendToVectored;
 use rand::Rng;
