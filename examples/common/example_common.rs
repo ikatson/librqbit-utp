@@ -2,7 +2,8 @@ use std::cell::OnceCell;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
+use portable_atomic::AtomicU64;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::Context;

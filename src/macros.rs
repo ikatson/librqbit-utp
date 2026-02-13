@@ -1,25 +1,25 @@
 macro_rules! log_every_ms {
     ($dur:expr, $level:expr, $($rest:tt)*) => {
-        static LAST_RUN: ::std::sync::atomic::AtomicU64 = ::std::sync::atomic::AtomicU64::new(0);
-        static EVENT_COUNT: ::std::sync::atomic::AtomicU64 =
-            ::std::sync::atomic::AtomicU64::new(0);
+        static LAST_RUN: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
+        static EVENT_COUNT: portable_atomic::AtomicU64 =
+            portable_atomic::AtomicU64::new(0);
 
-        EVENT_COUNT.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
+        EVENT_COUNT.fetch_add(1, portable_atomic::Ordering::Relaxed);
 
         if let Ok(now) = std::time::SystemTime::now().duration_since(::std::time::UNIX_EPOCH) {
-            let last = LAST_RUN.load(::std::sync::atomic::Ordering::Relaxed);
+            let last = LAST_RUN.load(portable_atomic::Ordering::Relaxed);
             let now = now.as_millis() as u64;
 
             if now.saturating_sub(last) > $dur {
                 if let Ok(_) = LAST_RUN.compare_exchange_weak(
                     last,
                     now,
-                    std::sync::atomic::Ordering::Relaxed,
-                    std::sync::atomic::Ordering::Relaxed,
+                    portable_atomic::Ordering::Relaxed,
+                    portable_atomic::Ordering::Relaxed,
                 ) {
                     // Reset the counter after getting its value
                     let events_since_last =
-                        EVENT_COUNT.swap(0, ::std::sync::atomic::Ordering::Relaxed).saturating_sub(1);
+                        EVENT_COUNT.swap(0, portable_atomic::Ordering::Relaxed).saturating_sub(1);
                     tracing::event!($level, skipped_logs=events_since_last, $($rest)*);
                 }
             }

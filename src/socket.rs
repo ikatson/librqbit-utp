@@ -5,12 +5,13 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::Ordering,
     },
     task::Poll,
     time::{Duration, Instant},
 };
 
+use portable_atomic::AtomicU64;
 use crate::{
     Error,
     constants::{TX_BUF_SIZE_PER_VSOCK_INITIAL_DEFAULT, TX_BUF_SIZE_PER_VSOCK_MAX_DEFAULT},
@@ -231,7 +232,7 @@ impl std::fmt::Debug for ControlRequest {
     }
 }
 
-static NEXT_CONNECT_TOKEN: AtomicU64 = AtomicU64::new(0);
+static NEXT_CONNECT_TOKEN: portable_atomic::AtomicU64 = portable_atomic::AtomicU64::new(0);
 type ConnectToken = u64;
 
 struct Connecting {
