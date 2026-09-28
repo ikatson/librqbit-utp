@@ -329,6 +329,22 @@ impl<T, E> AcceptQueue<T, E> {
     }
 }
 
+// Windows fails recv_from on a UDP socket with these for a single datagram, and the socket keeps
+// working afterwards:
+// - WSAEMSGSIZE: the datagram was longer than the buffer and got truncated.
+// - WSAENETRESET: an earlier send_to got an ICMP time exceeded back.
+// - WSAECONNRESET: an earlier send_to got an ICMP port unreachable back.
+fn is_datagram_error(e: &std::io::Error) -> bool {
+    const WSAEMSGSIZE: i32 = 10040;
+    const WSAENETRESET: i32 = 10052;
+    const WSAECONNRESET: i32 = 10054;
+    cfg!(windows)
+        && matches!(
+            e.raw_os_error(),
+            Some(WSAEMSGSIZE | WSAENETRESET | WSAECONNRESET)
+        )
+}
+
 pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     env: E,
     socket: Arc<UtpSocket<T, E>>,
@@ -367,7 +383,14 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 self.on_control(control).await;
             },
             recv = self.socket.transport.recv_from(read_buf) => {
-                let (len, addr) = recv.map_err(Error::Recv)?;
+                let (len, addr) = match recv {
+                    Ok(r) => r,
+                    Err(e) if is_datagram_error(&e) => {
+                        debug!("ignoring UDP receive error: {e:#}");
+                        return Ok(());
+                    }
+                    Err(e) => return Err(Error::Recv(e)),
+                };
                 let message = match UtpMessage::deserialize(&read_buf[..len]) {
                     Some(msg) => msg,
                     None => {
