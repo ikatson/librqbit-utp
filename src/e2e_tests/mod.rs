@@ -293,3 +293,57 @@ async fn e2e_test_loss_20_pct() {
     )
     .await
 }
+
+async fn assert_connects(client: &Arc<UtpSocketUdp>, server: &Arc<UtpSocketUdp>) {
+    timeout(Duration::from_secs(5), async {
+        try_join!(
+            UtpSocketUdp::accept(server),
+            UtpSocketUdp::connect(client, UtpSocketUdp::bind_addr(server))
+        )
+    })
+    .await
+    .expect("timed out connecting")
+    .expect("the socket stopped working");
+}
+
+// On Windows, an ICMP port unreachable that comes back for an earlier send_to makes the next
+// recv_from on the same UDP socket fail with WSAECONNRESET (os error 10054).
+#[tokio::test]
+async fn e2e_test_connect_after_icmp_port_unreachable() {
+    setup_test_logging();
+    let client = UtpSocketUdp::new_udp(localhost_ipv4(0)).await.unwrap();
+    let server = UtpSocketUdp::new_udp(localhost_ipv4(0)).await.unwrap();
+
+    // Nothing listens on this port once the socket is dropped, so the SYN sent there gets an
+    // ICMP port unreachable back.
+    let closed = std::net::UdpSocket::bind(localhost_ipv4(0))
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let _ = timeout(
+        Duration::from_millis(500),
+        UtpSocketUdp::connect(&client, closed),
+    )
+    .await;
+
+    assert_connects(&client, &server).await;
+}
+
+// On Windows, a datagram longer than the receive buffer makes recv_from fail with
+// WSAEMSGSIZE (os error 10040).
+#[tokio::test]
+async fn e2e_test_connect_after_oversized_datagram() {
+    setup_test_logging();
+    let client = UtpSocketUdp::new_udp(localhost_ipv4(0)).await.unwrap();
+    let server = UtpSocketUdp::new_udp(localhost_ipv4(0)).await.unwrap();
+
+    // Some platforms refuse to send a datagram this large, which is fine.
+    let sender = tokio::net::UdpSocket::bind(localhost_ipv4(0))
+        .await
+        .unwrap();
+    let _ = sender
+        .send_to(&[0u8; 20_000], UtpSocketUdp::bind_addr(&client))
+        .await;
+
+    assert_connects(&client, &server).await;
+}
