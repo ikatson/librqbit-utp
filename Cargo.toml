@@ -34,7 +34,7 @@ parking_lot = "0.12.3"
 bitvec = "1.0.1"
 rustc-hash = "2.1.1"
 tokio-util = "0.7.13"
-ringbuf = "0.4.7"
+ringbuf = "0.5.2"
 metrics = { version = "0.24.1", optional = true }
 lazy_static = "1.5.0"
 socket2 = { version = "0.6", features = ["all"] }
